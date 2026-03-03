@@ -1,0 +1,43 @@
+#!/bin/sh
+# rpcd exec plugin for nopal -- bridges CLI to ubus
+#
+# Install to /usr/libexec/rpcd/nopal and restart rpcd.
+# Methods are then available as ubus call nopal <method>.
+
+NOPAL=/usr/sbin/nopal
+
+case "$1" in
+	list)
+		cat <<'EOF'
+{
+	"status": {},
+	"interfaces": {},
+	"policies": {},
+	"connected": {},
+	"reload": {}
+}
+EOF
+		;;
+	call)
+		case "$2" in
+			status)
+				$NOPAL -j status 2>/dev/null || echo '{"error":"daemon not running"}'
+				;;
+			interfaces)
+				$NOPAL -j interfaces 2>/dev/null || echo '{"error":"daemon not running"}'
+				;;
+			policies)
+				$NOPAL -j policies 2>/dev/null || echo '{"error":"daemon not running"}'
+				;;
+			connected)
+				$NOPAL -j connected 2>/dev/null || echo '{"error":"daemon not running"}'
+				;;
+			reload)
+				$NOPAL reload 2>/dev/null && echo '{"success":true}' || echo '{"error":"reload failed"}'
+				;;
+			*)
+				echo '{"error":"unknown method"}'
+				;;
+		esac
+		;;
+esac
