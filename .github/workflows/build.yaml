@@ -43,8 +43,10 @@ jobs:
             rust_target: armv7-unknown-linux-musleabihf
           - openwrt_arch: mips_24kc
             rust_target: mips-unknown-linux-musl
+            extra_flags: -Z build-std=std,panic_abort
           - openwrt_arch: mipsel_24kc
             rust_target: mipsel-unknown-linux-musl
+            extra_flags: -Z build-std=std,panic_abort
     steps:
       - uses: actions/checkout@v4
 
@@ -56,7 +58,7 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build
-        run: cross +nightly build --release --features https --target ${{ matrix.rust_target }}
+        run: cross +nightly build --release --features https --target ${{ matrix.rust_target }} ${{ matrix.extra_flags }}
 
       - name: Prepare binary
         run: cp target/${{ matrix.rust_target }}/release/nopal nopald
