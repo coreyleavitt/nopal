@@ -34,6 +34,7 @@ jobs:
   compile:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - openwrt_arch: aarch64_cortex-a53
@@ -47,13 +48,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
 
       - name: Install cross
         run: cargo install cross --locked
 
       - name: Build
-        run: cross build --release --features https --target ${{ matrix.rust_target }}
+        run: cross +nightly build --release --features https --target ${{ matrix.rust_target }}
 
       - name: Prepare binary
         run: cp target/${{ matrix.rust_target }}/release/nopal nopald
