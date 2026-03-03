@@ -49,7 +49,7 @@ jobs:
           Package: nopal
           Version: ${VERSION}-${RELEASE}
           Architecture: ${ARCH}
-          Depends: nftables, conntrack
+          Depends: nftables
           Maintainer: nopal contributors
           Section: net
           Description: Multi-WAN policy routing and failover manager for OpenWrt
