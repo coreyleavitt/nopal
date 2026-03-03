@@ -62,7 +62,7 @@ jobs:
             --info "arch:${ARCH}" \
             --info "description:Multi-WAN policy routing and failover manager for OpenWrt" \
             --info "license:Apache-2.0" \
-            --info "depends:nftables conntrack" \
+            --info "depends:nftables" \
             --files data \
             --output "nopal_${VERSION}-r${RELEASE}_${ARCH}.apk"
 

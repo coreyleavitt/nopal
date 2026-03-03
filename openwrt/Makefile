@@ -13,7 +13,7 @@ define Package/nopal
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Multi-WAN manager
-  DEPENDS:=+nftables +conntrack
+  DEPENDS:=+nftables
   PKGARCH:=all
 endef
 
