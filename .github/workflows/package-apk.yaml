@@ -1,0 +1,72 @@
+name: Package APK
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      pkg_release:
+        required: true
+        type: string
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:edge
+    strategy:
+      matrix:
+        include:
+          - openwrt_arch: aarch64_cortex-a53
+          - openwrt_arch: arm_cortex-a7
+          - openwrt_arch: mips_24kc
+          - openwrt_arch: mipsel_24kc
+    steps:
+      - name: Install prerequisites
+        run: apk add --no-cache nodejs git
+
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.openwrt_arch }}
+
+      - name: Build APK
+        run: |
+          VERSION="${{ inputs.version }}"
+          RELEASE="${{ inputs.pkg_release }}"
+          ARCH="${{ matrix.openwrt_arch }}"
+
+          mkdir -p data/usr/sbin
+          mkdir -p data/etc/init.d
+          mkdir -p data/etc/config
+          mkdir -p data/usr/libexec/rpcd
+
+          cp nopald data/usr/sbin/nopald
+          chmod 755 data/usr/sbin/nopald
+          ln -s nopald data/usr/sbin/nopal
+
+          cp openwrt/files/nopal.init data/etc/init.d/nopal
+          chmod 755 data/etc/init.d/nopal
+          cp openwrt/files/nopal.config data/etc/config/nopal
+          cp openwrt/files/rpcd-nopal data/usr/libexec/rpcd/nopal
+          chmod 755 data/usr/libexec/rpcd/nopal
+
+          apk mkpkg \
+            --info "name:nopal" \
+            --info "version:${VERSION}-r${RELEASE}" \
+            --info "arch:${ARCH}" \
+            --info "description:Multi-WAN policy routing and failover manager for OpenWrt" \
+            --info "license:Apache-2.0" \
+            --info "depend:nftables" \
+            --info "depend:conntrack" \
+            --files data \
+            --output "nopal_${VERSION}-r${RELEASE}_${ARCH}.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.openwrt_arch }}
+          path: "*.apk"

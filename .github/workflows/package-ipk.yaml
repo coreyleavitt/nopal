@@ -1,0 +1,76 @@
+name: Package IPK
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      pkg_release:
+        required: true
+        type: string
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - openwrt_arch: aarch64_cortex-a53
+          - openwrt_arch: arm_cortex-a7
+          - openwrt_arch: mips_24kc
+          - openwrt_arch: mipsel_24kc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.openwrt_arch }}
+
+      - name: Download opkg-build
+        run: |
+          curl -sL https://raw.githubusercontent.com/openwrt/openwrt/openwrt-24.10/scripts/ipkg-build -o ipkg-build
+          chmod +x ipkg-build
+
+      - name: Build IPK
+        run: |
+          VERSION="${{ inputs.version }}"
+          RELEASE="${{ inputs.pkg_release }}"
+          ARCH="${{ matrix.openwrt_arch }}"
+
+          mkdir -p pkg/CONTROL
+          mkdir -p pkg/usr/sbin
+          mkdir -p pkg/etc/init.d
+          mkdir -p pkg/etc/config
+          mkdir -p pkg/usr/libexec/rpcd
+
+          cat > pkg/CONTROL/control <<EOF
+          Package: nopal
+          Version: ${VERSION}-${RELEASE}
+          Architecture: ${ARCH}
+          Depends: nftables, conntrack
+          Maintainer: nopal contributors
+          Section: net
+          Description: Multi-WAN policy routing and failover manager for OpenWrt
+          EOF
+
+          printf '/etc/config/nopal\n' > pkg/CONTROL/conffiles
+
+          cp nopald pkg/usr/sbin/nopald
+          chmod 755 pkg/usr/sbin/nopald
+          ln -s nopald pkg/usr/sbin/nopal
+
+          cp openwrt/files/nopal.init pkg/etc/init.d/nopal
+          chmod 755 pkg/etc/init.d/nopal
+          cp openwrt/files/nopal.config pkg/etc/config/nopal
+          cp openwrt/files/rpcd-nopal pkg/usr/libexec/rpcd/nopal
+          chmod 755 pkg/usr/libexec/rpcd/nopal
+
+          ./ipkg-build pkg .
+
+      - name: Upload IPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipk-${{ matrix.openwrt_arch }}
+          path: "*.ipk"

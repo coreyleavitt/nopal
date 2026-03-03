@@ -1,0 +1,112 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g. 0.1.0)"
+        required: true
+      pkg_release:
+        description: "Package release number"
+        default: "1"
+  push:
+    tags: ["v*"]
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      pkg_release: ${{ steps.v.outputs.pkg_release }}
+    steps:
+      - name: Determine version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "pkg_release=${{ inputs.pkg_release }}" >> "$GITHUB_OUTPUT"
+          else
+            TAG="${{ github.ref_name }}"
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "pkg_release=1" >> "$GITHUB_OUTPUT"
+          fi
+
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - openwrt_arch: aarch64_cortex-a53
+            rust_target: aarch64-unknown-linux-musl
+          - openwrt_arch: arm_cortex-a7
+            rust_target: armv7-unknown-linux-musleabihf
+          - openwrt_arch: mips_24kc
+            rust_target: mips-unknown-linux-musl
+          - openwrt_arch: mipsel_24kc
+            rust_target: mipsel-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build
+        run: cross build --release --features https --target ${{ matrix.rust_target }}
+
+      - name: Prepare binary
+        run: cp target/${{ matrix.rust_target }}/release/nopal nopald
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.openwrt_arch }}
+          path: nopald
+
+  package-ipk:
+    needs: [resolve-version, compile]
+    uses: ./.github/workflows/package-ipk.yaml
+    with:
+      version: ${{ needs.resolve-version.outputs.version }}
+      pkg_release: ${{ needs.resolve-version.outputs.pkg_release }}
+
+  package-apk:
+    needs: [resolve-version, compile]
+    uses: ./.github/workflows/package-apk.yaml
+    with:
+      version: ${{ needs.resolve-version.outputs.version }}
+      pkg_release: ${{ needs.resolve-version.outputs.pkg_release }}
+
+  release:
+    needs: [resolve-version, compile, package-ipk, package-apk]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          for dir in artifacts/binary-*; do
+            arch="${dir#artifacts/binary-}"
+            cp "$dir/nopald" "release/nopald_${arch}"
+          done
+          for dir in artifacts/ipk-*; do
+            cp "$dir"/*.ipk release/
+          done
+          for dir in artifacts/apk-*; do
+            cp "$dir"/*.apk release/
+          done
+          cd release && sha256sum * > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.resolve-version.outputs.version }}
+          files: release/*
+          generate_release_notes: true
