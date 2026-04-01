@@ -13,8 +13,6 @@ import ../linux_constants
 const
   IPPROTO_ICMP = 1.cint
   IPPROTO_ICMPV6 = 58.cint
-  AF_INET_U8 = uint8(2)
-  AF_INET6_U8 = uint8(10)
 
 func icmpChecksum*(data: openArray[byte]): uint16 =
   ## RFC 1071 ones-complement checksum.

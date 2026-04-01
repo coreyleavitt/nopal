@@ -74,8 +74,7 @@ proc addRoute*(m: var RouteManager, table: uint32, gateway: openArray[byte],
   b.addAttrU32(RTA_OIF.uint16, oif)
 
   # RTA_PRIORITY (metric for tier-based route selection)
-  if metric > 0:
-    b.addAttrU32(RTA_PRIORITY.uint16, metric)
+  b.addAttrU32(RTA_PRIORITY.uint16, metric)
 
   let msg = b.finish()
   discard m.sock.sendAndAck(msg, m.recvBuf)
