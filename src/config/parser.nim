@@ -431,9 +431,9 @@ proc validateCidr(s: string, context: string) =
     let addrPart = s[0 ..< slashIdx]
     let prefixPart = s[slashIdx + 1 ..< s.len]
     try:
-      let addr = parseIpAddress(addrPart)
+      let ipAddr = parseIpAddress(addrPart)
       let prefix = parseInt(prefixPart)
-      let maxPrefix = if addr.family == IpAddressFamily.IPv4: 32 else: 128
+      let maxPrefix = if ipAddr.family == IpAddressFamily.IPv4: 32 else: 128
       if prefix < 0 or prefix > maxPrefix:
         raise newException(ConfigError, context & ": prefix length " & $prefix & " out of range for " & s)
     except ValueError:

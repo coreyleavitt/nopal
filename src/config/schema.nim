@@ -84,7 +84,7 @@ type
 
   MemberConfig* = object
     name*: string
-    interface*: string
+    `interface`*: string
     metric*: uint32
     weight*: uint32
 

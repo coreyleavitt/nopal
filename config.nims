@@ -1,7 +1,7 @@
 import std/os
 
 # Common release flags
-switch("gc", "arc")
+switch("mm", "arc")
 switch("define", "useMalloc")
 switch("panics", "on")
 
