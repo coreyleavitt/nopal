@@ -8,7 +8,7 @@
 ## SO_BINDTODEVICE and marked with SO_MARK = 0xDEAD for nftables
 ## exemption.
 
-import std/[posix, strutils, os]
+import std/[posix, os]
 import ../linux_constants
 
 const DNS_PORT = 53'u16
@@ -40,7 +40,12 @@ proc encodeDnsQuery*(name: string, buf: var array[512, byte]): int =
   pos = 12
 
   # Question section: encode domain name as DNS labels
-  let trimmed = name.strip(chars = {'.'})
+  # Trim leading and trailing dots (inline to avoid std/strutils dependency)
+  var trimStart = 0
+  var trimEnd = name.len - 1
+  while trimStart <= trimEnd and name[trimStart] == '.': inc trimStart
+  while trimEnd >= trimStart and name[trimEnd] == '.': dec trimEnd
+  let trimmed = if trimStart > trimEnd: "" else: name[trimStart .. trimEnd]
   if trimmed.len == 0:
     # Root query: single null byte
     buf[pos] = 0x00
