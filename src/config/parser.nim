@@ -4,7 +4,7 @@
 
 import ./schema
 import ../errors
-import std/[tables, sets, strutils, parseutils, net, logging]
+import std/[tables, sets, strutils, parseutils, logging]
 
 type
   UciSection* = object
@@ -54,6 +54,137 @@ func stripQuotes*(s: string): string =
     if (s[0] == '"' and s[^1] == '"') or (s[0] == '\'' and s[^1] == '\''):
       return s[1 ..< s.len - 1]
   return s
+
+func isValidIpv4(s: string): bool =
+  ## Validate an IPv4 address: 4 dot-separated octets 0-255, no leading zeros.
+  let parts = s.split('.')
+  if parts.len != 4:
+    return false
+  for part in parts:
+    if part.len == 0 or part.len > 3:
+      return false
+    # No leading zeros (except "0" itself)
+    if part.len > 1 and part[0] == '0':
+      return false
+    for c in part:
+      if c < '0' or c > '9':
+        return false
+    let val = parseInt(part)
+    if val < 0 or val > 255:
+      return false
+  return true
+
+func isValidIpv6(s: string): bool =
+  ## Validate an IPv6 address with optional :: compression and mixed notation.
+  if s.len == 0:
+    return false
+
+  # Check for mixed notation (IPv6 with embedded IPv4 at the end)
+  # e.g. ::ffff:192.168.1.1
+  let lastColon = s.rfind(':')
+  if lastColon >= 0 and lastColon + 1 < s.len:
+    let tail = s[lastColon + 1 ..< s.len]
+    if '.' in tail:
+      # Mixed notation: validate the IPv4 part and treat the rest as IPv6
+      if not isValidIpv4(tail):
+        return false
+      # The prefix before the IPv4 must be a valid IPv6 prefix
+      # that ends with ':' and would have 2 groups replaced by the IPv4
+      let prefix = s[0 ..< lastColon]
+      # prefix should look like valid IPv6 groups possibly with ::
+      # The IPv4 part replaces the last 2 groups of 8
+      let dcCount = prefix.count("::")
+      if dcCount > 1:
+        return false
+      # Split on :: first
+      if dcCount == 1:
+        let dcParts = prefix.split("::")
+        var groupCount = 0
+        for p in dcParts:
+          if p.len > 0:
+            for g in p.split(':'):
+              if g.len == 0 or g.len > 4:
+                return false
+              for c in g:
+                if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+                  return false
+              inc groupCount
+        # With mixed notation, IPv4 replaces 2 groups, so max 6 groups total
+        if groupCount > 6:
+          return false
+      else:
+        # No ::, just colon-separated groups ending with :
+        if prefix.len == 0:
+          return false
+        # prefix should not end with ':'? Actually it can be like "64:ff9b:"
+        # Wait - the prefix is everything before the last ':', so it includes
+        # trailing colon only if there were consecutive colons.
+        # Let me re-check: s = "64:ff9b::192.168.1.1", lastColon=8, prefix="64:ff9b:"
+        # Actually no, let me re-derive. For "::ffff:1.2.3.4":
+        #   lastColon = 6 (the colon before "1.2.3.4")
+        #   prefix = "::ffff"
+        # For "64:ff9b::1.2.3.4":
+        #   lastColon = 8
+        #   prefix = "64:ff9b:"  -- this has :: at the end... no wait
+        #   "64:ff9b::1.2.3.4" - positions: 6,7 are '::', lastColon = 8? No.
+        #   Let me just count: 6->':',7->':',8->'1'... lastColon = 7
+        #   prefix = "64:ff9b:" -- trailing colon from the ::
+        # Actually this is getting complicated. Let me handle the prefix
+        # by stripping trailing colon if any, since it came from the :: split.
+        let trimmed = if prefix.endsWith(":"): prefix[0 ..< prefix.len - 1] else: prefix
+        if trimmed.len == 0:
+          return false
+        let groups = trimmed.split(':')
+        for g in groups:
+          if g.len == 0 or g.len > 4:
+            return false
+          for c in g:
+            if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+              return false
+        # IPv4 part = 2 groups, so need exactly 6 explicit groups
+        if groups.len != 6:
+          return false
+      return true
+
+  # Pure IPv6 validation
+  let dcCount = s.count("::")
+  if dcCount > 1:
+    return false
+
+  if dcCount == 1:
+    let dcParts = s.split("::")
+    var groupCount = 0
+    for p in dcParts:
+      if p.len > 0:
+        for g in p.split(':'):
+          if g.len == 0 or g.len > 4:
+            return false
+          for c in g:
+            if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+              return false
+          inc groupCount
+    if groupCount >= 8:
+      return false
+  else:
+    let groups = s.split(':')
+    if groups.len != 8:
+      return false
+    for g in groups:
+      if g.len == 0 or g.len > 4:
+        return false
+      for c in g:
+        if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
+          return false
+  return true
+
+func isValidIpAddress*(s: string): bool =
+  ## Validate an IPv4 or IPv6 address string.
+  return isValidIpv4(s) or isValidIpv6(s)
+
+func isIpv6*(s: string): bool =
+  ## Check whether a valid IP address string is IPv6.
+  ## Assumes s is a valid IP address (call isValidIpAddress first).
+  return ':' in s
 
 proc validateName*(kind, name: string) =
   ## Raise ConfigError if name is empty, contains /\0/.., or non-[a-zA-Z0-9_.-].
@@ -273,11 +404,9 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   # track_ip can be option (single) or list (multiple)
   let trackIps = sec.getAll("track_ip")
   for ip in trackIps:
-    try:
-      discard parseIpAddress(ip)
-      result.trackIp.add(ip)
-    except ValueError:
+    if not isValidIpAddress(ip):
       raise newException(ConfigError, "interface '" & sec.name & "': invalid track_ip '" & ip & "'")
+    result.trackIp.add(ip)
 
   result.trackPort = int(sec.getU32("track_port", uint32(result.trackPort)))
   result.reliability = sec.getU32("reliability", result.reliability)
@@ -338,11 +467,9 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   result.clampMss = sec.getBool("clamp_mss", result.clampMss)
 
   for ds in sec.getAll("dns_server"):
-    try:
-      discard parseIpAddress(ds)
-      result.dnsServers.add(ds)
-    except ValueError:
+    if not isValidIpAddress(ds):
       raise newException(ConfigError, "interface '" & sec.name & "': invalid dns_server '" & ds & "'")
+    result.dnsServers.add(ds)
 
   # flush_conntrack list
   let flushList = sec.getAll("flush_conntrack")
@@ -429,18 +556,17 @@ proc validateCidr(s: string, context: string) =
   if slashIdx >= 0:
     let addrPart = s[0 ..< slashIdx]
     let prefixPart = s[slashIdx + 1 ..< s.len]
+    if not isValidIpAddress(addrPart):
+      raise newException(ConfigError, context & ": invalid CIDR '" & s & "'")
     try:
-      let ipAddr = parseIpAddress(addrPart)
       let prefix = parseInt(prefixPart)
-      let maxPrefix = if ipAddr.family == IpAddressFamily.IPv4: 32 else: 128
+      let maxPrefix = if isIpv6(addrPart): 128 else: 32
       if prefix < 0 or prefix > maxPrefix:
         raise newException(ConfigError, context & ": prefix length " & $prefix & " out of range for " & s)
     except ValueError:
       raise newException(ConfigError, context & ": invalid CIDR '" & s & "'")
   else:
-    try:
-      discard parseIpAddress(s)
-    except ValueError:
+    if not isValidIpAddress(s):
       raise newException(ConfigError, context & ": invalid IP address '" & s & "'")
 
 proc parseRule*(sec: UciSection): RuleConfig =
