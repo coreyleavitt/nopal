@@ -18,3 +18,4 @@ fuzz/oom-*
 *.swp
 *~
 .DS_Store
+# Nim compiled outputs
