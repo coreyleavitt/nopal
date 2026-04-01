@@ -4,7 +4,7 @@
 import ../src/health/icmp
 
 proc fuzzTarget(data: openArray[byte]) =
-  if data.len < 8: return  # minimum ICMP header
+  if data.len == 0: return
   # Verify checksum doesn't crash on arbitrary input
   discard icmpChecksum(data)
 

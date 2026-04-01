@@ -14,7 +14,6 @@ define Package/nopal
   CATEGORY:=Network
   TITLE:=Multi-WAN manager
   DEPENDS:=+nftables
-  PKGARCH:=all
 endef
 
 define Package/nopal/description
@@ -36,7 +35,7 @@ endef
 define Package/nopal/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/nopald $(1)/usr/sbin/nopald
-	ln -sf nopald $(1)/usr/sbin/nopal
+	ln -sf /usr/sbin/nopald $(1)/usr/sbin/nopal
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/nopal.init $(1)/etc/init.d/nopal

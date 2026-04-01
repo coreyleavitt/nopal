@@ -10,7 +10,10 @@ proc fuzzTarget(data: openArray[byte]) =
   copyMem(addr input[0], unsafeAddr data[0], data.len)
   try:
     let j = parseJson(input)
+    # Exercise parseRequest on all JSON types (objects, arrays, strings, etc.)
     discard parseRequest(j)
+    # Also test parseResponse path
+    discard parseResponse(j)
   except JsonParsingError:
     discard
   except CatchableError:
