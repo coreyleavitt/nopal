@@ -5,5 +5,5 @@ import ./socket
 type
   RouteManager* = object
     sock: NetlinkSocket
-    seq: uint32
+    nlSeq: uint32
     recvBuf: seq[byte]

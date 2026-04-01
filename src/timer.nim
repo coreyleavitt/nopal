@@ -2,6 +2,7 @@
 
 import std/heapqueue
 import std/monotimes
+import std/times
 
 type
   TimerKind* = enum
