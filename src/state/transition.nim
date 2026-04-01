@@ -3,7 +3,7 @@
 ## Determines what actions the daemon should take when an interface
 ## transitions between states.
 
-import tracker
+import ./tracker
 
 type
   TransitionAction* = enum

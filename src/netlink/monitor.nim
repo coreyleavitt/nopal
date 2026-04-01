@@ -1,6 +1,6 @@
 ## Route monitor: subscribes to route/address change notifications.
 
-import socket
+import ./socket
 
 type
   RouteMonitor* = object

@@ -8,4 +8,3 @@ type
     lossPercent*: int
 
   ProbeEngine* = object
-    discard

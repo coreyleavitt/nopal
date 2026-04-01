@@ -1,6 +1,6 @@
 ## Route manager: add/delete routes, ip rules, address queries via NETLINK_ROUTE.
 
-import socket
+import ./socket
 
 type
   RouteManager* = object

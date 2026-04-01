@@ -1,6 +1,6 @@
 ## Link monitor: subscribes to RTNLGRP_LINK for interface up/down events.
 
-import socket
+import ./socket
 
 type
   LinkMonitor* = object
