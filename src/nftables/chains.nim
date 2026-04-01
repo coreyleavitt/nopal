@@ -510,7 +510,7 @@ proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[Pol
                    markMask: uint32, ipv6Enabled, logging: bool): Ruleset =
   var rs = initRuleset()
 
-  # Table setup
+  # Table setup: add (idempotent create) then flush (clear old rules)
   rs.addTable()
   rs.addFlushTable()
 
