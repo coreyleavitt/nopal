@@ -4,6 +4,7 @@
 ## so the daemon can apply targeted updates instead of a full
 ## teardown/rebuild on every reload.
 
+import std/strformat
 import ./schema
 
 type
@@ -92,7 +93,7 @@ when isMainModule:
   proc testInterface(name: string): InterfaceConfig =
     var iface = defaultInterface()
     iface.name = name
-    iface.device = "eth-" & name
+    iface.device = fmt"eth-{name}"
     iface
 
   suite "config diff":

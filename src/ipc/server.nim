@@ -3,7 +3,7 @@
 ## Non-blocking accept, read, write. Clients receive length-prefixed JSON
 ## frames (u32 BE prefix + payload). Supports event subscriptions.
 
-import std/[posix, os, tables, logging, json, selectors, endians]
+import std/[posix, os, tables, logging, json, selectors, endians, strformat]
 import ./protocol
 
 const
@@ -121,7 +121,7 @@ proc readClient*(s: var IpcServer, clientId: int, selector: Selector[int]): seq[
       break  # EAGAIN
     # Budget check: cap readBuf to MaxMsgSize + 4 (one max frame)
     if client.readBuf.len + n > int(MaxMsgSize) + 4:
-      warn "IPC client " & $clientId & " readbuf overflow, disconnecting"
+      warn fmt"IPC client {clientId} readbuf overflow, disconnecting"
       s.removeClient(clientId, selector)
       return
     for i in 0 ..< n:
@@ -132,7 +132,7 @@ proc readClient*(s: var IpcServer, clientId: int, selector: Selector[int]): seq[
     var frameLen: uint32
     bigEndian32(addr frameLen, addr client.readBuf[0])
     if frameLen > MaxMsgSize:
-      warn "IPC client " & $clientId & " sent oversized message, disconnecting"
+      warn fmt"IPC client {clientId} sent oversized message, disconnecting"
       s.removeClient(clientId, selector)
       return
 
@@ -151,7 +151,7 @@ proc readClient*(s: var IpcServer, clientId: int, selector: Selector[int]): seq[
         client.subscribed = true
       result.add(req)
     except:
-      warn "IPC client " & $clientId & " sent malformed JSON"
+      warn fmt"IPC client {clientId} sent malformed JSON"
 
     # Remove consumed bytes
     client.readBuf = client.readBuf[totalLen .. ^1]

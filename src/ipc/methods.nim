@@ -1,6 +1,6 @@
 ## IPC method dispatch: routes RPC requests to handlers.
 
-import std/[json, options, monotimes, times]
+import std/[json, options, monotimes, times, strformat]
 import ./protocol
 import ../state/tracker
 import ../state/policy
@@ -88,7 +88,7 @@ proc dispatch*(req: IpcRequest, view: DaemonView): (IpcResponse, DispatchAction)
       if t.name == ifaceName:
         let data = buildInterfaceStatus(t)
         return (successResponse(req.id, data.toJson()), daNone)
-    (errorResponse(req.id, "interface '" & ifaceName & "' not found"), daNone)
+    (errorResponse(req.id, fmt"interface '{ifaceName}' not found"), daNone)
 
   of "connected":
     let data = ConnectedData(networks: view.connectedNetworks[])
@@ -103,7 +103,7 @@ proc dispatch*(req: IpcRequest, view: DaemonView): (IpcResponse, DispatchAction)
     (successResponse(req.id), daNone)
 
   else:
-    (errorResponse(req.id, "unknown method '" & req.rpcMethod & "'"), daNone)
+    (errorResponse(req.id, fmt"unknown method '{req.rpcMethod}'"), daNone)
 
 when isMainModule:
   import std/[unittest, strutils]

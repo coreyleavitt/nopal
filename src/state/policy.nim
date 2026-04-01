@@ -4,7 +4,7 @@
 ## sorts tiers by metric (lowest = highest priority). The active tier is
 ## the first one with at least one online member.
 
-import std/algorithm
+import std/[algorithm, strformat]
 import ./tracker
 import ../config/schema
 
@@ -94,8 +94,9 @@ when isMainModule:
     result.interfaceName = iface
 
   proc makeTracker(name: string, index: int, mark: uint32, online: bool): InterfaceTracker =
+    let devIdx = index + 2
     var t = newTracker(name, index, mark, 100 + index.uint32,
-                       "eth0." & $(index + 2), 3, 5)
+                       fmt"eth0.{devIdx}", 3, 5)
     if online:
       t.state = isOnline
     t

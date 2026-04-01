@@ -4,7 +4,7 @@
 ## selector-based event loop, dispatches probe/link/route/IPC events,
 ## and coalesces deferred nftables/DNS updates.
 
-import std/[selectors, posix, monotimes, times, options, logging, os, strutils]
+import std/[selectors, posix, monotimes, times, options, logging, os, strutils, strformat]
 
 import ./config/schema
 import ./config/parser
@@ -133,8 +133,7 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
   ## selector, assign marks, build trackers.
   let config = loadConfig(configPath)
 
-  info "loaded config: " & $config.interfaces.len & " interfaces, " &
-       $config.policies.len & " policies, " & $config.rules.len & " rules"
+  info fmt"loaded config: {config.interfaces.len} interfaces, {config.policies.len} policies, {config.rules.len} rules"
 
   var selector = newSelector[int]()
   var timers = newTimerWheel()
@@ -174,11 +173,11 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
   for i, iface in config.interfaces:
     if not iface.enabled: continue
     if not ipv6Enabled and iface.family == afIpv6:
-      warn iface.name & ": skipping IPv6-only interface (ipv6_enabled=false)"
+      warn fmt"{iface.name}: skipping IPv6-only interface (ipv6_enabled=false)"
       continue
 
     if markIdx >= marks.len:
-      error iface.name & ": no mark slot available, skipping"
+      error fmt"{iface.name}: no mark slot available, skipping"
       continue
 
     let (mark, tableId) = marks[markIdx]
@@ -196,10 +195,7 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
         iface.dampeningSuppress,
         iface.dampeningReuse,
       )
-      info iface.name & ": dampening enabled (halflife=" &
-           $iface.dampeningHalflife & ", ceiling=" & $iface.dampeningCeiling &
-           ", suppress=" & $iface.dampeningSuppress & ", reuse=" &
-           $iface.dampeningReuse & ")"
+      info fmt"{iface.name}: dampening enabled (halflife={iface.dampeningHalflife}, ceiling={iface.dampeningCeiling}, suppress={iface.dampeningSuppress}, reuse={iface.dampeningReuse})"
 
     trackers.add(t)
 
@@ -386,7 +382,7 @@ proc addRoutes(d: var Daemon, index: int) =
       found = true
       break
   if not found:
-    error "addRoutes: no tracker for index " & $index
+    error fmt"addRoutes: no tracker for index {index}"
     return
 
   let cfg = d.configForIndex(index)
@@ -400,17 +396,16 @@ proc addRoutes(d: var Daemon, index: int) =
       d.routeManager.addRule(t.mark, d.config.globals.markMask,
                              t.tableId, 100 + index.uint32, AF_INET)
     except CatchableError as e:
-      warn "failed to add IPv4 ip rule for " & t.name & ": " & e.msg
+      warn fmt"failed to add IPv4 ip rule for {t.name}: {e.msg}"
 
   if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
     try:
       d.routeManager.addRule(t.mark, d.config.globals.markMask,
                              t.tableId, 100 + index.uint32, AF_INET6)
     except CatchableError as e:
-      warn "failed to add IPv6 ip rule for " & t.name & ": " & e.msg
+      warn fmt"failed to add IPv6 ip rule for {t.name}: {e.msg}"
 
-  info "added routes for " & t.name & " (mark=0x" & t.mark.toHex(4) &
-       ", table=" & $t.tableId & ")"
+  info fmt"added routes for {t.name} (mark=0x{t.mark.toHex(4)}, table={t.tableId})"
 
 proc removeRoutes(d: var Daemon, index: int) =
   ## Delete ip rules and flush routing table for an interface.
@@ -422,7 +417,7 @@ proc removeRoutes(d: var Daemon, index: int) =
       found = true
       break
   if not found:
-    error "removeRoutes: no tracker for index " & $index
+    error fmt"removeRoutes: no tracker for index {index}"
     return
 
   let cfg = d.configForIndex(index)
@@ -436,21 +431,21 @@ proc removeRoutes(d: var Daemon, index: int) =
       d.routeManager.delRule(t.mark, d.config.globals.markMask,
                              t.tableId, 100 + index.uint32, AF_INET)
     except CatchableError as e:
-      warn "failed to delete IPv4 ip rule for " & t.name & ": " & e.msg
+      warn fmt"failed to delete IPv4 ip rule for {t.name}: {e.msg}"
 
   if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
     try:
       d.routeManager.delRule(t.mark, d.config.globals.markMask,
                              t.tableId, 100 + index.uint32, AF_INET6)
     except CatchableError as e:
-      warn "failed to delete IPv6 ip rule for " & t.name & ": " & e.msg
+      warn fmt"failed to delete IPv6 ip rule for {t.name}: {e.msg}"
 
   try:
     d.routeManager.flushTableBoth(t.tableId)
   except CatchableError as e:
-    warn "failed to flush table " & $t.tableId & " for " & t.name & ": " & e.msg
+    warn fmt"failed to flush table {t.tableId} for {t.name}: {e.msg}"
 
-  info "removed routes for " & t.name
+  info fmt"removed routes for {t.name}"
 
 # =========================================================================
 # DNS management
@@ -480,12 +475,12 @@ proc flushConntrack(d: var Daemon, mark, mask: uint32) =
     try:
       d.conntrackMgr.flushByMark(mark, mask)
     except CatchableError as e:
-      error "conntrack flush failed: " & e.msg
+      error fmt"conntrack flush failed: {e.msg}"
   of cfmFull:
     try:
       d.conntrackMgr.flushByMark(0, 0)  # mask=0 means match all entries
     except CatchableError as e:
-      error "conntrack flush all failed: " & e.msg
+      error fmt"conntrack flush all failed: {e.msg}"
   of cfmNone:
     discard
 
@@ -515,7 +510,7 @@ proc maybeFlushConntrack(d: var Daemon, index: int, mark: uint32,
     return
 
   if trigger in c.flushConntrack:
-    debug c.name & ": conntrack flush triggered by " & $newState
+    debug fmt"{c.name}: conntrack flush triggered by {newState}"
     d.flushConntrack(mark, d.config.globals.markMask)
 
 # =========================================================================
@@ -549,16 +544,15 @@ proc runHook(d: var Daemon, interfaceName: string, newState: InterfaceState) =
     d.firstConnectFired = true
 
   if d.inFlightHooks >= MaxInFlightHooks:
-    warn "hook script skipped (" & $d.inFlightHooks & " already in flight)"
+    warn fmt"hook script skipped ({d.inFlightHooks} already in flight)"
     return
 
-  info "running hook: " & script & " ACTION=" & action &
-       " INTERFACE=" & interfaceName & " DEVICE=" & device
+  info fmt"running hook: {script} ACTION={action} INTERFACE={interfaceName} DEVICE={device}"
 
   # Fork and exec the hook script
   let pid = posix.fork()
   if pid < 0:
-    warn "failed to fork for hook script: " & $strerror(errno)
+    warn fmt"failed to fork for hook script: {strerror(errno)}"
   elif pid == 0:
     # Child process
     # Set environment variables
@@ -580,7 +574,7 @@ proc runHook(d: var Daemon, interfaceName: string, newState: InterfaceState) =
     if res > 0:
       dec d.inFlightHooks
       if WEXITSTATUS(status) != 0:
-        warn "hook script exited with " & $WEXITSTATUS(status)
+        warn fmt"hook script exited with {WEXITSTATUS(status)}"
 
 proc reapHookChildren(d: var Daemon) =
   ## Non-blocking reap of any finished hook child processes.
@@ -590,7 +584,7 @@ proc reapHookChildren(d: var Daemon) =
     if res <= 0: break
     dec d.inFlightHooks
     if WIFEXITED(status) and WEXITSTATUS(status) != 0:
-      warn "hook script exited with " & $WEXITSTATUS(status)
+      warn fmt"hook script exited with {WEXITSTATUS(status)}"
 
 # =========================================================================
 # Status file management
@@ -598,11 +592,11 @@ proc reapHookChildren(d: var Daemon) =
 
 proc createStatusDirs(d: Daemon) =
   for t in d.trackers:
-    let dir = "/var/run/nopal/" & t.name
+    let dir = fmt"/var/run/nopal/{t.name}"
     try:
       createDir(dir)
     except OSError as e:
-      warn "failed to create status dir " & dir & ": " & e.msg
+      warn fmt"failed to create status dir {dir}: {e.msg}"
 
 proc writeStatusFile(d: Daemon, index: int, state: InterfaceState) =
   var t: InterfaceTracker
@@ -614,24 +608,25 @@ proc writeStatusFile(d: Daemon, index: int, state: InterfaceState) =
       break
   if not found: return
 
-  let dir = "/var/run/nopal/" & t.name
+  let dir = fmt"/var/run/nopal/{t.name}"
   var content = $state & "\n"
 
   if t.onlineSince.isSome:
     let elapsed = (getMonoTime() - t.onlineSince.get).inSeconds
-    content.add("uptime=" & $elapsed & "\n")
+    content.add(fmt"uptime={elapsed}" & "\n")
   if t.offlineSince.isSome:
     let elapsed = (getMonoTime() - t.offlineSince.get).inSeconds
-    content.add("downtime=" & $elapsed & "\n")
-  content.add("success_count=" & $t.successCount & "\n")
-  content.add("fail_count=" & $t.failCount & "\n")
+    content.add(fmt"downtime={elapsed}" & "\n")
+  content.add(fmt"success_count={t.successCount}" & "\n")
+  content.add(fmt"fail_count={t.failCount}" & "\n")
   if t.avgRttMs.isSome:
-    content.add("avg_rtt_ms=" & $t.avgRttMs.get & "\n")
-  content.add("loss_percent=" & $t.lossPercent & "\n")
+    content.add(fmt"avg_rtt_ms={t.avgRttMs.get}" & "\n")
+  content.add(fmt"loss_percent={t.lossPercent}" & "\n")
 
   # Atomic write via temp + rename
-  let tmpPath = dir & "/status.tmp." & $posix.getpid()
-  let finalPath = dir & "/status"
+  let pid = posix.getpid()
+  let tmpPath = fmt"{dir}/status.tmp.{pid}"
+  let finalPath = fmt"{dir}/status"
 
   try: removeFile(tmpPath)
   except OSError: discard
@@ -639,7 +634,7 @@ proc writeStatusFile(d: Daemon, index: int, state: InterfaceState) =
   let fd = posix.open(cstring(tmpPath),
                       O_WRONLY or O_CREAT or O_EXCL, 0o644)
   if fd < 0:
-    warn "failed to create status file " & tmpPath
+    warn fmt"failed to create status file {tmpPath}"
     return
 
   let written = posix.write(fd, cstring(content), content.len)
@@ -656,7 +651,7 @@ proc writeStatusFile(d: Daemon, index: int, state: InterfaceState) =
   try:
     moveFile(tmpPath, finalPath)
   except OSError as e:
-    warn "failed to rename status file: " & e.msg
+    warn fmt"failed to rename status file: {e.msg}"
     try: removeFile(tmpPath)
     except OSError: discard
 
@@ -738,12 +733,10 @@ proc handleDampenDecay(d: var Daemon, index: int) =
   d.trackers[trackerIdx].dampening = some(damp)
 
   if damp.isSuppressed:
-    debug d.trackers[trackerIdx].name & ": dampening penalty decayed to " &
-          $damp.penalty & " (reuse: " & $damp.reuse & ")"
+    debug fmt"{d.trackers[trackerIdx].name}: dampening penalty decayed to {damp.penalty} (reuse: {damp.reuse})"
     d.scheduleDampenDecay(index)
   else:
-    info d.trackers[trackerIdx].name &
-         ": dampening reuse threshold reached, unsuppressed"
+    info fmt"{d.trackers[trackerIdx].name}: dampening reuse threshold reached, unsuppressed"
 
     # If interface is Offline with link still up, restart probing
     if d.trackers[trackerIdx].state == isOffline:
@@ -751,7 +744,7 @@ proc handleDampenDecay(d: var Daemon, index: int) =
       let mark = d.trackers[trackerIdx].mark
       let newStateOpt = d.trackers[trackerIdx].linkUp()
       if newStateOpt.isSome:
-        info name & ": restarting probing after dampening decay"
+        info fmt"{name}: restarting probing after dampening decay"
         d.probeEngine.resetCounters(index)
         let tr = actionsForTransition(name, index, mark, isOffline, newStateOpt.get)
         d.executeActions(tr)
@@ -901,7 +894,7 @@ proc handleRouteEvents(d: var Daemon) =
       for t in d.trackers:
         if t.ifindex != 0 and t.ifindex == change.ifindex:
           if t.state == isOnline or t.state == isDegraded:
-            debug t.name & ": route change detected (family=" & $change.family & ")"
+            debug fmt"{t.name}: route change detected (family={change.family})"
             d.connectedNetworksDirty = true
           found = true
           break
@@ -913,7 +906,7 @@ proc handleProbeTimer(d: var Daemon, index: int) =
   ## Send a probe for the given interface, schedule timeout.
   let ok = d.probeEngine.sendProbe(index)
   if not ok:
-    warn "failed to send probe for interface " & $index
+    warn fmt"failed to send probe for interface {index}"
     d.timers.cancelByIndex(index, {tkProbeTimeout})
     # Treat send failure as immediate timeout
     let resultOpt = d.probeEngine.recordTimeout(index)
@@ -978,7 +971,7 @@ proc initializeInterfaces(d: var Daemon) =
       d.trackers[ti].onlineSince = some(getMonoTime())
       d.trackers[ti].successCount = d.trackers[ti].upCount
       onlineIndices.add(index)
-      info d.trackers[ti].name & ": initial_state=online, active immediately"
+      info fmt"{d.trackers[ti].name}: initial_state=online, active immediately"
     else:
       discard d.trackers[ti].linkUp()
 
@@ -1038,13 +1031,13 @@ proc initializeInterfaces(d: var Daemon) =
 
 proc handleReload(d: var Daemon) =
   ## Reload configuration, applying targeted or full rebuild as needed.
-  info "reloading configuration from " & d.configPath
+  info fmt"reloading configuration from {d.configPath}"
 
   var newConfig: NopalConfig
   try:
     newConfig = loadConfig(d.configPath)
   except CatchableError as e:
-    error "failed to reload config: " & e.msg
+    error fmt"failed to reload config: {e.msg}"
     return
 
   let cfgDiff = diff(d.config, newConfig)
@@ -1119,11 +1112,11 @@ proc handleReload(d: var Daemon) =
   for i, iface in d.config.interfaces:
     if not iface.enabled: continue
     if not ipv6Enabled and iface.family == afIpv6:
-      warn iface.name & ": skipping IPv6-only interface (ipv6_enabled=false)"
+      warn fmt"{iface.name}: skipping IPv6-only interface (ipv6_enabled=false)"
       continue
 
     if markIdx >= marks.len:
-      error iface.name & ": no mark slot available, skipping"
+      error fmt"{iface.name}: no mark slot available, skipping"
       continue
 
     let (mark, tableId) = marks[markIdx]
@@ -1226,8 +1219,7 @@ proc handleReload(d: var Daemon) =
   # Regenerate nftables
   d.regenerateNftables()
 
-  info "configuration reloaded: " & $d.config.interfaces.len & " interfaces, " &
-       $d.config.policies.len & " policies, " & $d.config.rules.len & " rules"
+  info fmt"configuration reloaded: {d.config.interfaces.len} interfaces, {d.config.policies.len} policies, {d.config.rules.len} rules"
 
 # =========================================================================
 # Shutdown
@@ -1325,7 +1317,7 @@ proc run*(d: var Daemon) =
       elif token == TokenIpc:
         let clientId = d.ipcServer.acceptClient(d.selector)
         if clientId >= 0:
-          debug "IPC client connected: " & $clientId
+          debug fmt"IPC client connected: {clientId}"
       elif token >= ProbeTokenBase and token < IpcClientBase:
         d.handleProbeResponse(token - ProbeTokenBase)
       elif token >= IpcClientBase:

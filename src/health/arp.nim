@@ -7,7 +7,7 @@
 ## The socket uses AF_PACKET with SOCK_DGRAM (kernel handles Ethernet
 ## framing). Like other probe types, it is bound to a specific interface.
 
-import std/[posix, os]
+import std/[posix, os, strformat]
 import ../linux_constants
 
 const
@@ -40,7 +40,7 @@ proc ioctl(fd: cint, request: culong, arg: pointer): cint
 proc createArpSocket*(device: string): tuple[fd: cint, state: ArpProbeState] =
   ## Create an AF_PACKET ARP socket bound to `device`.
   ## Returns the fd and an ArpProbeState populated with interface info.
-  assert device.len < IFNAMSIZ, "device name too long: " & device
+  assert device.len < IFNAMSIZ, fmt"device name too long: {device}"
 
   # Create AF_PACKET socket for ARP
   let proto = htons(ETH_P_ARP).cint

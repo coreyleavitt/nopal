@@ -8,7 +8,7 @@
 ## SO_BINDTODEVICE and marked with SO_MARK = 0xDEAD for nftables
 ## exemption.
 
-import std/[posix, os]
+import std/[posix, os, strformat]
 import ../linux_constants
 
 const DNS_PORT = 53'u16
@@ -226,6 +226,6 @@ when isMainModule:
     doAssert n1 == n2, "trailing dot should not change length"
     for i in 12 ..< n1:
       doAssert buf1[i] == buf2[i],
-        "trailing dot: byte " & $i & " differs"
+        fmt"trailing dot: byte {i} differs"
 
   echo "All encodeDnsQuery tests passed."
