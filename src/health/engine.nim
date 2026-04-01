@@ -78,7 +78,7 @@ proc lossPercent*(w: QualityWindow): uint32 =
 
 type
   ProbeTransportKind* = enum
-    tkIcmp, tkDns, tkHttp, tkArp, tkComposite
+    tkIcmp, tkDns, tkHttp, tkHttps, tkArp, tkComposite
 
   ProbeTransport* = object
     case kind*: ProbeTransportKind
@@ -96,6 +96,10 @@ type
       httpDevice*: string
       httpPort*: uint16
       httpState*: HttpProbeState
+    of tkHttps:
+      httpsFamily*: uint8
+      httpsDevice*: string
+      httpsPort*: uint16
     of tkArp:
       arpFd*: cint
       arpIfindex*: cint
@@ -223,6 +227,9 @@ proc dispatchSend*(transport: var ProbeTransport, target: array[16, byte],
   of tkHttp:
     # Would call: startHttpConnect(transport.httpFd, target, transport.httpPort)
     return false
+  of tkHttps:
+    # Would call: startHttpsConnect(state, target, family, seqNum)
+    return false
   of tkArp:
     # Would call: sendArpProbe(transport.arpFd, target, transport.arpIfindex, ...)
     return false
@@ -242,6 +249,8 @@ proc dispatchRecv*(transport: var ProbeTransport): Option[tuple[seqNum: uint16, 
     return none(tuple[seqNum: uint16, id: uint16])
   of tkHttp:
     return none(tuple[seqNum: uint16, id: uint16])
+  of tkHttps:
+    return none(tuple[seqNum: uint16, id: uint16])
   of tkArp:
     return none(tuple[seqNum: uint16, id: uint16])
   of tkComposite:
@@ -257,6 +266,7 @@ proc dispatchGetFds*(transport: ProbeTransport): seq[cint] =
   of tkIcmp: @[transport.icmpFd]
   of tkDns: @[transport.dnsFd]
   of tkHttp: @[transport.httpFd]
+  of tkHttps: @[]  # HTTPS doesn't register fds (polled like HTTP)
   of tkArp: @[transport.arpFd]
   of tkComposite:
     var fds: seq[cint] = @[]
@@ -270,6 +280,7 @@ proc dispatchClose*(transport: var ProbeTransport) =
   of tkIcmp: discard  # Would call: close(transport.icmpFd)
   of tkDns: discard
   of tkHttp: discard
+  of tkHttps: discard  # Would call: closeHttpsConn
   of tkArp: discard
   of tkComposite:
     for sub in transport.subs.mitems:
