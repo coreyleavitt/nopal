@@ -53,6 +53,39 @@ type
   ConnectedData* = object
     networks*: seq[string]
 
+proc parseResponse*(j: JsonNode): IpcResponse =
+  ## Parse a JSON object into an IpcResponse.
+  result.id = j.getOrDefault("id").getBiggestInt().uint64
+  result.success = j.getOrDefault("success").getBool()
+  result.error = j.getOrDefault("error").getStr()
+  result.data = j.getOrDefault("data")
+
+proc parseDaemonStatus*(j: JsonNode): DaemonStatus =
+  ## Parse a JSON object into a DaemonStatus.
+  result.version = j.getOrDefault("version").getStr()
+  result.uptimeSecs = j.getOrDefault("uptime_secs").getBiggestInt()
+  for iface in j.getOrDefault("interfaces"):
+    result.interfaces.add(InterfaceStatusData(
+      name: iface.getOrDefault("name").getStr(),
+      device: iface.getOrDefault("device").getStr(),
+      state: iface.getOrDefault("state").getStr(),
+      enabled: iface.getOrDefault("enabled").getBool(),
+      mark: iface.getOrDefault("mark").getInt().uint32,
+      tableId: iface.getOrDefault("table_id").getInt().uint32,
+      avgRttMs: iface.getOrDefault("avg_rtt_ms").getInt(-1),
+      lossPercent: iface.getOrDefault("loss_percent").getInt().uint32,
+      uptimeSecs: iface.getOrDefault("uptime_secs").getBiggestInt(),
+    ))
+  for pol in j.getOrDefault("policies"):
+    var members: seq[string]
+    for m in pol.getOrDefault("active_members"):
+      members.add(m.getStr())
+    result.policies.add(PolicyStatusData(
+      name: pol.getOrDefault("name").getStr(),
+      activeMembers: members,
+      activeTier: pol.getOrDefault("active_tier").getInt(-1),
+    ))
+
 proc parseRequest*(j: JsonNode): IpcRequest =
   ## Parse a JSON object into an IpcRequest.
   result.id = j.getOrDefault("id").getBiggestInt().uint64
