@@ -13,7 +13,9 @@ import ../linux_constants
 const
   HTTP_PORT = 80'u16
   HTTP_REQUEST = "HEAD / HTTP/1.0\r\nHost: health-check\r\nConnection: close\r\n\r\n"
-  linux_constants.MSG_NOSIGNAL = 0x4000.cint
+  HTTP_MSG_NOSIGNAL = 0x4000.cint
+  SOCK_NONBLOCK = 0x800.cint
+  SOCK_CLOEXEC_VAL = 0x80000.cint
 
 type
   HttpProbeState* = enum
@@ -27,7 +29,7 @@ proc createHttpSocket*(device: string, family: uint8): cint =
   let af = if family == AF_INET.uint8: AF_INET.cint else: AF_INET6.cint
 
   # SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
-  result = cint(socket(af, SOCK_STREAM.cint or SOCK_NONBLOCK.cint or SOCK_CLOEXEC.cint, 0))
+  result = cint(socket(af, SOCK_STREAM.cint or SOCK_NONBLOCK or SOCK_CLOEXEC_VAL, 0))
   if result < 0:
     raiseOSError(osLastError())
 
@@ -55,7 +57,7 @@ proc startHttpConnect*(fd: cint, target: openArray[byte], family: uint8,
     sa.sin_family = AF_INET.TSa_Family
     sa.sin_port = htons(port)
     copyMem(addr sa.sin_addr, unsafeAddr target[0], 4)
-    let ret = connect(fd, cast[ptr SockAddr](addr sa),
+    let ret = connect(SocketHandle(fd), cast[ptr SockAddr](addr sa),
                       sizeof(Sockaddr_in).SockLen)
     if ret == 0:
       return true
@@ -68,7 +70,7 @@ proc startHttpConnect*(fd: cint, target: openArray[byte], family: uint8,
     sa.sin6_family = AF_INET6.TSa_Family
     sa.sin6_port = htons(port)
     copyMem(addr sa.sin6_addr, unsafeAddr target[0], 16)
-    let ret = connect(fd, cast[ptr SockAddr](addr sa),
+    let ret = connect(SocketHandle(fd), cast[ptr SockAddr](addr sa),
                       sizeof(Sockaddr_in6).SockLen)
     if ret == 0:
       return true
@@ -82,14 +84,14 @@ proc checkHttpConnect*(fd: cint): bool =
   ## Returns true if connected with no socket error.
   var pfd: TPollfd
   pfd.fd = fd
-  pfd.events = POLLOUT.cshort
+  pfd.events = linux_constants.POLLOUT.cshort
   pfd.revents = 0
 
   let ret = poll(addr pfd, 1, 0)
   if ret <= 0:
     return false
 
-  if (pfd.revents.cint and (POLLERR.cint or POLLHUP.cint)) != 0:
+  if (pfd.revents.cint and (linux_constants.POLLERR.cint or linux_constants.POLLHUP.cint)) != 0:
     return false
 
   # Verify no error on the socket via getsockopt(SO_ERROR)
@@ -101,13 +103,13 @@ proc checkHttpConnect*(fd: cint): bool =
 
 proc sendHttpHead*(fd: cint): bool =
   ## Send the HTTP HEAD request. Returns true on success.
-  let ret = send(fd, cstring(HTTP_REQUEST), HTTP_REQUEST.len.cint, linux_constants.MSG_NOSIGNAL)
+  let ret = send(SocketHandle(fd), cast[pointer](cstring(HTTP_REQUEST)), HTTP_REQUEST.len, HTTP_MSG_NOSIGNAL)
   result = ret >= 0
 
 proc recvHttpResponse*(fd: cint, buf: var array[512, byte]): bool =
   ## Non-blocking receive of HTTP response.
   ## Returns true if response starts with "HTTP/" and status is 2xx.
-  let n = recv(fd, addr buf[0], buf.len.cint, 0)
+  let n = recv(SocketHandle(fd), cast[pointer](addr buf[0]), buf.len, 0)
   if n < 12:
     return false
 

@@ -161,7 +161,7 @@ proc sendArpProbe*(fd: cint, pkt: ArpPacket, ifindex: cint): bool =
   dst.sll_addr[4] = 0xFF
   dst.sll_addr[5] = 0xFF
 
-  let ret = sendto(fd, unsafeAddr pkt, sizeof(ArpPacket).SockLen, 0,
+  let ret = sendto(SocketHandle(fd), cast[pointer](unsafeAddr pkt), sizeof(ArpPacket), 0'i32,
                    cast[ptr SockAddr](addr dst),
                    sizeof(SockaddrLl).SockLen)
   result = ret >= 0
@@ -170,7 +170,7 @@ proc recvArpReply*(fd: cint, buf: var array[64, byte],
                    targetIp: array[4, byte]): bool =
   ## Non-blocking receive of an ARP reply.
   ## Returns true if the reply is ARPOP_REPLY from the expected target IP.
-  let n = recv(fd, addr buf[0], buf.len.cint, 0)
+  let n = recv(SocketHandle(fd), cast[pointer](addr buf[0]), buf.len, 0)
   if n < ARP_PKT_LEN:
     return false
 
