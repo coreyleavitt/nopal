@@ -19,3 +19,8 @@ fuzz/oom-*
 *~
 .DS_Store
 # Nim compiled outputs
+src/health/arp
+src/health/dampening
+src/health/dns
+src/health/http
+src/health/icmp
