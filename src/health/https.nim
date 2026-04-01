@@ -224,56 +224,56 @@ when defined(https):
         continue  # fall through to handshake
 
       of hpTlsHandshaking:
-      let ret = mbedtls_ssl_handshake(conn.sslCtx)
-      if ret == MBEDTLS_ERR_SSL_WANT_READ or ret == MBEDTLS_ERR_SSL_WANT_WRITE:
-        return  # try again next poll
-      if ret != 0:
-        debug fmt"HTTPS probe TLS handshake failed: {ret}"
-        state.closeHttpsConn()
-        return
-      conn.phase = hpSendingRequest
-      continue  # fall through to send
+        let ret = mbedtls_ssl_handshake(conn.sslCtx)
+        if ret == MBEDTLS_ERR_SSL_WANT_READ or ret == MBEDTLS_ERR_SSL_WANT_WRITE:
+          return  # try again next poll
+        if ret != 0:
+          debug fmt"HTTPS probe TLS handshake failed: {ret}"
+          state.closeHttpsConn()
+          return
+        conn.phase = hpSendingRequest
+        continue  # fall through to send
 
       of hpSendingRequest:
-      let reqBytes = HttpsRequest
-      let ret = mbedtls_ssl_write(conn.sslCtx, cast[ptr byte](cstring(reqBytes)),
-                                   csize_t(reqBytes.len))
-      if ret == MBEDTLS_ERR_SSL_WANT_WRITE:
-        return
-      if ret < 0:
-        debug fmt"HTTPS probe write failed: {ret}"
-        state.closeHttpsConn()
-        return
-      conn.phase = hpWaitingResponse
-      return  # wait for next readable event
+        let reqBytes = HttpsRequest
+        let ret = mbedtls_ssl_write(conn.sslCtx, cast[ptr byte](cstring(reqBytes)),
+                                     csize_t(reqBytes.len))
+        if ret == MBEDTLS_ERR_SSL_WANT_WRITE:
+          return
+        if ret < 0:
+          debug fmt"HTTPS probe write failed: {ret}"
+          state.closeHttpsConn()
+          return
+        conn.phase = hpWaitingResponse
+        return  # wait for next readable event
 
       of hpWaitingResponse:
-      var buf: array[64, byte]
-      let ret = mbedtls_ssl_read(conn.sslCtx, addr buf[0], csize_t(buf.len))
-      if ret == MBEDTLS_ERR_SSL_WANT_READ:
-        return
-      if ret < 12:
-        if ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
-          debug "HTTPS probe: peer closed before response"
-        elif ret < 0:
-          debug fmt"HTTPS probe read failed: {ret}"
-        else:
-          debug fmt"HTTPS probe: response too short ({ret} bytes)"
-        state.closeHttpsConn()
-        return
-
-      # Validate HTTP response: "HTTP/x.x NNN"
-      let n = ret
-      if buf[0] == byte('H') and buf[1] == byte('T') and buf[2] == byte('T') and
-         buf[3] == byte('P') and buf[4] == byte('/'):
-        let s0 = char(buf[9])
-        let s1 = char(buf[10])
-        let s2 = char(buf[11])
-        if s0 == '2' and s1 in {'0'..'9'} and s2 in {'0'..'9'}:
-          let seq = conn.seqNum
+        var buf: array[64, byte]
+        let ret = mbedtls_ssl_read(conn.sslCtx, addr buf[0], csize_t(buf.len))
+        if ret == MBEDTLS_ERR_SSL_WANT_READ:
+          return
+        if ret < 12:
+          if ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
+            debug "HTTPS probe: peer closed before response"
+          elif ret < 0:
+            debug fmt"HTTPS probe read failed: {ret}"
+          else:
+            debug fmt"HTTPS probe: response too short ({ret} bytes)"
           state.closeHttpsConn()
-          return (ok: true, seqNum: seq, id: probeId)
-        debug fmt"HTTPS probe non-2xx status: {s0}{s1}{s2}"
+          return
 
-      state.closeHttpsConn()
-      return  # end of while loop — response processed
+        # Validate HTTP response: "HTTP/x.x NNN"
+        let n = ret
+        if buf[0] == byte('H') and buf[1] == byte('T') and buf[2] == byte('T') and
+           buf[3] == byte('P') and buf[4] == byte('/'):
+          let s0 = char(buf[9])
+          let s1 = char(buf[10])
+          let s2 = char(buf[11])
+          if s0 == '2' and s1 in {'0'..'9'} and s2 in {'0'..'9'}:
+            let seq = conn.seqNum
+            state.closeHttpsConn()
+            return (ok: true, seqNum: seq, id: probeId)
+          debug fmt"HTTPS probe non-2xx status: {s0}{s1}{s2}"
+
+        state.closeHttpsConn()
+        return  # end of while loop — response processed
