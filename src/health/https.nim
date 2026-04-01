@@ -277,3 +277,31 @@ when defined(https):
 
         state.closeHttpsConn()
         return  # end of while loop — response processed
+
+  when isMainModule:
+    echo "=== HTTPS probe tests ==="
+
+    block testCreateAndClose:
+      var state = createHttpsProbeState("eth0", 443)
+      assert state.conn == nil
+      state.closeHttpsConn()  # no-op on nil
+      assert state.conn == nil
+      echo "  PASS: create and close on nil"
+
+    block testCheckResponseOnNilConn:
+      var state = createHttpsProbeState("eth0", 443)
+      let r = state.checkHttpsResponse(0)
+      assert not r.ok
+      echo "  PASS: checkResponse returns false on nil conn"
+
+    block testDefaultPort:
+      let state = createHttpsProbeState("eth0")
+      assert state.port == 443
+      echo "  PASS: default port is 443"
+
+    block testCustomPort:
+      let state = createHttpsProbeState("eth0", 8443)
+      assert state.port == 8443
+      echo "  PASS: custom port 8443"
+
+    echo "All HTTPS probe tests passed."
