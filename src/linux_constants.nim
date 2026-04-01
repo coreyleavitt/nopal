@@ -112,3 +112,122 @@ type
 
 static:
   assert sizeof(IfInfoMsg) == 16
+
+# Netlink attribute header
+type
+  NlAttr* {.packed.} = object
+    nlaLen*: uint16
+    nlaType*: uint16
+
+static:
+  assert sizeof(NlAttr) == 4
+
+# Address message (RTM_NEWADDR / RTM_GETADDR)
+type
+  IfAddrMsg* {.packed.} = object
+    ifaFamily*: uint8
+    ifaPrefixLen*: uint8
+    ifaFlags*: uint8
+    ifaScope*: uint8
+    ifaIndex*: uint32
+
+static:
+  assert sizeof(IfAddrMsg) == 8
+
+# Netfilter generic header (for conntrack)
+type
+  NfGenMsg* {.packed.} = object
+    nfgenFamily*: uint8
+    version*: uint8
+    resId*: uint16
+
+static:
+  assert sizeof(NfGenMsg) == 4
+
+# Netlink error response
+type
+  NlMsgErr* {.packed.} = object
+    error*: int32
+    msg*: NlMsgHdr
+
+static:
+  assert sizeof(NlMsgErr) == 20
+
+# ICMP echo header (shared layout for ICMPv4 and ICMPv6)
+type
+  IcmpEchoHdr* {.packed.} = object
+    icmpType*: uint8
+    icmpCode*: uint8
+    icmpChecksum*: uint16
+    icmpId*: uint16
+    icmpSeq*: uint16
+
+static:
+  assert sizeof(IcmpEchoHdr) == 8
+
+# ARP packet (28 bytes for IPv4-over-Ethernet)
+type
+  ArpPacket* {.packed.} = object
+    hwType*: uint16       # 1 = Ethernet
+    protoType*: uint16    # 0x0800 = IPv4
+    hwLen*: uint8         # 6
+    protoLen*: uint8      # 4
+    operation*: uint16    # 1=request, 2=reply
+    senderMac*: array[6, byte]
+    senderIp*: array[4, byte]
+    targetMac*: array[6, byte]
+    targetIp*: array[4, byte]
+
+static:
+  assert sizeof(ArpPacket) == 28
+
+# Netlink message types (generic)
+const NLMSG_NOOP* = uint16(1)
+const NLMSG_ERROR* = uint16(2)
+const NLMSG_DONE* = uint16(3)
+
+# Address attributes (IFA_*)
+const IFA_ADDRESS* = cushort(1)
+const IFA_LOCAL* = cushort(2)
+const IFA_LABEL* = cushort(3)
+
+# Route table/protocol/scope/type constants
+const RT_TABLE_MAIN* = uint8(254)
+const RTPROT_STATIC* = uint8(4)
+const RTPROT_NOPAL* = uint8(99)
+const RT_SCOPE_UNIVERSE* = uint8(0)
+const RT_SCOPE_LINK* = uint8(253)
+const RTN_UNICAST* = uint8(1)
+const RTN_UNREACHABLE* = uint8(7)
+const RTN_BLACKHOLE* = uint8(6)
+
+# Routing rule attributes (FRA_*)
+const FRA_PRIORITY* = cushort(6)
+const FRA_FWMARK* = cushort(10)
+const FRA_FWMASK* = cushort(16)
+const FRA_TABLE* = cushort(15)
+const FRA_SRC* = cushort(2)
+
+# ICMP types
+const ICMP_ECHO_REQUEST* = uint8(8)
+const ICMP_ECHO_REPLY* = uint8(0)
+const ICMPV6_ECHO_REQUEST* = uint8(128)
+const ICMPV6_ECHO_REPLY* = uint8(129)
+
+# ARP operations
+const ARPOP_REQUEST* = uint16(1)
+const ARPOP_REPLY* = uint16(2)
+
+# Socket/IP options not in Nim posix
+const IP_TTL* = cint(2)
+const IPV6_UNICAST_HOPS* = cint(16)
+const MSG_NOSIGNAL* = cint(0x4000)
+const MSG_TRUNC* = cint(0x20)
+
+# Poll events
+const POLLOUT* = cshort(0x04)
+const POLLERR* = cshort(0x08)
+const POLLHUP* = cshort(0x10)
+
+# Probe identification mark
+const PROBE_MARK* = uint32(0xDEAD)
