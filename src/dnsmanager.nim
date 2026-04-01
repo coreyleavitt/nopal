@@ -3,10 +3,11 @@
 ## Maintains per-interface DNS server lists and writes them atomically
 ## to /tmp/resolv.conf.auto. Signals dnsmasq via SIGHUP to pick up changes.
 
-import std/[posix, os, osproc, logging, strutils]
+import std/[posix, os, logging, strutils]
 
 const
   ResolvConfPath = "/tmp/resolv.conf.auto"
+  DnsmasqPidPath = "/var/run/dnsmasq.pid"
 
 type
   DnsEntry = object
@@ -32,7 +33,10 @@ proc setServers*(dm: var DnsManager, iface: string, servers: openArray[string]) 
   ## Set DNS servers for an interface. Replaces any previous servers.
   dm.removeInterface(iface)
   for s in servers:
-    dm.entries.add(DnsEntry(server: s, interfaceName: iface))
+    # Strip control characters for defense-in-depth
+    let clean = s.strip()
+    if clean.len > 0 and '\n' notin clean and '\r' notin clean:
+      dm.entries.add(DnsEntry(server: clean, interfaceName: iface))
 
 proc activeServers*(dm: DnsManager): seq[tuple[server, iface: string]] =
   ## Return all active DNS servers with their interface names.
@@ -45,22 +49,48 @@ proc apply*(dm: DnsManager) =
   for e in dm.entries:
     content.add("nameserver " & e.server & " # " & e.interfaceName & "\n")
 
-  # Atomic write: temp file + sync + rename
+  # Atomic write: open with O_EXCL (fail if exists), fsync, rename
   let tmpPath = ResolvConfPath & ".nopal." & $getpid()
+
+  # Remove stale temp file from previous crash
+  try: removeFile(tmpPath)
+  except OSError: discard
+
+  let fd = posix.open(cstring(tmpPath),
+                      posix.O_WRONLY or posix.O_CREAT or posix.O_EXCL, 0o644)
+  if fd < 0:
+    warn "failed to create temp DNS file: " & $strerror(errno)
+    return
+
+  let written = posix.write(fd, cast[pointer](cstring(content)), content.len)
+  if written < 0:
+    warn "failed to write DNS config: " & $strerror(errno)
+    discard posix.close(fd)
+    try: removeFile(tmpPath)
+    except OSError: discard
+    return
+
+  # fsync to ensure data is durable before rename
+  discard posix.fsync(fd)
+  discard posix.close(fd)
+
   try:
-    writeFile(tmpPath, content)
     moveFile(tmpPath, ResolvConfPath)
     info "wrote " & $dm.entries.len & " DNS servers to " & ResolvConfPath
   except OSError:
-    warn "failed to write DNS config: " & getCurrentExceptionMsg()
+    warn "failed to rename DNS config: " & getCurrentExceptionMsg()
     try: removeFile(tmpPath)
-    except: discard
+    except OSError: discard
     return
 
-  # Signal dnsmasq to re-read resolv.conf
-  let (_, exitCode) = execCmdEx("killall -HUP dnsmasq 2>/dev/null")
-  if exitCode != 0:
-    debug "dnsmasq not running or signal failed (expected on some setups)"
+  # Signal dnsmasq to re-read resolv.conf via PID file
+  try:
+    let pidStr = readFile(DnsmasqPidPath).strip()
+    let pid = parseInt(pidStr)
+    if pid > 0:
+      discard posix.kill(pid.cint, posix.SIGHUP)
+  except:
+    debug "dnsmasq not running or PID file not found"
 
 when isMainModule:
   import std/unittest
@@ -88,3 +118,10 @@ when isMainModule:
       var dm = initDnsManager()
       dm.removeInterface("wan")
       check dm.activeServers.len == 0
+
+    test "newlines in server strings are rejected":
+      var dm = initDnsManager()
+      dm.setServers("wan", ["8.8.8.8\nnameserver 1.2.3.4", "valid.server"])
+      # The injected entry should be rejected, only valid.server kept
+      check dm.activeServers.len == 1
+      check dm.activeServers[0].server == "valid.server"
