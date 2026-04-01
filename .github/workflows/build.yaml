@@ -92,6 +92,7 @@ jobs:
           ./configure \
             --prefix=/opt/musl/${{ matrix.nim_target }} \
             --target=${{ matrix.musl_triple }} \
+            --disable-shared \
             ${{ matrix.musl_configure_extra || '' }}
           make -j$(nproc)
           make install
