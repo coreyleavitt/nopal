@@ -19,9 +19,10 @@ proc applyRuleset*(rs: Ruleset): bool =
   input.write(jsonStr)
   input.close()
 
+  # Read output BEFORE waitForExit to avoid deadlock if nft fills pipe buffer
+  let output = process.outputStream().readAll()
   let exitCode = process.waitForExit()
   if exitCode != 0:
-    let output = process.outputStream().readAll()
     error "nft failed (exit " & $exitCode & "): " & output
     process.close()
     return false
@@ -31,9 +32,12 @@ proc applyRuleset*(rs: Ruleset): bool =
 
 proc cleanup*(): bool =
   ## Delete the nopal nftables table. Ignores "table not found" errors.
-  let (output, exitCode) = execCmdEx("nft delete table " & TableFamily & " " & TableName)
+  let process = startProcess("nft", args = ["delete", "table", TableFamily, TableName],
+                             options = {poUsePath, poStdErrToStdOut})
+  let output = process.outputStream().readAll()
+  let exitCode = process.waitForExit()
+  process.close()
   if exitCode != 0:
-    # Table not existing is fine (first run or already cleaned)
     if "No such file or directory" notin output and
        "does not exist" notin output:
       warn "nft cleanup failed: " & output
