@@ -52,6 +52,7 @@ const RTA_SRC* = cushort(2)
 const RTA_IIF* = cushort(3)
 const RTA_OIF* = cushort(4)
 const RTA_GATEWAY* = cushort(5)
+const RTA_PRIORITY* = cushort(6)
 const RTA_TABLE* = cushort(15)
 
 # Interface flags
@@ -202,6 +203,7 @@ const RTN_UNREACHABLE* = uint8(7)
 const RTN_BLACKHOLE* = uint8(6)
 
 # Routing rule attributes (FRA_*)
+const FR_ACT_TO_TBL* = uint8(1)
 const FRA_PRIORITY* = cushort(6)
 const FRA_FWMARK* = cushort(10)
 const FRA_FWMASK* = cushort(16)
