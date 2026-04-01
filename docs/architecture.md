@@ -254,6 +254,39 @@ MessagePack saves ~30% wire size, which is irrelevant for local IPC payloads und
 
 JSON can contain newlines in string values. Length-prefixed framing is unambiguous, requires no escaping, and allows the receiver to allocate the exact buffer size before reading.
 
+## Development environment
+
+### What we chose
+
+All development and CI builds run inside openSUSE Tumbleweed Docker containers. Tumbleweed provides rolling-release access to the latest Nim compiler, GCC, and tooling without waiting for distro release cycles.
+
+Cross-compilation toolchains are built with [crosstool-ng](https://crosstool-ng.github.io/) for all four OpenWrt targets:
+
+| Target | ct-ng tuple | Notes |
+|---|---|---|
+| aarch64 | `aarch64-unknown-linux-musl` | Cortex-A53/A72 routers |
+| armv7hf | `armv7-unknown-linux-musleabihf` | Cortex-A7/A9 routers |
+| mips | `mips-unknown-linux-musl` | Big-endian MIPS (Atheros, MediaTek) |
+| mipsel | `mipsel-unknown-linux-musl` | Little-endian MIPS (Broadcom, Realtek) |
+
+Toolchains are built once and cached as Docker layers. The Nim build pipeline is: `nim c --compileOnly` (generates C on host) then cross-compile the generated C with the ct-ng toolchain.
+
+**HTTPS build variant:** The base binary is fully static. The HTTPS-enabled variant dynamically links against system mbedTLS, which requires mbedTLS development headers at compile time (architecture-independent, pulled from OpenWrt's package feed).
+
+### Why crosstool-ng instead of OpenWrt SDK
+
+The OpenWrt SDK is designed for building full OpenWrt packages with dynamic linking against the system's musl and libraries. For a statically-linked binary:
+
+- The SDK pulls in the entire OpenWrt build system (~500 MB) just to get a cross-compiler
+- SDK versions are tied to OpenWrt releases — you can't freely choose GCC or musl versions
+- SDK toolchains include OpenWrt-specific patches that are irrelevant for static builds
+
+crosstool-ng builds exactly the toolchain you need: specific GCC version, specific musl version, specific architecture flags. The result is a ~200 MB toolchain per target that produces identical output regardless of the host environment.
+
+### Why Tumbleweed
+
+Rolling release means the Nim compiler, GCC, and all development tools are always current without manual version management. For a language (Nim) that is still evolving, being on the latest stable compiler avoids accumulating workarounds for fixed bugs.
+
 ## Source structure
 
 ```

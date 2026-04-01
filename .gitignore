@@ -1,1 +1,20 @@
-/target
+# Nim build output
+nimcache/
+nimblecache/
+src/nopal
+src/nopald
+
+# Test binaries
+tests/t_*
+!tests/t_*.nim
+
+# Fuzz artifacts
+fuzz/fuzz_*
+!fuzz/fuzz_*.nim
+fuzz/crash-*
+fuzz/oom-*
+
+# Editor/OS
+*.swp
+*~
+.DS_Store
