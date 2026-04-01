@@ -66,7 +66,7 @@ jobs:
       - name: Install build tools
         run: |
           zypper --non-interactive install \
-            clang lld llvm git make curl tar xz gzip bzip2 which mbedtls-devel
+            clang lld llvm git make cmake ninja curl tar xz gzip bzip2 which mbedtls-devel
           curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y --version 2.2.8
           echo "$HOME/.nimble/bin" >> $GITHUB_PATH
 
@@ -100,6 +100,51 @@ jobs:
           # Verify sysroot
           ls -la /opt/musl/${{ matrix.nim_target }}/lib/libc.a
           ls -la /opt/musl/${{ matrix.nim_target }}/include/stdio.h
+
+      - name: Build compiler-rt builtins
+        env:
+          LLVM_VERSION: "19.1.7"
+        run: |
+          cd /tmp
+          curl -LO "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/compiler-rt-${LLVM_VERSION}.src.tar.xz"
+          tar xf "compiler-rt-${LLVM_VERSION}.src.tar.xz"
+
+          # Also need cmake modules from LLVM source
+          curl -LO "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/cmake-${LLVM_VERSION}.src.tar.xz"
+          tar xf "cmake-${LLVM_VERSION}.src.tar.xz"
+
+          mkdir -p build-rt && cd build-rt
+          cmake "/tmp/compiler-rt-${LLVM_VERSION}.src" \
+            -G Ninja \
+            -DCMAKE_AR=$(which llvm-ar) \
+            -DCMAKE_NM=$(which llvm-nm) \
+            -DCMAKE_RANLIB=$(which llvm-ranlib) \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_C_COMPILER_TARGET="${{ matrix.musl_triple }}" \
+            -DCMAKE_C_FLAGS="--sysroot=/opt/musl/${{ matrix.nim_target }}" \
+            -DCMAKE_ASM_COMPILER_TARGET="${{ matrix.musl_triple }}" \
+            -DCMAKE_ASM_FLAGS="--sysroot=/opt/musl/${{ matrix.nim_target }}" \
+            -DCMAKE_SYSROOT="/opt/musl/${{ matrix.nim_target }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+            -DCOMPILER_RT_BUILD_BUILTINS=ON \
+            -DCOMPILER_RT_BUILD_CRT=ON \
+            -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+            -DCOMPILER_RT_BUILD_XRAY=OFF \
+            -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+            -DCOMPILER_RT_BUILD_PROFILE=OFF \
+            -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+            -DCOMPILER_RT_BUILD_ORC=OFF \
+            -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+            -DCOMPILER_RT_INCLUDE_TESTS=OFF \
+            -DLLVM_CMAKE_DIR="/tmp/cmake-${LLVM_VERSION}.src"
+          ninja builtins crt
+
+          # Install to clang's resource directory so -rtlib=compiler-rt finds them
+          CLANG_RT_DIR=$(clang --print-resource-dir)/lib/linux
+          mkdir -p "$CLANG_RT_DIR"
+          cp lib/linux/*.a "$CLANG_RT_DIR/" 2>/dev/null || true
+          cp lib/linux/*.o "$CLANG_RT_DIR/" 2>/dev/null || true
+          ls -la "$CLANG_RT_DIR/"
 
       - name: Cross-compile nopal
         run: |
