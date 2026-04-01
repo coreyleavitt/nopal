@@ -863,3 +863,268 @@ when isMainModule:
 
       let secondStr = $forwardRules[1]["expr"]
       check "fd00::" in secondStr
+
+    # ------------------------------------------------------------------
+    # HIGH priority tests
+    # ------------------------------------------------------------------
+
+    test "use_policy_default_emits_accept":
+      let interfaces = @[InterfaceInfo(name: "wan", device: "eth0", mark: 0x0100'u32, tableId: 100, clampMss: false)]
+      let policies = @[PolicyInfo(
+        name: "balanced",
+        members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
+        lastResort: Default,
+      )]
+      let rules = @[
+        # Rule using "default" policy -- should accept, not jump
+        RuleInfo(
+          srcIp: @["10.0.0.0/8"], destIp: @[], srcPort: "", destPort: "",
+          proto: "all", family: "ipv4", srcIface: "", ipset: "",
+          policy: "default", sticky: none(StickyInfo), log: false,
+        ),
+        # Normal rule -- should jump to policy chain
+        RuleInfo(
+          srcIp: @[], destIp: @[], srcPort: "", destPort: "",
+          proto: "all", family: "any", srcIface: "", ipset: "",
+          policy: "balanced", sticky: none(StickyInfo), log: false,
+        ),
+      ]
+      let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
+      let parsed = parseJson($rs.toJson())
+      let policyRules = getRulesForChain(parsed, "policy_rules")
+
+      check policyRules.len == 2
+
+      # First rule (use_policy default) should accept, not jump
+      let r0Str = $policyRules[0]["expr"]
+      check "accept" in r0Str
+      check "jump" notin r0Str
+
+      # Second rule should jump to policy chain
+      let r1Str = $policyRules[1]["expr"]
+      check "policy_balanced" in r1Str
+
+    test "policy_rules_with_filters":
+      let interfaces = @[InterfaceInfo(name: "wan", device: "eth0", mark: 0x0100'u32, tableId: 100, clampMss: false)]
+      let policies = @[PolicyInfo(
+        name: "direct",
+        members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
+        lastResort: Default,
+      )]
+      let rules = @[RuleInfo(
+        srcIp: @["192.168.1.0/24"], destIp: @["10.0.0.0/8"],
+        srcPort: "1024-65535", destPort: "443",
+        proto: "tcp", family: "ipv4", srcIface: "", ipset: "",
+        policy: "direct", sticky: none(StickyInfo), log: false,
+      )]
+      let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
+      let parsed = parseJson($rs.toJson())
+      let policyRules = getRulesForChain(parsed, "policy_rules")
+
+      check policyRules.len == 1
+      let ruleStr = $policyRules[0]["expr"]
+      check "nfproto" in ruleStr
+      check "l4proto" in ruleStr
+      check "192.168.1.0" in ruleStr  # src IP CIDR
+      check "10.0.0.0" in ruleStr     # dst IP CIDR
+      check "sport" in ruleStr
+      check "dport" in ruleStr
+      check "policy_direct" in ruleStr
+
+      # Verify port range and CIDR serialization via string search
+      check "1024" in ruleStr
+      check "65535" in ruleStr
+      check "443" in ruleStr
+      check "192.168.1.0" in ruleStr
+      check "10.0.0.0" in ruleStr
+
+    test "sticky_any_family_creates_dual_maps":
+      let interfaces = @[InterfaceInfo(name: "wan", device: "eth0", mark: 0x0100'u32, tableId: 100, clampMss: false)]
+      let policies = @[PolicyInfo(
+        name: "balanced",
+        members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
+        lastResort: Default,
+      )]
+      let rules = @[RuleInfo(
+        srcIp: @[], destIp: @[], srcPort: "", destPort: "",
+        proto: "all", family: "any", srcIface: "", ipset: "",
+        policy: "balanced",
+        sticky: some(StickyInfo(mode: "src_ip", timeout: 300)),
+        log: false,
+      )]
+      let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
+      let parsed = parseJson($rs.toJson())
+
+      # "any" family should create both v4 and v6 maps
+      let maps = getMaps(parsed)
+      check maps.len == 2
+      var mapNames: seq[string] = @[]
+      for m in maps:
+        mapNames.add(m["name"].getStr())
+      check "sticky_r0_v4" in mapNames
+      check "sticky_r0_v6" in mapNames
+
+    test "no_connected_networks_means_no_bypass_rules":
+      let (interfaces, policies, rules) = twoInterfaceSetup()
+      let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
+      let parsed = parseJson($rs.toJson())
+      let forwardRules = getRulesForChain(parsed, "forward")
+
+      # Without connected networks, forward chain should have 4 rules:
+      # bypass_v4 set + bypass_v6 set + ct restore + jump policy_rules
+      check forwardRules.len == 4
+
+    # ------------------------------------------------------------------
+    # MEDIUM priority tests
+    # ------------------------------------------------------------------
+
+    test "named_set_matching_in_rules":
+      let interfaces = @[InterfaceInfo(name: "wan", device: "eth0", mark: 0x0100'u32, tableId: 100, clampMss: false)]
+      let policies = @[PolicyInfo(
+        name: "direct",
+        members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
+        lastResort: Default,
+      )]
+      let rules = @[
+        # IPv4 named set on src_ip
+        RuleInfo(
+          srcIp: @["@vpn_clients"], destIp: @[], srcPort: "", destPort: "",
+          proto: "all", family: "ipv4", srcIface: "", ipset: "",
+          policy: "direct", sticky: none(StickyInfo), log: false,
+        ),
+        # IPv6 named set on dest_ip
+        RuleInfo(
+          srcIp: @[], destIp: @["@blocked_v6"], srcPort: "", destPort: "",
+          proto: "all", family: "ipv6", srcIface: "", ipset: "",
+          policy: "direct", sticky: none(StickyInfo), log: false,
+        ),
+      ]
+      let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
+      let parsed = parseJson($rs.toJson())
+      let policyRules = getRulesForChain(parsed, "policy_rules")
+
+      check policyRules.len == 2
+
+      # First rule: src_ip = @vpn_clients with IPv4
+      let expr0 = policyRules[0]["expr"]
+      var srcMatch: JsonNode
+      for e in expr0:
+        if e.hasKey("match") and e["match"]["left"].hasKey("payload"):
+          if e["match"]["left"]["payload"]["field"].getStr() == "saddr":
+            srcMatch = e
+            break
+      check srcMatch["match"]["left"]["payload"]["protocol"].getStr() == "ip"
+      check srcMatch["match"]["right"]["@"].getStr() == "vpn_clients"
+
+      # Second rule: dest_ip = @blocked_v6 with IPv6
+      let expr1 = policyRules[1]["expr"]
+      var dstMatch: JsonNode
+      for e in expr1:
+        if e.hasKey("match") and e["match"]["left"].hasKey("payload"):
+          if e["match"]["left"]["payload"]["field"].getStr() == "daddr":
+            dstMatch = e
+            break
+      check dstMatch["match"]["left"]["payload"]["protocol"].getStr() == "ip6"
+      check dstMatch["match"]["right"]["@"].getStr() == "blocked_v6"
+
+    test "proto_all_without_ports_stays_single_rule":
+      let interfaces = @[InterfaceInfo(name: "wan", device: "eth0", mark: 0x0100'u32, tableId: 100, clampMss: false)]
+      let policies = @[PolicyInfo(
+        name: "balanced",
+        members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
+        lastResort: Default,
+      )]
+      let rules = @[RuleInfo(
+        srcIp: @["10.0.0.0/8"], destIp: @[], srcPort: "", destPort: "",
+        proto: "all", family: "ipv4", srcIface: "", ipset: "",
+        policy: "balanced", sticky: none(StickyInfo), log: false,
+      )]
+      let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
+      let parsed = parseJson($rs.toJson())
+      let policyRules = getRulesForChain(parsed, "policy_rules")
+
+      # proto:all without ports should stay as a single rule with no l4proto match
+      check policyRules.len == 1
+      let ruleStr = $policyRules[0]["expr"]
+      check "l4proto" notin ruleStr
+
+    test "ipv6_addresses_use_ip6_protocol":
+      let interfaces = @[InterfaceInfo(name: "wan", device: "eth0", mark: 0x0100'u32, tableId: 100, clampMss: false)]
+      let policies = @[PolicyInfo(
+        name: "direct",
+        members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
+        lastResort: Default,
+      )]
+      let rules = @[RuleInfo(
+        srcIp: @["2001:db8::/32"], destIp: @["10.0.0.0/8"],
+        srcPort: "", destPort: "",
+        proto: "all", family: "any", srcIface: "", ipset: "",
+        policy: "direct", sticky: none(StickyInfo), log: false,
+      )]
+      let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
+      let parsed = parseJson($rs.toJson())
+      let policyRules = getRulesForChain(parsed, "policy_rules")
+      let expr = policyRules[0]["expr"]
+
+      # IPv6 src address should use "ip6" protocol
+      var saddrMatch: JsonNode
+      for e in expr:
+        if e.hasKey("match") and e["match"]["left"].hasKey("payload"):
+          if e["match"]["left"]["payload"]["field"].getStr() == "saddr":
+            saddrMatch = e
+            break
+      check saddrMatch["match"]["left"]["payload"]["protocol"].getStr() == "ip6"
+
+      # IPv4 dst address should use "ip" protocol
+      var daddrMatch: JsonNode
+      for e in expr:
+        if e.hasKey("match") and e["match"]["left"].hasKey("payload"):
+          if e["match"]["left"]["payload"]["field"].getStr() == "daddr":
+            daddrMatch = e
+            break
+      check daddrMatch["match"]["left"]["payload"]["protocol"].getStr() == "ip"
+
+    # ------------------------------------------------------------------
+    # LOW priority tests
+    # ------------------------------------------------------------------
+
+    test "per_rule_logging":
+      let (interfaces, policies, _) = twoInterfaceSetup()
+      let rules = @[
+        # Rule with logging enabled
+        RuleInfo(
+          srcIp: @[], destIp: @[], srcPort: "", destPort: "",
+          proto: "all", family: "any", srcIface: "", ipset: "",
+          policy: "balanced", sticky: none(StickyInfo), log: true,
+        ),
+        # Rule without logging
+        RuleInfo(
+          srcIp: @[], destIp: @[], srcPort: "", destPort: "",
+          proto: "tcp", family: "any", srcIface: "", ipset: "",
+          policy: "balanced", sticky: none(StickyInfo), log: false,
+        ),
+      ]
+      let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
+      let parsed = parseJson($rs.toJson())
+      let policyRules = getRulesForChain(parsed, "policy_rules")
+
+      check policyRules.len == 2
+
+      # First rule should have a log statement
+      let expr0 = policyRules[0]["expr"]
+      var hasLog0 = false
+      for e in expr0:
+        if e.hasKey("log"):
+          hasLog0 = true
+          check e["log"]["prefix"].getStr() == "nopal:balanced "
+          break
+      check hasLog0
+
+      # Second rule should NOT have a log statement
+      let expr1 = policyRules[1]["expr"]
+      var hasLog1 = false
+      for e in expr1:
+        if e.hasKey("log"):
+          hasLog1 = true
+          break
+      check not hasLog1
