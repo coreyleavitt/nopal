@@ -1,0 +1,36 @@
+## Timer wheel using heapqueue for probe scheduling.
+
+import std/heapqueue
+import std/monotimes
+
+type
+  TimerKind* = enum
+    tkProbe, tkProbeTimeout, tkDampenDecay, tkIpcTimeout
+
+  TimerEntry* = object
+    deadline*: MonoTime
+    kind*: TimerKind
+    index*: int
+
+proc `<`*(a, b: TimerEntry): bool =
+  a.deadline < b.deadline
+
+type
+  TimerWheel* = object
+    heap: HeapQueue[TimerEntry]
+
+proc newTimerWheel*(): TimerWheel =
+  TimerWheel(heap: initHeapQueue[TimerEntry]())
+
+proc push*(tw: var TimerWheel, entry: TimerEntry) =
+  tw.heap.push(entry)
+
+proc nextDeadline*(tw: TimerWheel): MonoTime =
+  if tw.heap.len > 0:
+    tw.heap[0].deadline
+  else:
+    getMonoTime() + initDuration(seconds = 60)
+
+proc popExpired*(tw: var TimerWheel, now: MonoTime): seq[TimerEntry] =
+  while tw.heap.len > 0 and tw.heap[0].deadline <= now:
+    result.add(tw.heap.pop())
