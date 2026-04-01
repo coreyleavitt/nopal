@@ -9,6 +9,7 @@
 
 import std/monotimes
 import std/times
+import std/math
 
 const PenaltyPerFailure* = 1000.0
 
