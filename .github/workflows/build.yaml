@@ -66,7 +66,7 @@ jobs:
       - name: Install build tools
         run: |
           zypper --non-interactive install \
-            clang lld llvm compiler-rt git make curl tar xz gzip bzip2 which mbedtls-devel
+            clang lld llvm git make curl tar xz gzip bzip2 which mbedtls-devel
           curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y --version 2.2.8
           echo "$HOME/.nimble/bin" >> $GITHUB_PATH
 
