@@ -17,33 +17,46 @@ when defined(release):
 # We use -nostdlib to suppress gcc's CRT files and default libraries,
 # then explicitly link musl's CRT objects and libc.
 #
+# clang.options.linker = "" clears Nim's default -ldl
+# -nostdlib suppresses all CRT files (crtbeginT.o, crtend.o) and default libs
+# Then we explicitly provide musl's crt1.o, crti.o, -lc, crtn.o
+#
 # Usage: nim c -d:release -d:aarch64 src/nopal.nim
 
 const crossCFlags = "-Oz -fno-unwind-tables -fno-asynchronous-unwind-tables -fmerge-all-constants -fvisibility=hidden"
 
-template crossProfile(archDef, nimCpu, target, sysrootPath: string) =
-  when defined(archDef):
-    switch("os", "linux")
-    switch("cpu", nimCpu)
-    switch("cc", "clang")
-    switch("clang.exe", "clang")
-    switch("clang.linkerexe", "clang")
-    # Clear Nim's default linker options (-ldl) for clang
-    switch("clang.options.linker", "")
-    switch("passC", "--target=" & target & " --sysroot=" & sysrootPath & " " & crossCFlags)
-    # -nostdlib: suppress all default CRT files and libraries (no crtbeginT.o, no libgcc)
-    # Then explicitly link musl's startup objects and libc
-    switch("passL", "--target=" & target & " --sysroot=" & sysrootPath &
-      " -static -fuse-ld=lld -nostdlib" &
-      " " & sysrootPath & "/lib/crt1.o" &
-      " " & sysrootPath & "/lib/crti.o" &
-      " -lc" &
-      " " & sysrootPath & "/lib/crtn.o")
+proc setupCross(target, sysroot: string) =
+  switch("cc", "clang")
+  switch("clang.exe", "clang")
+  switch("clang.linkerexe", "clang")
+  switch("clang.options.linker", "")
+  switch("passC", "--target=" & target & " --sysroot=" & sysroot & " " & crossCFlags)
+  switch("passL", "--target=" & target & " --sysroot=" & sysroot &
+    " -static -fuse-ld=lld -nostdlib" &
+    " " & sysroot & "/lib/crt1.o" &
+    " " & sysroot & "/lib/crti.o" &
+    " -lc" &
+    " " & sysroot & "/lib/crtn.o")
 
-crossProfile("aarch64", "arm64", "aarch64-linux-musl", "/opt/musl/aarch64")
-crossProfile("armv7hf", "arm", "armv7-linux-musleabihf", "/opt/musl/armv7hf")
-crossProfile("mips", "mips", "mips-linux-musl", "/opt/musl/mips")
-crossProfile("mipsel", "mipsel", "mipsel-linux-musl", "/opt/musl/mipsel")
+when defined(aarch64):
+  switch("os", "linux")
+  switch("cpu", "arm64")
+  setupCross("aarch64-linux-musl", "/opt/musl/aarch64")
+
+when defined(armv7hf):
+  switch("os", "linux")
+  switch("cpu", "arm")
+  setupCross("armv7-linux-musleabihf", "/opt/musl/armv7hf")
+
+when defined(mips):
+  switch("os", "linux")
+  switch("cpu", "mips")
+  setupCross("mips-linux-musl", "/opt/musl/mips")
+
+when defined(mipsel):
+  switch("os", "linux")
+  switch("cpu", "mipsel")
+  setupCross("mipsel-linux-musl", "/opt/musl/mipsel")
 
 # HTTPS feature flag (requires nim-mbedtls)
 # Usage: nim c -d:https src/nopal.nim
