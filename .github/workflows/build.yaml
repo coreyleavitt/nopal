@@ -126,6 +126,7 @@ jobs:
             -DCMAKE_ASM_FLAGS="--sysroot=/opt/musl/${{ matrix.nim_target }}" \
             -DCMAKE_SYSROOT="/opt/musl/${{ matrix.nim_target }}" \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
             -DCOMPILER_RT_BUILD_BUILTINS=ON \
             -DCOMPILER_RT_BUILD_CRT=ON \
             -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
@@ -136,7 +137,7 @@ jobs:
             -DCOMPILER_RT_BUILD_ORC=OFF \
             -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
             -DCOMPILER_RT_INCLUDE_TESTS=OFF \
-            -DLLVM_CMAKE_DIR="/tmp/cmake-${LLVM_VERSION}.src"
+            -DLLVM_CMAKE_DIR="/tmp/cmake-${LLVM_VERSION}.src/Modules"
           ninja builtins crt
 
           # Install to clang's resource directory so -rtlib=compiler-rt finds them
