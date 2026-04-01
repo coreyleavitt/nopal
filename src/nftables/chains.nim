@@ -154,6 +154,7 @@ proc prefixValue(cidr: string): JsonNode =
   return %*cidr
 
 proc matchIpList(addrs: seq[string], field, ruleFamily: string): JsonNode =
+  assert addrs.len > 0, "matchIpList called with empty address list"
   let proto = ipProtocolFor(addrs[0], ruleFamily)
   let right =
     if addrs.len == 1:
@@ -508,6 +509,7 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
 proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[PolicyInfo],
                    rules: openArray[RuleInfo], connected: openArray[string],
                    markMask: uint32, ipv6Enabled, logging: bool): Ruleset =
+  # TODO: ipv6Enabled gates IPv6 chain generation; logging gates per-rule log stmts
   var rs = initRuleset()
 
   # Table setup: add (idempotent create) then flush (clear old rules)
