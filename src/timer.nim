@@ -31,6 +31,8 @@ proc nextDeadline*(tw: TimerWheel): MonoTime =
   else:
     getMonoTime() + initDuration(seconds = 60)
 
-proc popExpired*(tw: var TimerWheel, now: MonoTime): seq[TimerEntry] =
+proc popExpired*(tw: var TimerWheel, now: MonoTime, buf: var seq[TimerEntry]) =
+  ## Pop all expired entries into buf, reusing its existing capacity.
+  buf.setLen(0)
   while tw.heap.len > 0 and tw.heap[0].deadline <= now:
-    result.add(tw.heap.pop())
+    buf.add(tw.heap.pop())
