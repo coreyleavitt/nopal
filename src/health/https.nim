@@ -186,7 +186,7 @@ when defined(https):
       freeConn(conn)
       return false
 
-    mbedtls_ssl_conf_authmode(conn.sslConf, MBEDTLS_SSL_VERIFY_OPTIONAL)
+    mbedtls_ssl_conf_authmode(conn.sslConf, MBEDTLS_SSL_VERIFY_REQUIRED)
     mbedtls_ssl_conf_ca_chain(conn.sslConf, cast[pointer](conn.cacert), nil)
     mbedtls_ssl_conf_rng(conn.sslConf, cast[pointer](mbedtls_ctr_drbg_random),
                           cast[pointer](conn.ctrDrbgCtx))
@@ -215,13 +215,15 @@ when defined(https):
     if state.conn == nil: return
     let conn = state.conn
 
-    case conn.phase
-    of hpTcpConnecting:
-      if not isConnected(conn.fd):
-        return
-      conn.phase = hpTlsHandshaking
+    while true:
+      case conn.phase
+      of hpTcpConnecting:
+        if not isConnected(conn.fd):
+          return
+        conn.phase = hpTlsHandshaking
+        continue  # fall through to handshake
 
-    of hpTlsHandshaking:
+      of hpTlsHandshaking:
       let ret = mbedtls_ssl_handshake(conn.sslCtx)
       if ret == MBEDTLS_ERR_SSL_WANT_READ or ret == MBEDTLS_ERR_SSL_WANT_WRITE:
         return  # try again next poll
@@ -230,8 +232,9 @@ when defined(https):
         state.closeHttpsConn()
         return
       conn.phase = hpSendingRequest
+      continue  # fall through to send
 
-    of hpSendingRequest:
+      of hpSendingRequest:
       let reqBytes = HttpsRequest
       let ret = mbedtls_ssl_write(conn.sslCtx, cast[ptr byte](cstring(reqBytes)),
                                    csize_t(reqBytes.len))
@@ -242,8 +245,9 @@ when defined(https):
         state.closeHttpsConn()
         return
       conn.phase = hpWaitingResponse
+      return  # wait for next readable event
 
-    of hpWaitingResponse:
+      of hpWaitingResponse:
       var buf: array[64, byte]
       let ret = mbedtls_ssl_read(conn.sslCtx, addr buf[0], csize_t(buf.len))
       if ret == MBEDTLS_ERR_SSL_WANT_READ:
@@ -272,3 +276,4 @@ when defined(https):
         debug fmt"HTTPS probe non-2xx status: {s0}{s1}{s2}"
 
       state.closeHttpsConn()
+      return  # end of while loop — response processed

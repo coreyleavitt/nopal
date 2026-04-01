@@ -407,12 +407,13 @@ proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
   let v6ret = execCmd(fmt"ip -6 rule add uidrange {uidRange} lookup {tableStr} prio 1")
   v6Added = v6ret == 0
 
-  # Run user command with DEVICE and INTERFACE env vars
+  # Run user command with DEVICE and INTERFACE added to inherited env
   var exitCode = 1
   try:
-    let env = newStringTable({"DEVICE": device, "INTERFACE": iface})
+    putEnv("DEVICE", device)
+    putEnv("INTERFACE", iface)
     let p = startProcess(cmdArgs[0], args = cmdArgs[1..^1],
-                         env = env, options = {poParentStreams, poUsePath})
+                         options = {poParentStreams, poUsePath})
     exitCode = p.waitForExit()
     p.close()
   except OSError:
@@ -453,12 +454,14 @@ proc cliInternal() =
             tables.add(tableId)
       except ValueError: discard
   tables.sort()
+  # Two passes: all IPv4 first, then all IPv6 (matches Rust output order)
   for t in tables:
     echo fmt"--- table {t} (IPv4) ---"
     discard execCmd(fmt"ip -4 route show table {t}")
+  for t in tables:
     echo fmt"--- table {t} (IPv6) ---"
     discard execCmd(fmt"ip -6 route show table {t}")
-    echo ""
+  echo ""
 
   echo "=== nftables Ruleset ==="
   discard execCmd("nft list table inet nopal")
