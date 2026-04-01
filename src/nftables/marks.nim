@@ -5,6 +5,8 @@
 ## across config reorder (name-based, not position-based). Linear probing
 ## resolves collisions.
 
+import std/[logging, strformat]
+
 const
   FnvOffsetBasis = 2166136261'u32
   FnvPrime = 16777619'u32
@@ -23,6 +25,8 @@ proc assignMarks*(names: openArray[string], markMask: uint32): seq[tuple[mark: u
   result = newSeq[tuple[mark: uint32, tableId: uint32]](names.len)
 
   if markMask == 0 or names.len == 0:
+    if markMask == 0:
+      error "mark_mask is 0; no marks can be assigned"
     for i in 0 ..< result.len:
       result[i] = (mark: 0'u32, tableId: TableBase)
     return
@@ -35,7 +39,9 @@ proc assignMarks*(names: openArray[string], markMask: uint32): seq[tuple[mark: u
 
   var usedSlots = newSeq[bool](maxSlots + 1)  # index 0 unused, 1..maxSlots
 
-  # Truncate to maxSlots if more interfaces than available slots (log, don't crash)
+  # Truncate to maxSlots if more interfaces than available slots
+  if names.len > maxSlots:
+    error fmt"too many interfaces ({names.len}, max {maxSlots}); excess will be skipped"
   let assignCount = min(names.len, maxSlots)
 
   for i in 0 ..< assignCount:
@@ -47,6 +53,10 @@ proc assignMarks*(names: openArray[string], markMask: uint32): seq[tuple[mark: u
     while usedSlots[slot] and probes < maxSlots:
       slot = (slot mod maxSlots) + 1
       inc probes
+
+    if probes >= maxSlots:
+      error fmt"mark slot exhausted for interface {names[i]}"
+      continue
 
     usedSlots[slot] = true
     result[i] = (mark: uint32(slot) * step, tableId: TableBase + uint32(slot))

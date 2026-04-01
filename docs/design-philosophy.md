@@ -68,6 +68,24 @@ System state changes must be atomic or not happen at all.
 
 Incremental rule insertion creates intermediate states where the ruleset is partially updated. Traffic during that window may be misrouted. With atomic replacement, the kernel switches from the old ruleset to the new one in a single operation. The cost is regenerating the full ruleset (~1ms for typical configs), which is negligible compared to the correctness guarantee.
 
+## String interpolation over concatenation
+
+Use `std/strformat` with `fmt` strings for readable string construction:
+
+```nim
+import std/strformat
+warn fmt"interface '{name}': probe failed ({failCount} consecutive)"
+```
+
+Not:
+```nim
+warn "interface '" & name & "': probe failed (" & $failCount & " consecutive)"
+```
+
+The `fmt` macro resolves at compile time with zero runtime overhead beyond the string building itself. It is stdlib, not a third-party dependency. Every file that builds user-facing messages, log output, or error strings should use it.
+
+Exception: JSON construction uses `%*` macro, not string interpolation. Never build JSON by interpolating strings.
+
 ## Composition over abstraction
 
 Prefer concrete types and direct function calls over abstract interfaces. A health probe is not a generic "plugin" -- it is one of five known transport types (ICMP, DNS, HTTP, HTTPS, ARP) selected at config time. The set of probe types is closed and known at compile time.

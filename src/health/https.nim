@@ -11,7 +11,7 @@
 ## Compile with -d:https to enable. Requires nim-mbedtls package.
 
 when defined(https):
-  import std/[posix, os, logging]
+  import std/[posix, os, logging, strformat]
   import ../linux_constants
   import mbedtls/[ssl, net, entropy, ctr_drbg, x509_crt]
 
@@ -226,7 +226,7 @@ when defined(https):
       if ret == MBEDTLS_ERR_SSL_WANT_READ or ret == MBEDTLS_ERR_SSL_WANT_WRITE:
         return  # try again next poll
       if ret != 0:
-        debug "HTTPS probe TLS handshake failed: " & $ret
+        debug fmt"HTTPS probe TLS handshake failed: {ret}"
         state.closeHttpsConn()
         return
       conn.phase = hpSendingRequest
@@ -238,7 +238,7 @@ when defined(https):
       if ret == MBEDTLS_ERR_SSL_WANT_WRITE:
         return
       if ret < 0:
-        debug "HTTPS probe write failed: " & $ret
+        debug fmt"HTTPS probe write failed: {ret}"
         state.closeHttpsConn()
         return
       conn.phase = hpWaitingResponse
@@ -252,9 +252,9 @@ when defined(https):
         if ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
           debug "HTTPS probe: peer closed before response"
         elif ret < 0:
-          debug "HTTPS probe read failed: " & $ret
+          debug fmt"HTTPS probe read failed: {ret}"
         else:
-          debug "HTTPS probe: response too short (" & $ret & " bytes)"
+          debug fmt"HTTPS probe: response too short ({ret} bytes)"
         state.closeHttpsConn()
         return
 
@@ -269,6 +269,6 @@ when defined(https):
           let seq = conn.seqNum
           state.closeHttpsConn()
           return (ok: true, seqNum: seq, id: probeId)
-        debug "HTTPS probe non-2xx status: " & s0 & s1 & s2
+        debug fmt"HTTPS probe non-2xx status: {s0}{s1}{s2}"
 
       state.closeHttpsConn()

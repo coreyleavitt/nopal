@@ -4,7 +4,7 @@
 ## Invoked as "nopald" or with --daemon/-d: runs the daemon.
 ## Otherwise: CLI tool that talks to the daemon over Unix socket IPC.
 
-import std/[posix, os, strutils, json, endians, net, nativesockets]
+import std/[posix, os, strutils, strformat, json, endians, net, nativesockets]
 import daemon
 import ipc/protocol
 import logging
@@ -56,7 +56,7 @@ proc runDaemon(args: seq[string]) =
   # Create self-pipe for signal delivery
   var pipeFds: array[2, cint]
   if pipe(pipeFds) != 0:
-    stderr.writeLine "failed to create signal pipe: " & $strerror(errno)
+    stderr.writeLine fmt"failed to create signal pipe: {strerror(errno)}"
     quit(1)
 
   # Set O_NONBLOCK and O_CLOEXEC on both ends
@@ -83,7 +83,7 @@ proc runDaemon(args: seq[string]) =
   sa.sa_handler = SIG_IGN
   discard sigaction(SIGPIPE, sa, nil)
 
-  stderr.writeLine "nopal v" & Version & " starting"
+  stderr.writeLine fmt"nopal v{Version} starting"
 
   var d = initDaemon(configPath, pipeFds[0])
   d.run()
@@ -98,7 +98,7 @@ proc sendIpcRequest(socketPath: string, req: IpcRequest): IpcResponse =
   let fd = createNativeSocket(Domain.AF_UNIX, SockType.SOCK_STREAM,
                                Protocol.IPPROTO_IP)
   if fd == osInvalidSocket:
-    raise newException(IOError, "failed to create socket: " & $strerror(errno))
+    raise newException(IOError, fmt"failed to create socket: {strerror(errno)}")
 
   # Build sockaddr_un
   var sa: Sockaddr_un
@@ -112,8 +112,7 @@ proc sendIpcRequest(socketPath: string, req: IpcRequest): IpcResponse =
   if connect(fd, cast[ptr SockAddr](addr sa),
              SockLen(sizeof(sa))) != 0:
     discard posix.close(fd.cint)
-    raise newException(IOError, "failed to connect to " & socketPath &
-                       ": " & $strerror(errno))
+    raise newException(IOError, fmt"failed to connect to {socketPath}: {strerror(errno)}")
 
   # Serialize request to JSON, then frame with u32 BE length prefix
   var reqJson = %*{"id": req.id, "method": req.rpcMethod}
@@ -147,7 +146,7 @@ proc sendIpcRequest(socketPath: string, req: IpcRequest): IpcResponse =
 
   if respLen > MaxMsgSize:
     discard posix.close(fd.cint)
-    raise newException(IOError, "response too large (" & $respLen & " bytes)")
+    raise newException(IOError, fmt"response too large ({respLen} bytes)")
 
   # Read response payload
   var respBuf = newString(respLen.int)
@@ -171,7 +170,7 @@ proc fetchStatus(socketPath: string): DaemonStatus =
   let req = IpcRequest(id: 1, rpcMethod: "status")
   let resp = sendIpcRequest(socketPath, req)
   if not resp.success:
-    stderr.writeLine "error: " & resp.error
+    stderr.writeLine fmt"error: {resp.error}"
     quit(1)
   if resp.data.kind != JObject or not resp.data.hasKey("version"):
     stderr.writeLine "unexpected response from daemon"
@@ -183,11 +182,11 @@ proc formatUptime(secs: int64): string =
   let hours = (secs mod 86400) div 3600
   let mins = (secs mod 3600) div 60
   if days > 0:
-    result = $days & "d " & $hours & "h " & $mins & "m"
+    result = fmt"{days}d {hours}h {mins}m"
   elif hours > 0:
-    result = $hours & "h " & $mins & "m"
+    result = fmt"{hours}h {mins}m"
   else:
-    result = $mins & "m"
+    result = fmt"{mins}m"
 
 proc printInterfaceTable(interfaces: JsonNode) =
   echo "  " & alignLeft("INTERFACE", 12) & " " &
@@ -203,14 +202,13 @@ proc printInterfaceTable(interfaces: JsonNode) =
     let device = iface{"device"}.getStr("-")
     let state = iface{"state"}.getStr("-")
     let enabled = if iface{"enabled"}.getBool(false): "yes" else: "no"
-    let rtt = if iface{"avg_rtt_ms"}.kind != JNull:
-                $iface{"avg_rtt_ms"}.getFloat() & "ms"
-              else:
-                "-"
-    let loss = $iface{"loss_percent"}.getInt(0) & "%"
+    let rttVal = iface{"avg_rtt_ms"}
+    let rtt = if rttVal.kind != JNull: fmt"{rttVal.getFloat()}ms" else: "-"
+    let lossVal = iface{"loss_percent"}.getInt(0)
+    let loss = fmt"{lossVal}%"
     let successes = iface{"success_count"}.getInt(0)
     let failures = iface{"fail_count"}.getInt(0)
-    let score = $successes & "/" & $(successes + failures)
+    let score = fmt"{successes}/{successes + failures}"
 
     echo "  " & alignLeft(name, 12) & " " &
          alignLeft(device, 10) & " " &
@@ -221,20 +219,26 @@ proc printInterfaceTable(interfaces: JsonNode) =
          align(score, 6)
 
 proc printInterfaceDetail(iface: JsonNode) =
-  echo "Interface: " & iface{"name"}.getStr("-")
-  echo "  Device:    " & iface{"device"}.getStr("-")
-  echo "  State:     " & iface{"state"}.getStr("-")
-  echo "  Enabled:   " & (if iface{"enabled"}.getBool(false): "yes" else: "no")
-  echo "  Mark:      0x" & iface{"mark"}.getInt(0).toHex(4).toLowerAscii()
-  echo "  Table:     " & $iface{"table_id"}.getInt(0)
-  let rtt = if iface{"avg_rtt_ms"}.kind != JNull:
-              $iface{"avg_rtt_ms"}.getFloat() & "ms"
-            else:
-              "-"
-  echo "  RTT:       " & rtt
-  echo "  Loss:      " & $iface{"loss_percent"}.getInt(0) & "%"
-  echo "  Probes:    " & $iface{"success_count"}.getInt(0) & " ok / " &
-       $iface{"fail_count"}.getInt(0) & " fail"
+  let name = iface{"name"}.getStr("-")
+  let device = iface{"device"}.getStr("-")
+  let state = iface{"state"}.getStr("-")
+  let enabled = if iface{"enabled"}.getBool(false): "yes" else: "no"
+  let mark = iface{"mark"}.getInt(0).toHex(4).toLowerAscii()
+  let tableId = iface{"table_id"}.getInt(0)
+  echo fmt"Interface: {name}"
+  echo fmt"  Device:    {device}"
+  echo fmt"  State:     {state}"
+  echo fmt"  Enabled:   {enabled}"
+  echo fmt"  Mark:      0x{mark}"
+  echo fmt"  Table:     {tableId}"
+  let rttVal = iface{"avg_rtt_ms"}
+  let rtt = if rttVal.kind != JNull: fmt"{rttVal.getFloat()}ms" else: "-"
+  let lossVal = iface{"loss_percent"}.getInt(0)
+  let okCount = iface{"success_count"}.getInt(0)
+  let failCount = iface{"fail_count"}.getInt(0)
+  echo fmt"  RTT:       {rtt}"
+  echo fmt"  Loss:      {lossVal}%"
+  echo fmt"  Probes:    {okCount} ok / {failCount} fail"
 
 proc printPolicyTable(policies: JsonNode) =
   echo "  " & alignLeft("POLICY", 16) & " " &
@@ -270,7 +274,7 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
                          params: %*{"interface": iface})
     let resp = sendIpcRequest(socketPath, req)
     if not resp.success:
-      stderr.writeLine "error: " & resp.error
+      stderr.writeLine fmt"error: {resp.error}"
       quit(1)
     if jsonMode:
       echo resp.data.pretty()
@@ -281,7 +285,7 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
   let req = IpcRequest(id: 1, rpcMethod: "status")
   let resp = sendIpcRequest(socketPath, req)
   if not resp.success:
-    stderr.writeLine "error: " & resp.error
+    stderr.writeLine fmt"error: {resp.error}"
     quit(1)
 
   if jsonMode:
@@ -289,7 +293,8 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
     return
 
   let uptime = formatUptime(resp.data{"uptime_secs"}.getBiggestInt(0))
-  echo "nopal v" & resp.data{"version"}.getStr(Version) & " -- uptime " & uptime
+  let version = resp.data{"version"}.getStr(Version)
+  echo fmt"nopal v{version} -- uptime {uptime}"
   echo ""
 
   let interfaces = resp.data{"interfaces"}
@@ -312,7 +317,7 @@ proc cliInterfaces(socketPath: string, jsonMode: bool) =
   let req = IpcRequest(id: 1, rpcMethod: "status")
   let resp = sendIpcRequest(socketPath, req)
   if not resp.success:
-    stderr.writeLine "error: " & resp.error
+    stderr.writeLine fmt"error: {resp.error}"
     quit(1)
 
   let interfaces = resp.data{"interfaces"}
@@ -329,7 +334,7 @@ proc cliPolicies(socketPath: string, jsonMode: bool) =
   let req = IpcRequest(id: 1, rpcMethod: "status")
   let resp = sendIpcRequest(socketPath, req)
   if not resp.success:
-    stderr.writeLine "error: " & resp.error
+    stderr.writeLine fmt"error: {resp.error}"
     quit(1)
 
   let policies = resp.data{"policies"}
@@ -346,7 +351,7 @@ proc cliConnected(socketPath: string, jsonMode: bool) =
   let req = IpcRequest(id: 1, rpcMethod: "connected")
   let resp = sendIpcRequest(socketPath, req)
   if not resp.success:
-    stderr.writeLine "error: " & resp.error
+    stderr.writeLine fmt"error: {resp.error}"
     quit(1)
 
   if jsonMode:
@@ -357,7 +362,7 @@ proc cliConnected(socketPath: string, jsonMode: bool) =
   let networks = resp.data{"networks"}
   if networks.kind == JArray:
     for net in networks:
-      echo "  " & net.getStr()
+      echo fmt"  {net.getStr()}"
 
 proc cliReload(socketPath: string) =
   let req = IpcRequest(id: 1, rpcMethod: "config.reload")
@@ -365,7 +370,7 @@ proc cliReload(socketPath: string) =
   if resp.success:
     echo "configuration reloaded"
   else:
-    stderr.writeLine "reload failed: " & resp.error
+    stderr.writeLine fmt"reload failed: {resp.error}"
     quit(1)
 
 proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
@@ -377,31 +382,29 @@ proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
                        params: %*{"interface": iface})
   let resp = sendIpcRequest(socketPath, req)
   if not resp.success:
-    stderr.writeLine "error: " & resp.error
+    stderr.writeLine fmt"error: {resp.error}"
     quit(1)
   let tableId = resp.data{"table_id"}.getInt()
   let device = resp.data{"device"}.getStr()
   if tableId == 0:
-    stderr.writeLine "error: interface '" & iface & "' has no routing table"
+    stderr.writeLine fmt"error: interface '{iface}' has no routing table"
     quit(1)
 
   # Get UID for uidrange rule
   let uid = getuid()
-  let uidRange = $uid & "-" & $uid
+  let uidRange = fmt"{uid}-{uid}"
   let tableStr = $tableId
 
   # Add IPv4 uidrange ip rule (required)
   var v4Added, v6Added = false
-  let v4ret = execCmd("ip -4 rule add uidrange " & uidRange &
-                      " lookup " & tableStr & " prio 1")
+  let v4ret = execCmd(fmt"ip -4 rule add uidrange {uidRange} lookup {tableStr} prio 1")
   if v4ret != 0:
     stderr.writeLine "error: failed to add IPv4 routing rule"
     quit(1)
   v4Added = true
 
   # Try IPv6 rule (tolerate failure — IPv6 may be disabled)
-  let v6ret = execCmd("ip -6 rule add uidrange " & uidRange &
-                      " lookup " & tableStr & " prio 1")
+  let v6ret = execCmd(fmt"ip -6 rule add uidrange {uidRange} lookup {tableStr} prio 1")
   v6Added = v6ret == 0
 
   # Run user command with DEVICE and INTERFACE env vars
@@ -413,15 +416,13 @@ proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
     exitCode = p.waitForExit()
     p.close()
   except OSError:
-    stderr.writeLine "error: " & getCurrentExceptionMsg()
+    stderr.writeLine fmt"error: {getCurrentExceptionMsg()}"
 
   # Cleanup rules (always, even on error)
   if v4Added:
-    discard execCmd("ip -4 rule del uidrange " & uidRange &
-                    " lookup " & tableStr & " prio 1")
+    discard execCmd(fmt"ip -4 rule del uidrange {uidRange} lookup {tableStr} prio 1")
   if v6Added:
-    discard execCmd("ip -6 rule del uidrange " & uidRange &
-                    " lookup " & tableStr & " prio 1")
+    discard execCmd(fmt"ip -6 rule del uidrange {uidRange} lookup {tableStr} prio 1")
 
   quit(exitCode)
 
@@ -453,10 +454,10 @@ proc cliInternal() =
       except ValueError: discard
   tables.sort()
   for t in tables:
-    echo "--- table " & $t & " (IPv4) ---"
-    discard execCmd("ip -4 route show table " & $t)
-    echo "--- table " & $t & " (IPv6) ---"
-    discard execCmd("ip -6 route show table " & $t)
+    echo fmt"--- table {t} (IPv4) ---"
+    discard execCmd(fmt"ip -4 route show table {t}")
+    echo fmt"--- table {t} (IPv6) ---"
+    discard execCmd(fmt"ip -6 route show table {t}")
     echo ""
 
   echo "=== nftables Ruleset ==="
@@ -469,7 +470,7 @@ proc cliRules() =
     echo "nopal nftables rules not loaded (daemon not running?)"
 
 proc printUsage() =
-  echo "nopal " & Version & " -- Multi-WAN manager for OpenWrt"
+  echo fmt"nopal {Version} -- Multi-WAN manager for OpenWrt"
   echo ""
   echo "Usage:"
   echo "  nopal status [<interface>]   Show daemon/interface status"
@@ -486,8 +487,8 @@ proc printUsage() =
   echo "  nopald [-c <config>]         Run the daemon"
   echo ""
   echo "Options:"
-  echo "  -c, --config <path>         Config file path (default: " & DefaultConfig & ")"
-  echo "  -s, --socket <path>         IPC socket path (default: " & DefaultSocket & ")"
+  echo fmt"  -c, --config <path>         Config file path (default: {DefaultConfig})"
+  echo fmt"  -s, --socket <path>         IPC socket path (default: {DefaultSocket})"
   echo "  -j, --json                  Output in JSON format"
 
 # ---------------------------------------------------------------------------
@@ -516,7 +517,7 @@ proc runCli(args: seq[string]) =
       printUsage()
       return
     of "--version", "-V":
-      echo "nopal " & Version
+      echo fmt"nopal {Version}"
       return
     else:
       positional.add a
@@ -549,13 +550,13 @@ proc runCli(args: seq[string]) =
     of "help":
       printUsage()
     of "version":
-      echo "nopal " & Version
+      echo fmt"nopal {Version}"
     else:
-      stderr.writeLine "unknown command: " & command
+      stderr.writeLine fmt"unknown command: {command}"
       printUsage()
       quit(1)
   except IOError as e:
-    stderr.writeLine "failed to connect to nopal daemon: " & e.msg
+    stderr.writeLine fmt"failed to connect to nopal daemon: {e.msg}"
     stderr.writeLine "is nopald running?"
     quit(1)
 

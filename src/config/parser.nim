@@ -4,7 +4,7 @@
 
 import ./schema
 import ../errors
-import std/[tables, sets, strutils, options, logging]
+import std/[tables, sets, strutils, strformat, options, logging]
 
 type
   UciSection* = object
@@ -169,14 +169,14 @@ func isIpv6*(s: string): bool =
 proc validateName*(kind, name: string) =
   ## Raise ConfigError if name is empty, contains /\0/.., or non-[a-zA-Z0-9_.-].
   if name.len == 0:
-    raise newException(ConfigError, kind & " name must not be empty")
+    raise newException(ConfigError, fmt"{kind} name must not be empty")
   if ".." in name:
-    raise newException(ConfigError, kind & " name '" & name & "' contains '..'")
+    raise newException(ConfigError, fmt"{kind} name '{name}' contains '..'")
   for c in name:
     if c == '/' or c == '\0':
-      raise newException(ConfigError, kind & " name '" & name & "' contains invalid character '" & $c & "'")
+      raise newException(ConfigError, fmt"{kind} name '{name}' contains invalid character '{c}'")
     if not (c in {'a'..'z', 'A'..'Z', '0'..'9', '_', '.', '-'}):
-      raise newException(ConfigError, kind & " name '" & name & "' contains invalid character '" & $c & "'")
+      raise newException(ConfigError, fmt"{kind} name '{name}' contains invalid character '{c}'")
 
 proc parseUci*(text: string): seq[UciSection] =
   ## Tokenize UCI text into sections. Handle config/option/list directives.
@@ -202,7 +202,7 @@ proc parseUci*(text: string): seq[UciSection] =
     case directive
     of "config":
       if parts.len < 2:
-        raise newException(ConfigError, "line " & $lineNum & ": config directive requires a type")
+        raise newException(ConfigError, fmt"line {lineNum}: config directive requires a type")
       var sec = UciSection(
         sectionType: stripQuotes(parts[1]),
         name: "",
@@ -215,18 +215,18 @@ proc parseUci*(text: string): seq[UciSection] =
 
     of "option":
       if currentIdx < 0:
-        raise newException(ConfigError, "line " & $lineNum & ": option outside of section")
+        raise newException(ConfigError, fmt"line {lineNum}: option outside of section")
       if parts.len < 2:
-        raise newException(ConfigError, "line " & $lineNum & ": option directive requires a key")
+        raise newException(ConfigError, fmt"line {lineNum}: option directive requires a key")
       let key = stripQuotes(parts[1])
       let value = if parts.len >= 3: stripQuotes(parts[2 ..< parts.len].join(" ")) else: ""
       result[currentIdx].options[key] = @[value]
 
     of "list":
       if currentIdx < 0:
-        raise newException(ConfigError, "line " & $lineNum & ": list outside of section")
+        raise newException(ConfigError, fmt"line {lineNum}: list outside of section")
       if parts.len < 2:
-        raise newException(ConfigError, "line " & $lineNum & ": list directive requires a key")
+        raise newException(ConfigError, fmt"line {lineNum}: list directive requires a key")
       let key = stripQuotes(parts[1])
       let value = if parts.len >= 3: stripQuotes(parts[2 ..< parts.len].join(" ")) else: ""
       if key in result[currentIdx].options:
@@ -235,7 +235,7 @@ proc parseUci*(text: string): seq[UciSection] =
         result[currentIdx].options[key] = @[value]
 
     else:
-      warn "line " & $lineNum & ": unknown directive '" & directive & "', skipping"
+      warn fmt"line {lineNum}: unknown directive '{directive}', skipping"
       continue
 
 func isValidMarkMask(mask: uint32): bool =
@@ -276,7 +276,7 @@ proc parseGlobals*(sec: UciSection): GlobalsConfig =
     of "full":
       result.conntrackFlush = cfmFull
     else:
-      warn "Unknown conntrack_flush value '" & flushStr & "', using default"
+      warn fmt"Unknown conntrack_flush value '{flushStr}', using default"
 
   # Parse mark_mask (hex)
   let maskStr = sec.get("mark_mask")
@@ -285,7 +285,7 @@ proc parseGlobals*(sec: UciSection): GlobalsConfig =
       let parsed = parseHexInt(maskStr)
       result.markMask = uint32(parsed)
     except ValueError:
-      warn "globals: invalid mark_mask '" & maskStr & "' (expected hex like 0xFF00), using default"
+      warn fmt"globals: invalid mark_mask '{maskStr}' (expected hex like 0xFF00), using default"
       result.markMask = defaultGlobals().markMask
 
   if result.markMask == 0:
@@ -293,7 +293,7 @@ proc parseGlobals*(sec: UciSection): GlobalsConfig =
     result.markMask = defaultGlobals().markMask
 
   if not isValidMarkMask(result.markMask):
-    warn "globals: mark_mask 0x" & toHex(result.markMask) & " must have contiguous bits with >=2 slots, using default"
+    warn fmt"globals: mark_mask 0x{toHex(result.markMask)} must have contiguous bits with >=2 slots, using default"
     result.markMask = defaultGlobals().markMask
 
   # rt_table_lookup
@@ -301,7 +301,7 @@ proc parseGlobals*(sec: UciSection): GlobalsConfig =
     try:
       result.rtTableLookup.add(uint32(parseUInt(v)))
     except ValueError:
-      warn "Ignoring invalid rt_table_lookup value '" & v & "'"
+      warn fmt"Ignoring invalid rt_table_lookup value '{v}'"
 
 proc mapTrackMethod(s: string, ifaceName: string): TrackMethod =
   ## Map a string to TrackMethod, with mwan3 compatibility warnings.
@@ -320,19 +320,19 @@ proc mapTrackMethod(s: string, ifaceName: string): TrackMethod =
     return tmComposite
   # mwan3 compatibility
   of "nping-tcp":
-    warn "interface '" & ifaceName & "': track_method 'nping-tcp' is not supported, using 'http' instead"
+    warn fmt"interface '{ifaceName}': track_method 'nping-tcp' is not supported, using 'http' instead"
     return tmHttp
   of "nping-udp":
-    warn "interface '" & ifaceName & "': track_method 'nping-udp' is not supported, using 'dns' instead"
+    warn fmt"interface '{ifaceName}': track_method 'nping-udp' is not supported, using 'dns' instead"
     return tmDns
   of "nping-icmp":
-    warn "interface '" & ifaceName & "': track_method 'nping-icmp' is not supported, using 'ping' instead"
+    warn fmt"interface '{ifaceName}': track_method 'nping-icmp' is not supported, using 'ping' instead"
     return tmPing
   of "nping-arp":
-    warn "interface '" & ifaceName & "': track_method 'nping-arp' is not supported, using 'arping' instead"
+    warn fmt"interface '{ifaceName}': track_method 'nping-arp' is not supported, using 'arping' instead"
     return tmArping
   else:
-    warn "interface '" & ifaceName & "': unknown track_method '" & s & "', using 'ping'"
+    warn fmt"interface '{ifaceName}': unknown track_method '{s}', using 'ping'"
     return tmPing
 
 func parseFlushTrigger(s: string): options.Option[ConntrackFlushTrigger] =
@@ -364,12 +364,12 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   ]
   for (oldName, newName) in mwan3Renames:
     if sec.get(oldName) != "":
-      warn "interface '" & sec.name & "': mwan3 option '" & oldName & "' has been renamed to '" & newName & "'"
+      warn fmt"interface '{sec.name}': mwan3 option '{oldName}' has been renamed to '{newName}'"
   if sec.get("httping_ssl") != "":
-    warn "interface '" & sec.name & "': 'httping_ssl' is deprecated, use track_method 'https' instead"
+    warn fmt"interface '{sec.name}': 'httping_ssl' is deprecated, use track_method 'https' instead"
 
   if sec.get("list_type") != "":
-    warn "interface '" & sec.name & "': 'list_type' is an mwan3 field, ignored by nopal"
+    warn fmt"interface '{sec.name}': 'list_type' is an mwan3 field, ignored by nopal"
 
   result.enabled = sec.getBool("enabled", result.enabled)
 
@@ -388,7 +388,7 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
     of "both":
       result.family = afBoth
     else:
-      raise newException(ConfigError, "interface '" & sec.name & "': unknown family '" & familyStr & "'")
+      raise newException(ConfigError, fmt"interface '{sec.name}': unknown family '{familyStr}'")
 
   result.metric = sec.getU32("metric", result.metric)
   result.weight = sec.getU32("weight", result.weight)
@@ -402,7 +402,7 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   let trackIps = sec.getAll("track_ip")
   for ip in trackIps:
     if not isValidIpAddress(ip):
-      warn "interface '" & sec.name & "': invalid track_ip '" & ip & "', skipping"
+      warn fmt"interface '{sec.name}': invalid track_ip '{ip}', skipping"
       continue
     result.trackIp.add(ip)
 
@@ -436,7 +436,7 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
     of "online":
       result.initialState = initOnline
     else:
-      warn "interface '" & sec.name & "': unknown initial_state '" & initStr & "', using offline"
+      warn fmt"interface '{sec.name}': unknown initial_state '{initStr}', using offline"
 
   result.checkQuality = sec.getBool("check_quality", result.checkQuality)
   result.latencyThreshold = int(sec.getU32("latency_threshold", uint32(result.latencyThreshold)))
@@ -454,10 +454,10 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   let dqn = sec.get("dns_query_name")
   if dqn != "":
     if dqn.len > 253:
-      raise newException(ConfigError, "interface '" & sec.name & "': dns_query_name too long (max 253)")
+      raise newException(ConfigError, fmt"interface '{sec.name}': dns_query_name too long (max 253)")
     for label in dqn.split('.'):
       if label.len > 63:
-        raise newException(ConfigError, "interface '" & sec.name & "': dns_query_name label too long (max 63): '" & label & "'")
+        raise newException(ConfigError, fmt"interface '{sec.name}': dns_query_name label too long (max 63): '{label}'")
     result.dnsQueryName = dqn
 
   result.localSource = sec.getBool("local_source", result.localSource)
@@ -466,7 +466,7 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
 
   for ds in sec.getAll("dns_server"):
     if not isValidIpAddress(ds):
-      warn "interface '" & sec.name & "': invalid dns_server '" & ds & "', skipping"
+      warn fmt"interface '{sec.name}': invalid dns_server '{ds}', skipping"
       continue
     result.dnsServers.add(ds)
 
@@ -478,7 +478,7 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
     of "http": result.compositeMethods.add(tmHttp)
     of "https": result.compositeMethods.add(tmHttps)
     of "arping": result.compositeMethods.add(tmArping)
-    else: warn "interface '" & sec.name & "': unknown composite_method '" & cm & "'"
+    else: warn fmt"interface '{sec.name}': unknown composite_method '{cm}'"
 
   # flush_conntrack list
   let flushList = sec.getAll("flush_conntrack")
@@ -489,7 +489,7 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
       if parsed.isSome:
         result.flushConntrack.add(parsed.get)
       else:
-        warn "interface '" & sec.name & "': unknown flush_conntrack trigger '" & ft & "', skipping"
+        warn fmt"interface '{sec.name}': unknown flush_conntrack trigger '{ft}', skipping"
 
 proc parseMember*(sec: UciSection): MemberConfig =
   ## Convert a UCI section of type 'member' to MemberConfig.
@@ -499,7 +499,7 @@ proc parseMember*(sec: UciSection): MemberConfig =
 
   let ifaceName = sec.get("interface")
   if ifaceName == "":
-    raise newException(ConfigError, "member '" & sec.name & "': 'interface' field is required")
+    raise newException(ConfigError, fmt"member '{sec.name}': 'interface' field is required")
 
   result = MemberConfig(
     name: sec.name,
@@ -532,7 +532,7 @@ proc parsePolicy*(sec: UciSection): PolicyConfig =
     of "blackhole":
       result.lastResort = lrBlackhole
     else:
-      warn "policy '" & sec.name & "': unknown last_resort '" & lr & "', using default"
+      warn fmt"policy '{sec.name}': unknown last_resort '{lr}', using default"
 
 proc validatePortSpec(spec: string, context: string) =
   ## Validate a port specification: either a single u16 or a range "lo-hi".
@@ -543,25 +543,25 @@ proc validatePortSpec(spec: string, context: string) =
     try:
       let p = parseInt(parts[0])
       if p < 0 or p > 65535:
-        raise newException(ConfigError, context & ": port " & parts[0] & " out of range (0-65535)")
+        raise newException(ConfigError, fmt"{context}: port {parts[0]} out of range (0-65535)")
     except ValueError:
-      raise newException(ConfigError, context & ": invalid port '" & parts[0] & "'")
+      raise newException(ConfigError, fmt"{context}: invalid port '{parts[0]}'")
   elif parts.len == 2:
     var lo, hi: int
     try:
       lo = parseInt(parts[0])
     except ValueError:
-      raise newException(ConfigError, context & ": invalid port range start '" & parts[0] & "'")
+      raise newException(ConfigError, fmt"{context}: invalid port range start '{parts[0]}'")
     try:
       hi = parseInt(parts[1])
     except ValueError:
-      raise newException(ConfigError, context & ": invalid port range end '" & parts[1] & "'")
+      raise newException(ConfigError, fmt"{context}: invalid port range end '{parts[1]}'")
     if lo < 0 or lo > 65535 or hi < 0 or hi > 65535:
-      raise newException(ConfigError, context & ": port range out of bounds")
+      raise newException(ConfigError, fmt"{context}: port range out of bounds")
     if lo > hi:
-      raise newException(ConfigError, context & ": port range start (" & $lo & ") > end (" & $hi & ")")
+      raise newException(ConfigError, fmt"{context}: port range start ({lo}) > end ({hi})")
   else:
-    raise newException(ConfigError, context & ": invalid port specification '" & spec & "'")
+    raise newException(ConfigError, fmt"{context}: invalid port specification '{spec}'")
 
 proc validateCidr(s: string, context: string) =
   ## Validate an IP address or CIDR notation (addr/prefix).
@@ -573,17 +573,17 @@ proc validateCidr(s: string, context: string) =
     let addrPart = s[0 ..< slashIdx]
     let prefixPart = s[slashIdx + 1 ..< s.len]
     if not isValidIpAddress(addrPart):
-      raise newException(ConfigError, context & ": invalid CIDR '" & s & "'")
+      raise newException(ConfigError, fmt"{context}: invalid CIDR '{s}'")
     try:
       let prefix = parseInt(prefixPart)
       let maxPrefix = if isIpv6(addrPart): 128 else: 32
       if prefix < 0 or prefix > maxPrefix:
-        raise newException(ConfigError, context & ": prefix length " & $prefix & " out of range for " & s)
+        raise newException(ConfigError, fmt"{context}: prefix length {prefix} out of range for {s}")
     except ValueError:
-      raise newException(ConfigError, context & ": invalid CIDR '" & s & "'")
+      raise newException(ConfigError, fmt"{context}: invalid CIDR '{s}'")
   else:
     if not isValidIpAddress(s):
-      raise newException(ConfigError, context & ": invalid IP address '" & s & "'")
+      raise newException(ConfigError, fmt"{context}: invalid IP address '{s}'")
 
 proc parseRule*(sec: UciSection): RuleConfig =
   ## Convert a UCI section of type 'rule' to RuleConfig.
@@ -594,7 +594,7 @@ proc parseRule*(sec: UciSection): RuleConfig =
   result = defaultRule()
   result.name = sec.name
 
-  let ctx = "rule '" & sec.name & "'"
+  let ctx = fmt"rule '{sec.name}'"
 
   # src_ip (list)
   for ip in sec.getAll("src_ip"):
@@ -629,10 +629,10 @@ proc parseRule*(sec: UciSection): RuleConfig =
       try:
         let pnum = parseInt(proto)
         if pnum < 0 or pnum > 255:
-          raise newException(ConfigError, ctx & ": protocol number " & $pnum & " out of range (0-255)")
+          raise newException(ConfigError, fmt"{ctx}: protocol number {pnum} out of range (0-255)")
         result.proto = proto
       except ValueError:
-        raise newException(ConfigError, ctx & ": unknown protocol '" & proto & "'")
+        raise newException(ConfigError, fmt"{ctx}: unknown protocol '{proto}'")
 
   # family
   let familyStr = sec.get("family")
@@ -645,7 +645,7 @@ proc parseRule*(sec: UciSection): RuleConfig =
     of "ipv6":
       result.family = rfIpv6
     else:
-      raise newException(ConfigError, ctx & ": unknown family '" & familyStr & "'")
+      raise newException(ConfigError, fmt"{ctx}: unknown family '{familyStr}'")
 
   # src_iface
   let srcIface = sec.get("src_iface")
@@ -656,7 +656,7 @@ proc parseRule*(sec: UciSection): RuleConfig =
   # ipset
   let ipset = sec.get("ipset")
   if ipset != "":
-    validateName(ctx & " ipset", ipset)
+    validateName(fmt"{ctx} ipset", ipset)
     result.ipset = ipset
 
   # sticky
@@ -673,12 +673,12 @@ proc parseRule*(sec: UciSection): RuleConfig =
     of "src_dst", "srcdst":
       result.stickyMode = smSrcDst
     else:
-      warn ctx & ": unknown sticky_mode '" & stickyModeStr & "', using flow"
+      warn fmt"{ctx}: unknown sticky_mode '{stickyModeStr}', using flow"
 
   # use_policy (required)
   let usePolicy = sec.get("use_policy")
   if usePolicy == "":
-    raise newException(ConfigError, ctx & ": 'use_policy' is required")
+    raise newException(ConfigError, fmt"{ctx}: 'use_policy' is required")
   result.usePolicy = usePolicy
 
   result.log = sec.getBool("log", result.log)
@@ -690,51 +690,51 @@ proc validate*(config: var NopalConfig) =
   var ifaceNames = initHashSet[string]()
   for iface in config.interfaces:
     if iface.name in ifaceNames:
-      raise newException(ConfigError, "duplicate interface name '" & iface.name & "'")
+      raise newException(ConfigError, fmt"duplicate interface name '{iface.name}'")
     ifaceNames.incl(iface.name)
 
   # Check duplicate member names
   var memberNames = initHashSet[string]()
   for member in config.members:
     if member.name in memberNames:
-      raise newException(ConfigError, "duplicate member name '" & member.name & "'")
+      raise newException(ConfigError, fmt"duplicate member name '{member.name}'")
     memberNames.incl(member.name)
 
   # Check duplicate policy names
   var policyNames = initHashSet[string]()
   for policy in config.policies:
     if policy.name in policyNames:
-      raise newException(ConfigError, "duplicate policy name '" & policy.name & "'")
+      raise newException(ConfigError, fmt"duplicate policy name '{policy.name}'")
     policyNames.incl(policy.name)
 
   # Check duplicate rule names
   var ruleNames = initHashSet[string]()
   for rule in config.rules:
     if rule.name in ruleNames:
-      raise newException(ConfigError, "duplicate rule name '" & rule.name & "'")
+      raise newException(ConfigError, fmt"duplicate rule name '{rule.name}'")
     ruleNames.incl(rule.name)
 
   # Members must reference existing interfaces
   for member in config.members:
     if member.interfaceName notin ifaceNames:
-      raise newException(ConfigError, "member '" & member.name & "' references non-existent interface '" & member.interfaceName & "'")
+      raise newException(ConfigError, fmt"member '{member.name}' references non-existent interface '{member.interfaceName}'")
 
   # Policies must reference existing members
   for policy in config.policies:
     for memberName in policy.members:
       if memberName notin memberNames:
-        raise newException(ConfigError, "policy '" & policy.name & "' references non-existent member '" & memberName & "'")
+        raise newException(ConfigError, fmt"policy '{policy.name}' references non-existent member '{memberName}'")
 
   # Rules must reference existing policies (unless "default")
   for rule in config.rules:
     if rule.usePolicy != "" and rule.usePolicy != "default":
       if rule.usePolicy notin policyNames:
-        raise newException(ConfigError, "rule '" & rule.name & "' references non-existent policy '" & rule.usePolicy & "'")
+        raise newException(ConfigError, fmt"rule '{rule.name}' references non-existent policy '{rule.usePolicy}'")
 
   # Warn on interfaces with no track_ip
   for iface in config.interfaces:
     if iface.enabled and iface.trackIp.len == 0:
-      warn "interface '" & iface.name & "' has no track_ip configured, probes will not run"
+      warn fmt"interface '{iface.name}' has no track_ip configured, probes will not run"
 
   # Warn on unreferenced members
   var referencedMembers = initHashSet[string]()
@@ -743,7 +743,7 @@ proc validate*(config: var NopalConfig) =
       referencedMembers.incl(memberName)
   for member in config.members:
     if member.name notin referencedMembers:
-      warn "member '" & member.name & "' is not referenced by any policy"
+      warn fmt"member '{member.name}' is not referenced by any policy"
 
 proc loadFromStr*(text: string): NopalConfig =
   ## Parse UCI text and return a validated NopalConfig.
@@ -766,7 +766,7 @@ proc loadFromStr*(text: string): NopalConfig =
     of "rule":
       result.rules.add(parseRule(sec))
     else:
-      warn "unknown section type '" & sec.sectionType & "', skipping"
+      warn fmt"unknown section type '{sec.sectionType}', skipping"
 
   validate(result)
 
@@ -775,7 +775,7 @@ proc loadConfig*(path: string): NopalConfig =
   let text = try:
     readFile(path)
   except IOError:
-    raise newException(ConfigError, "cannot read config file '" & path & "'")
+    raise newException(ConfigError, fmt"cannot read config file '{path}'")
   return loadFromStr(text)
 
 

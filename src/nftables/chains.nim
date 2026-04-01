@@ -3,7 +3,7 @@
 ## Ported from the Rust implementation in chains.rs. Builds all base chains,
 ## regular chains, expression helpers, and rule generation for policy routing.
 
-import std/[json, strutils, options, algorithm, sequtils]
+import std/[json, strutils, strformat, options, algorithm, sequtils]
 import ./ruleset
 
 # ---------------------------------------------------------------------------
@@ -347,7 +347,7 @@ proc buildPolicyRules(rs: var Ruleset, rules: openArray[RuleInfo]) =
 
       # Log matching packets if enabled
       if rule.log:
-        expr.add(logPrefix("nopal:" & rule.policy & " "))
+        expr.add(logPrefix(fmt"nopal:{rule.policy} "))
 
       # "default" policy = accept (bypass policy routing)
       if rule.policy == "default":
@@ -355,14 +355,14 @@ proc buildPolicyRules(rs: var Ruleset, rules: openArray[RuleInfo]) =
       else:
         let needsStickyChain = rule.sticky.isSome and rule.sticky.get.mode != "flow"
         if needsStickyChain:
-          expr.add(jump("sticky_r" & $i))
+          expr.add(jump(fmt"sticky_r{i}"))
         else:
-          expr.add(jump("policy_" & rule.policy))
+          expr.add(jump(fmt"policy_{rule.policy}"))
 
       rs.addRule("policy_rules", expr)
 
 proc buildPolicyChain(rs: var Ruleset, policy: PolicyInfo) =
-  let chainName = "policy_" & policy.name
+  let chainName = fmt"policy_{policy.name}"
 
   if policy.members.len == 0:
     case policy.lastResort
@@ -379,7 +379,7 @@ proc buildPolicyChain(rs: var Ruleset, policy: PolicyInfo) =
   for tier in tiers:
     let members = tier.members
     if members.len == 1:
-      rs.addRule(chainName, @[goto("mark_" & members[0].interfaceName)])
+      rs.addRule(chainName, @[goto(fmt"mark_{members[0].interfaceName}")])
     else:
       # Weighted round-robin via numgen vmap
       var total: uint32 = 0
@@ -396,7 +396,7 @@ proc buildPolicyChain(rs: var Ruleset, policy: PolicyInfo) =
       ])
 
 proc buildMarkChain(rs: var Ruleset, iface: InterfaceInfo) =
-  let chainName = "mark_" & iface.name
+  let chainName = fmt"mark_{iface.name}"
   rs.addRule(chainName, @[setMetaMark(iface.mark), saveMarkToCt(), nftAccept()])
 
 proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
@@ -414,7 +414,7 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
         if fam == "ipv4": "_v4" else: "_v6"
       else:
         ""
-    let mapName = "sticky_r" & $ruleIndex & suffix
+    let mapName = fmt"sticky_r{ruleIndex}{suffix}"
     let addrType = if fam == "ipv4": "ipv4_addr" else: "ipv6_addr"
     let keyType =
       if sticky.mode == "src_dst":
@@ -424,7 +424,7 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
     rs.addMap(mapName, keyType, "mark", sticky.timeout)
 
   # Create the sticky helper chain
-  let chainName = "sticky_r" & $ruleIndex
+  let chainName = fmt"sticky_r{ruleIndex}"
   rs.addRegularChain(chainName)
 
   # Phase 1: Map lookup
@@ -434,7 +434,7 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
         if fam == "ipv4": "_v4" else: "_v6"
       else:
         ""
-    let mapName = "sticky_r" & $ruleIndex & suffix
+    let mapName = fmt"sticky_r{ruleIndex}{suffix}"
     let proto = if fam == "ipv4": "ip" else: "ip6"
     let lookupKey = stickyKeyExpr(proto, sticky.mode)
 
@@ -487,7 +487,7 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
         if fam == "ipv4": "_v4" else: "_v6"
       else:
         ""
-    let mapName = "sticky_r" & $ruleIndex & suffix
+    let mapName = fmt"sticky_r{ruleIndex}{suffix}"
     let proto = if fam == "ipv4": "ip" else: "ip6"
     let updateKey = stickyKeyExpr(proto, sticky.mode)
 
@@ -529,9 +529,9 @@ proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[Pol
   # Regular chains
   rs.addRegularChain("policy_rules")
   for iface in interfaces:
-    rs.addRegularChain("mark_" & iface.name)
+    rs.addRegularChain(fmt"mark_{iface.name}")
   for policy in policies:
-    rs.addRegularChain("policy_" & policy.name)
+    rs.addRegularChain(fmt"policy_{policy.name}")
 
   # Prerouting rules
   buildPrerouting(rs, interfaces, markMask)
