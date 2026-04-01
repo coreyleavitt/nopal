@@ -255,7 +255,8 @@ proc parseUci*(text: string): seq[UciSection] =
         result[currentIdx].options[key] = @[value]
 
     else:
-      raise newException(ConfigError, "line " & $lineNum & ": unknown directive '" & directive & "'")
+      warn "line " & $lineNum & ": unknown directive '" & directive & "', skipping"
+      continue
 
 func isContiguousBits(mask: uint32): bool =
   ## Check that a bitmask has contiguous set bits (no gaps).
@@ -302,13 +303,16 @@ proc parseGlobals*(sec: UciSection): GlobalsConfig =
       let parsed = parseHexInt(maskStr)
       result.markMask = uint32(parsed)
     except ValueError:
-      raise newException(ConfigError, "globals: invalid mark_mask '" & maskStr & "' (expected hex like 0xFF00)")
+      warn "globals: invalid mark_mask '" & maskStr & "' (expected hex like 0xFF00), using default"
+      result.markMask = defaultGlobals().markMask
 
   if result.markMask == 0:
-    raise newException(ConfigError, "globals: mark_mask must not be zero")
+    warn "globals: mark_mask must not be zero, using default"
+    result.markMask = defaultGlobals().markMask
 
   if not isContiguousBits(result.markMask):
-    raise newException(ConfigError, "globals: mark_mask 0x" & toHex(result.markMask) & " must have contiguous bits")
+    warn "globals: mark_mask 0x" & toHex(result.markMask) & " must have contiguous bits, using default"
+    result.markMask = defaultGlobals().markMask
 
   # rt_table_lookup
   for v in sec.getAll("rt_table_lookup"):
@@ -342,8 +346,12 @@ proc mapTrackMethod(s: string, ifaceName: string): TrackMethod =
   of "nping-icmp":
     warn "interface '" & ifaceName & "': track_method 'nping-icmp' is not supported, using 'ping' instead"
     return tmPing
+  of "nping-arp":
+    warn "interface '" & ifaceName & "': track_method 'nping-arp' is not supported, using 'arping' instead"
+    return tmArping
   else:
-    raise newException(ConfigError, "interface '" & ifaceName & "': unknown track_method '" & s & "'")
+    warn "interface '" & ifaceName & "': unknown track_method '" & s & "', using 'ping'"
+    return tmPing
 
 proc parseFlushTrigger(s: string): ConntrackFlushTrigger =
   case s.toLowerAscii()
@@ -368,9 +376,21 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   result.name = sec.name
 
   # mwan3 field name warnings
-  if sec.get("track_ip") == "" and sec.getAll("track_ip").len == 0:
-    # Check for mwan3-style 'track_ip' as option vs list - handled below
-    discard
+  const mwan3Renames = [
+    ("interval", "probe_interval"),
+    ("timeout", "probe_timeout"),
+    ("up", "up_count"),
+    ("down", "down_count"),
+    ("size", "probe_size"),
+    ("failure_latency", "latency_threshold"),
+    ("failure_loss", "loss_threshold"),
+  ]
+  for (oldName, newName) in mwan3Renames:
+    if sec.get(oldName) != "":
+      warn "interface '" & sec.name & "': mwan3 option '" & oldName & "' has been renamed to '" & newName & "'"
+  if sec.get("httping_ssl") != "":
+    warn "interface '" & sec.name & "': 'httping_ssl' is deprecated, use track_method 'https' instead"
+
   if sec.get("list_type") != "":
     warn "interface '" & sec.name & "': 'list_type' is an mwan3 field, ignored by nopal"
 
@@ -378,6 +398,7 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
 
   let dev = sec.get("device")
   if dev != "":
+    validateName("device", dev)
     result.device = dev
 
   let familyStr = sec.get("family")
@@ -394,8 +415,7 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
 
   result.metric = sec.getU32("metric", result.metric)
   result.weight = sec.getU32("weight", result.weight)
-  if result.weight == 0:
-    result.weight = 1
+  result.weight = clamp(result.weight, 1'u32, 1000'u32)
 
   let methodStr = sec.get("track_method")
   if methodStr != "":
@@ -405,32 +425,31 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   let trackIps = sec.getAll("track_ip")
   for ip in trackIps:
     if not isValidIpAddress(ip):
-      raise newException(ConfigError, "interface '" & sec.name & "': invalid track_ip '" & ip & "'")
+      warn "interface '" & sec.name & "': invalid track_ip '" & ip & "', skipping"
+      continue
     result.trackIp.add(ip)
 
   result.trackPort = int(sec.getU32("track_port", uint32(result.trackPort)))
   result.reliability = sec.getU32("reliability", result.reliability)
   result.probeInterval = sec.getU32("probe_interval", result.probeInterval)
-  # Clamp probe_interval
-  result.probeInterval = clamp(result.probeInterval, 1'u32, 3600'u32)
 
   result.failureInterval = int(sec.getU32("failure_interval", uint32(result.failureInterval)))
   result.recoveryInterval = int(sec.getU32("recovery_interval", uint32(result.recoveryInterval)))
   result.keepFailureInterval = sec.getBool("keep_failure_interval", result.keepFailureInterval)
   result.probeTimeout = sec.getU32("probe_timeout", result.probeTimeout)
-  result.probeTimeout = clamp(result.probeTimeout, 1'u32, 60'u32)
 
   result.count = sec.getU32("count", result.count)
-  result.count = clamp(result.count, 1'u32, 100'u32)
+  result.count = max(result.count, 1'u32)
 
   result.maxTtl = sec.getU32("max_ttl", result.maxTtl)
+  result.maxTtl = clamp(result.maxTtl, 1'u32, 255'u32)
   result.probeSize = sec.getU32("probe_size", result.probeSize)
-  result.probeSize = clamp(result.probeSize, 0'u32, 65507'u32)
+  result.probeSize = clamp(result.probeSize, 0'u32, 1400'u32)
 
-  result.upCount = sec.getU32("up", result.upCount)
-  result.upCount = clamp(result.upCount, 1'u32, 100'u32)
-  result.downCount = sec.getU32("down", result.downCount)
-  result.downCount = clamp(result.downCount, 1'u32, 100'u32)
+  result.upCount = sec.getU32("up_count", result.upCount)
+  result.upCount = max(result.upCount, 1'u32)
+  result.downCount = sec.getU32("down_count", result.downCount)
+  result.downCount = max(result.downCount, 1'u32)
 
   let initStr = sec.get("initial_state")
   if initStr != "":
@@ -448,7 +467,6 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   result.recoveryLatency = int(sec.getU32("recovery_latency", uint32(result.recoveryLatency)))
   result.recoveryLoss = int(sec.getU32("recovery_loss", uint32(result.recoveryLoss)))
   result.qualityWindow = sec.getU32("quality_window", result.qualityWindow)
-  result.qualityWindow = clamp(result.qualityWindow, 1'u32, 1000'u32)
 
   result.dampening = sec.getBool("dampening", result.dampening)
   result.dampeningHalflife = sec.getU32("dampening_halflife", result.dampeningHalflife)
@@ -460,6 +478,9 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   if dqn != "":
     if dqn.len > 253:
       raise newException(ConfigError, "interface '" & sec.name & "': dns_query_name too long (max 253)")
+    for label in dqn.split('.'):
+      if label.len > 63:
+        raise newException(ConfigError, "interface '" & sec.name & "': dns_query_name label too long (max 63): '" & label & "'")
     result.dnsQueryName = dqn
 
   result.localSource = sec.getBool("local_source", result.localSource)
@@ -468,8 +489,19 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
 
   for ds in sec.getAll("dns_server"):
     if not isValidIpAddress(ds):
-      raise newException(ConfigError, "interface '" & sec.name & "': invalid dns_server '" & ds & "'")
+      warn "interface '" & sec.name & "': invalid dns_server '" & ds & "', skipping"
+      continue
     result.dnsServers.add(ds)
+
+  # composite_method list
+  for cm in sec.getAll("composite_method"):
+    case cm.toLowerAscii()
+    of "ping": result.compositeMethods.add(tmPing)
+    of "dns": result.compositeMethods.add(tmDns)
+    of "http": result.compositeMethods.add(tmHttp)
+    of "https": result.compositeMethods.add(tmHttps)
+    of "arping": result.compositeMethods.add(tmArping)
+    else: warn "interface '" & sec.name & "': unknown composite_method '" & cm & "'"
 
   # flush_conntrack list
   let flushList = sec.getAll("flush_conntrack")
@@ -552,6 +584,9 @@ proc validatePortSpec(spec: string, context: string) =
 
 proc validateCidr(s: string, context: string) =
   ## Validate an IP address or CIDR notation (addr/prefix).
+  ## Strings starting with '@' are nftables set references and skip validation.
+  if s.len > 0 and s[0] == '@':
+    return
   let slashIdx = s.find('/')
   if slashIdx >= 0:
     let addrPart = s[0 ..< slashIdx]
@@ -606,7 +641,7 @@ proc parseRule*(sec: UciSection): RuleConfig =
   let proto = sec.get("proto")
   if proto != "":
     case proto.toLowerAscii()
-    of "tcp", "udp", "icmp", "all":
+    of "tcp", "udp", "icmp", "icmpv6", "sctp", "gre", "esp", "ah", "all":
       result.proto = proto.toLowerAscii()
     else:
       # Allow numeric protocol numbers
@@ -658,10 +693,11 @@ proc parseRule*(sec: UciSection): RuleConfig =
     else:
       warn ctx & ": unknown sticky_mode '" & stickyModeStr & "', using flow"
 
-  # use_policy (required for rules that route traffic)
+  # use_policy (required)
   let usePolicy = sec.get("use_policy")
-  if usePolicy != "":
-    result.usePolicy = usePolicy
+  if usePolicy == "":
+    raise newException(ConfigError, ctx & ": 'use_policy' is required")
+  result.usePolicy = usePolicy
 
   result.log = sec.getBool("log", result.log)
 
@@ -718,6 +754,15 @@ proc validate*(config: var NopalConfig) =
     if iface.enabled and iface.trackIp.len == 0:
       warn "interface '" & iface.name & "' has no track_ip configured, probes will not run"
 
+  # Warn on unreferenced members
+  var referencedMembers = initHashSet[string]()
+  for policy in config.policies:
+    for memberName in policy.members:
+      referencedMembers.incl(memberName)
+  for member in config.members:
+    if member.name notin referencedMembers:
+      warn "member '" & member.name & "' is not referenced by any policy"
+
 proc loadFromStr*(text: string): NopalConfig =
   ## Parse UCI text and return a validated NopalConfig.
   let sections = parseUci(text)
@@ -770,8 +815,8 @@ config interface wan1
   option reliability '2'
   option probe_interval '5'
   option probe_timeout '2'
-  option down '3'
-  option up '3'
+  option down_count '3'
+  option up_count '3'
   option metric '10'
   option weight '3'
 
@@ -783,8 +828,8 @@ config interface wan2
   option reliability '1'
   option probe_interval '5'
   option probe_timeout '2'
-  option down '3'
-  option up '3'
+  option down_count '3'
+  option up_count '3'
   option metric '20'
   option weight '2'
 
@@ -1010,3 +1055,126 @@ config rule r1
       check cfg.members.len == 2
       check cfg.policies.len == 1
       check cfg.rules.len == 1
+
+    test "conntrack_flush_modes":
+      for (val, expected) in [("none", cfmNone), ("selective", cfmSelective), ("full", cfmFull)]:
+        let text = "config globals globals\n  option conntrack_flush '" & val & "'\n"
+        let cfg = loadFromStr(text)
+        check cfg.globals.conntrackFlush == expected
+
+    test "ipv6_enabled_and_family_parsing":
+      let text = """
+config globals globals
+  option ipv6_enabled '1'
+
+config interface wan6
+  option device 'eth0'
+  option family 'ipv6'
+  list track_ip '2001:4860:4860::8888'
+
+config interface wan_dual
+  option device 'eth1'
+  option family 'both'
+  list track_ip '1.1.1.1'
+
+config policy balanced
+  option last_resort 'default'
+
+config rule v6_only
+  option family 'ipv6'
+  option use_policy 'balanced'
+
+config rule dual
+  option family 'any'
+  option use_policy 'balanced'
+"""
+      let cfg = loadFromStr(text)
+      check cfg.globals.ipv6Enabled
+      check cfg.interfaces[0].family == afIpv6
+      check cfg.interfaces[1].family == afBoth
+      check cfg.rules[0].family == rfIpv6
+      check cfg.rules[1].family == rfAny
+
+    test "rule_with_all_fields":
+      let text = """
+config interface wan
+  option device 'eth0'
+  list track_ip '1.1.1.1'
+
+config member wan_m
+  option interface 'wan'
+
+config policy balanced
+  list use_member 'wan_m'
+
+config rule custom
+  list src_ip '10.0.0.0/8'
+  option src_port '1024-65535'
+  list dest_ip '192.168.1.0/24'
+  option dest_port '80'
+  option proto 'tcp'
+  option family 'ipv4'
+  option sticky '1'
+  option sticky_timeout '300'
+  option sticky_mode 'src_ip'
+  option use_policy 'balanced'
+  option log '1'
+"""
+      let cfg = loadFromStr(text)
+      let rule = cfg.rules[0]
+      check rule.srcIp == @["10.0.0.0/8"]
+      check rule.srcPort == "1024-65535"
+      check rule.destIp == @["192.168.1.0/24"]
+      check rule.destPort == "80"
+      check rule.proto == "tcp"
+      check rule.family == rfIpv4
+      check rule.sticky == true
+      check rule.stickyTimeout == 300'u32
+      check rule.stickyMode == smSrcIp
+      check rule.log == true
+
+    test "duplicate_member_name_is_error":
+      let text = """
+config interface wan
+  option device 'eth0'
+config member wan_m
+  option interface 'wan'
+config member wan_m
+  option interface 'wan'
+"""
+      expect ConfigError:
+        discard loadFromStr(text)
+
+    test "duplicate_policy_name_is_error":
+      let text = """
+config policy balanced
+  option last_resort 'default'
+config policy balanced
+  option last_resort 'unreachable'
+"""
+      expect ConfigError:
+        discard loadFromStr(text)
+
+    test "duplicate_rule_name_is_error":
+      let text = """
+config policy balanced
+  option last_resort 'default'
+config rule r1
+  option use_policy 'balanced'
+config rule r1
+  option use_policy 'balanced'
+"""
+      expect ConfigError:
+        discard loadFromStr(text)
+
+    test "interface_missing_name_is_error":
+      let text = "config interface\n  option device 'eth0'\n"
+      expect ConfigError:
+        discard loadFromStr(text)
+
+    test "parse_empty_config_checks_defaults":
+      let cfg = loadFromStr("")
+      check cfg.globals.enabled == true
+      check cfg.globals.markMask == 0xFF00'u32
+      check cfg.globals.conntrackFlush == cfmSelective
+      check cfg.interfaces.len == 0
