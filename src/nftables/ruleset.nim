@@ -106,7 +106,7 @@ when isMainModule:
       var rs = initRuleset()
       let expr1 = %*{"match": {"op": "==", "left": 1, "right": 2}}
       let expr2 = %*{"accept": nil}
-      rs.addRule("forward", expr1, expr2)
+      rs.addRule("forward", [expr1, expr2])
       let j = rs.toJson()
       let rule = j["nftables"][1]["add"]["rule"]
       check rule["chain"].getStr == "forward"
