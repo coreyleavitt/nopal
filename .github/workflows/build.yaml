@@ -33,35 +33,31 @@ jobs:
 
   compile:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/coreyleavitt/nopal-toolchain:latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - openwrt_arch: aarch64_cortex-a53
-            rust_target: aarch64-unknown-linux-musl
+            nim_target: aarch64
           - openwrt_arch: arm_cortex-a7
-            rust_target: armv7-unknown-linux-musleabihf
+            nim_target: armv7hf
           - openwrt_arch: mips_24kc
-            rust_target: mips-unknown-linux-musl
-            extra_flags: -Z build-std=std,panic_abort
+            nim_target: mips
           - openwrt_arch: mipsel_24kc
-            rust_target: mipsel-unknown-linux-musl
-            extra_flags: -Z build-std=std,panic_abort
+            nim_target: mipsel
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
-
-      - name: Install cross
-        run: cargo install cross --locked
-
       - name: Build
-        run: cross +nightly build --release --features https --target ${{ matrix.rust_target }} ${{ matrix.extra_flags }}
+        run: nim c -d:release -d:https -d:${{ matrix.nim_target }} src/nopal.nim
 
       - name: Prepare binary
-        run: cp target/${{ matrix.rust_target }}/release/nopal nopald
+        run: |
+          mv src/nopal nopald
+          ls -lh nopald
+          file nopald
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
