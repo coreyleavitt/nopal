@@ -122,7 +122,7 @@ proc sendDnsProbe*(fd: cint, target: openArray[byte], family: uint8,
     sa.sin_family = AF_INET.TSa_Family
     sa.sin_port = htons(DNS_PORT)
     copyMem(addr sa.sin_addr, unsafeAddr target[0], 4)
-    let ret = sendto(fd, addr queryBuf[0], queryLen.SockLen, 0,
+    let ret = sendto(SocketHandle(fd), cast[pointer](addr queryBuf[0]), queryLen, 0'i32,
                      cast[ptr SockAddr](addr sa),
                      sizeof(Sockaddr_in).SockLen)
     result = ret >= 0
@@ -131,7 +131,7 @@ proc sendDnsProbe*(fd: cint, target: openArray[byte], family: uint8,
     sa.sin6_family = AF_INET6.TSa_Family
     sa.sin6_port = htons(DNS_PORT)
     copyMem(addr sa.sin6_addr, unsafeAddr target[0], 16)
-    let ret = sendto(fd, addr queryBuf[0], queryLen.SockLen, 0,
+    let ret = sendto(SocketHandle(fd), cast[pointer](addr queryBuf[0]), queryLen, 0'i32,
                      cast[ptr SockAddr](addr sa),
                      sizeof(Sockaddr_in6).SockLen)
     result = ret >= 0
@@ -141,7 +141,7 @@ proc recvDnsReply*(fd: cint, buf: var array[512, byte]): tuple[ok: bool, txid: u
   ## Checks QR bit (byte 2, bit 7), extracts txid from bytes 0-1.
   result = (ok: false, txid: 0'u16)
 
-  let n = recv(fd, addr buf[0], buf.len.cint, 0)
+  let n = recv(SocketHandle(fd), cast[pointer](addr buf[0]), buf.len, 0)
   if n < 12:
     return  # DNS header is 12 bytes minimum
 
