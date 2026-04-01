@@ -1,0 +1,6 @@
+.git
+target
+nimcache
+nimblecache
+*.ipk
+*.apk
