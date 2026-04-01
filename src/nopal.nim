@@ -69,6 +69,7 @@ proc runDaemon(args: seq[string]) =
 
   # Install signal handlers via sigaction
   var sa: Sigaction
+  discard sigemptyset(sa.sa_mask)
   sa.sa_flags = SA_RESTART
 
   sa.sa_handler = handleSigterm
@@ -108,7 +109,7 @@ proc sendIpcRequest(socketPath: string, req: IpcRequest): IpcResponse =
   sa.sun_path[pathBytes.len] = '\0'
 
   if connect(fd, cast[ptr SockAddr](addr sa),
-             SockLen(sizeof(sa).cint)) != 0:
+             SockLen(sizeof(sa))) != 0:
     discard posix.close(fd.cint)
     raise newException(IOError, "failed to connect to " & socketPath &
                        ": " & $strerror(errno))
@@ -126,7 +127,7 @@ proc sendIpcRequest(socketPath: string, req: IpcRequest): IpcResponse =
   if send(fd, unsafeAddr lenBuf[0], 4, 0) != 4:
     discard posix.close(fd.cint)
     raise newException(IOError, "failed to send request length")
-  if send(fd, unsafeAddr payload[0], payload.len.cint, 0) != payload.len.cint:
+  if send(fd, unsafeAddr payload[0], payload.len, 0) != payload.len:
     discard posix.close(fd.cint)
     raise newException(IOError, "failed to send request payload")
 
