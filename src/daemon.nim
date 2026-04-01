@@ -23,10 +23,9 @@ import ./netlink/monitor
 import ./netlink/conntrack
 import ./dnsmanager
 import ./timer
-# IPC server/methods stubs -- will be imported when complete
-# import ./ipc/server
-# import ./ipc/methods
-# import ./ipc/protocol
+import ./ipc/server
+import ./ipc/methods
+import ./ipc/protocol
 
 # =========================================================================
 # Token constants for selector dispatch
@@ -38,7 +37,6 @@ const
   TokenSignal* = 2
   TokenRoute* = 3
   ProbeTokenBase* = 100
-  IpcClientBase* = 1000
 
 # =========================================================================
 # Daemon type
@@ -58,6 +56,7 @@ type
     probeEngine: ProbeEngine
     dnsManager: DnsManager
     conntrackMgr: ConntrackManager
+    ipcServer: IpcServer
 
     # Signal delivery
     signalFd: cint
@@ -157,8 +156,8 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
   # Register route monitor
   selector.registerHandle(routeMon.fd, {Read}, TokenRoute)
 
-  # IPC listener registration is stubbed -- will be added when IPC server is complete
-  # selector.registerHandle(ipcServer.fd, {Read}, TokenIpc)
+  # Initialize IPC server (registers listener fd with selector)
+  let ipcServer = initIpcServer(config.globals.ipcSocket, selector)
 
   # Build interface trackers from config
   let ipv6Enabled = config.globals.ipv6Enabled
@@ -218,6 +217,7 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
     probeEngine: probeEng,
     dnsManager: dnsMgr,
     conntrackMgr: ctMgr,
+    ipcServer: ipcServer,
     signalFd: signalFd,
     trackers: trackers,
     startTime: getMonoTime(),
@@ -357,9 +357,11 @@ proc regenerateNftables(d: var Daemon) =
       lastResort: lr,
     ))
 
-  # TODO: refresh connected networks from route manager when available
-  # For now use cached list
-  d.connectedNetworksDirty = false
+  if d.connectedNetworksDirty:
+    d.connectedNetworksDirty = false
+    # Connected networks will be populated by route table dumps when available
+    # For now, use basic loopback and link-local prefixes
+    d.connectedNetworks = @["127.0.0.0/8", "::1/128"]
 
   let rs = buildRuleset(
     interfaces, policies, d.cachedRules, d.connectedNetworks,
@@ -480,9 +482,8 @@ proc flushConntrack(d: var Daemon, mark, mask: uint32) =
     except CatchableError as e:
       error "conntrack flush failed: " & e.msg
   of cfmFull:
-    # Full flush not yet implemented in conntrack manager; use selective
     try:
-      d.conntrackMgr.flushByMark(mark, mask)
+      d.conntrackMgr.flushByMark(0, 0)  # mask=0 means match all entries
     except CatchableError as e:
       error "conntrack flush all failed: " & e.msg
   of cfmNone:
@@ -694,8 +695,13 @@ proc executeActions(d: var Daemon, result: TransitionResult) =
           name = t.name
           break
       if name.len > 0:
-        # IPC broadcast is stubbed until server.nim is complete
-        debug "broadcast: interface.state_change " & name & " -> " & $result.newState
+        let eventData = EventData(
+          event: "interface.state_change",
+          interfaceName: name,
+          state: $result.newState,
+        )
+        let eventResp = successResponse(0, eventData.toJson())
+        d.ipcServer.broadcastEvent(eventResp, d.selector)
         d.runHook(name, result.newState)
     of taWriteStatus:
       d.writeStatusFile(result.index, result.newState)
@@ -710,6 +716,7 @@ proc scheduleDampenDecay(d: var Daemon, index: int) =
     proc(c: InterfaceConfig): uint32 = max(c.dampeningHalflife div 10, 1)
   ).get(30'u32)
 
+  d.timers.cancelByIndex(index, {tkDampenDecay})
   d.timers.push(TimerEntry(
     deadline: getMonoTime() + initDuration(seconds = int(interval)),
     kind: tkDampenDecay,
@@ -841,6 +848,8 @@ proc handleLinkEvents(d: var Daemon) =
         let mark = d.trackers[trackerIdx].mark
         let currentState = d.trackers[trackerIdx].state
 
+        d.timers.cancelByIndex(index, {tkProbe, tkProbeTimeout})
+
         # Reset quality window and hysteresis
         d.probeEngine.resetCounters(index)
 
@@ -870,6 +879,8 @@ proc handleLinkEvents(d: var Daemon) =
         let name = d.trackers[trackerIdx].name
         let index = d.trackers[trackerIdx].index
         let mark = d.trackers[trackerIdx].mark
+
+        d.timers.cancelByIndex(index, {tkProbe, tkProbeTimeout})
 
         let tr = actionsForTransition(name, index, mark, oldState, newStateOpt.get)
         d.executeActions(tr)
@@ -903,6 +914,7 @@ proc handleProbeTimer(d: var Daemon, index: int) =
   let ok = d.probeEngine.sendProbe(index)
   if not ok:
     warn "failed to send probe for interface " & $index
+    d.timers.cancelByIndex(index, {tkProbeTimeout})
     # Treat send failure as immediate timeout
     let resultOpt = d.probeEngine.recordTimeout(index)
     if resultOpt.isSome:
@@ -1058,6 +1070,8 @@ proc handleReload(d: var Daemon) =
     prevStates.add((name: t.name, state: t.state, onlineSince: t.onlineSince))
 
   # -- Teardown existing state --
+
+  d.timers.cancelAll({tkIpcTimeout})  # keep IPC timeouts, cancel everything else
 
   # Remove routes for active interfaces
   var activeIndices: seq[int]
@@ -1309,13 +1323,25 @@ proc run*(d: var Daemon) =
       elif token == TokenRoute:
         d.handleRouteEvents()
       elif token == TokenIpc:
-        # IPC listener accept -- stubbed until server.nim is complete
-        debug "IPC accept event (stubbed)"
+        let clientId = d.ipcServer.acceptClient(d.selector)
+        if clientId >= 0:
+          debug "IPC client connected: " & $clientId
       elif token >= ProbeTokenBase and token < IpcClientBase:
         d.handleProbeResponse(token - ProbeTokenBase)
       elif token >= IpcClientBase:
-        # IPC client read -- stubbed until server.nim is complete
-        debug "IPC client event (stubbed), client_id=" & $(token - IpcClientBase)
+        let clientId = token - IpcClientBase
+        let requests = d.ipcServer.readClient(clientId, d.selector)
+        for req in requests:
+          let view = DaemonView(
+            trackers: addr d.trackers,
+            config: unsafeAddr d.config,
+            startTime: d.startTime,
+            connectedNetworks: addr d.connectedNetworks,
+          )
+          let (resp, action) = dispatch(req, view)
+          d.ipcServer.sendResponse(clientId, resp, d.selector)
+          if action == daReload:
+            d.reloadRequested = true
 
     # Process expired timers
     let timerNow = getMonoTime()
@@ -1329,8 +1355,7 @@ proc run*(d: var Daemon) =
       of tkDampenDecay:
         d.handleDampenDecay(entry.index)
       of tkIpcTimeout:
-        # IPC client timeout -- stubbed until server.nim is complete
-        debug "IPC timeout for client " & $entry.index
+        d.ipcServer.removeClient(entry.index, d.selector)
 
     # Deferred nftables regeneration: coalesce multiple transitions
     if d.nftablesDirty:
