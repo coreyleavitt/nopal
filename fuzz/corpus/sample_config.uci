@@ -1,0 +1,26 @@
+config globals 'globals'
+    option enabled '1'
+    option log_level 'info'
+    option conntrack_flush 'selective'
+
+config interface 'wan'
+    option enabled '1'
+    option device 'eth0'
+    option track_method 'ping'
+    list track_ip '8.8.8.8'
+    option probe_interval '5'
+    option up_count '3'
+    option down_count '5'
+
+config member 'wan_m1'
+    option interface 'wan'
+    option metric '10'
+    option weight '1'
+
+config policy 'balanced'
+    list use_member 'wan_m1'
+    option last_resort 'default'
+
+config rule 'default_rule'
+    option use_policy 'balanced'
+    option proto 'all'
