@@ -163,34 +163,35 @@ proc delRule*(m: var RouteManager, mark, mask, table, priority: uint32,
 # Dump helper
 # ---------------------------------------------------------------------------
 
-proc recvDump(m: var RouteManager, callback: proc(hdr: NlMsgHdr,
-              data: openArray[byte], payloadSlice: Slice[int]): bool) =
-  ## Receive a netlink dump response, calling callback for each message.
-  ## callback returns true to stop iteration (like break).
+iterator recvDump(m: var RouteManager): tuple[hdr: NlMsgHdr, payloadSlice: Slice[int], bufLen: int] =
+  ## Iterate netlink dump response messages. Yields each message.
   ## Stops on NLMSG_DONE or NLMSG_ERROR with error=0.
   let deadline = getMonoTime() + initDuration(milliseconds = DumpTimeoutMs)
+  var done = false
 
-  while true:
+  while not done:
     let n = m.sock.recvMsg(m.recvBuf)
     if n < 0:
-      raiseOSError(osLastError())
+      break
     if n == 0:
       if getMonoTime() >= deadline:
-        raise newException(IOError, "timeout waiting for netlink dump")
+        break
       discard posix.poll(nil, 0, 1)  # 1ms sleep
       continue
 
     for (hdr, payloadSlice) in nlMsgs(m.recvBuf, n):
       if hdr.nlmsgType == NLMSG_DONE:
-        return
+        done = true
+        break
       if hdr.nlmsgType == NLMSG_ERROR:
         if payloadSlice.b - payloadSlice.a + 1 >= sizeof(int32):
           let errCode = readStruct[int32](m.recvBuf, payloadSlice.a)
           if errCode != 0:
-            raise newException(IOError, "netlink dump error: " & $errCode)
-        return
-      if callback(hdr, m.recvBuf[0 ..< n], payloadSlice):
-        return
+            done = true
+            break
+        done = true
+        break
+      yield (hdr, payloadSlice, n)
 
 # ---------------------------------------------------------------------------
 # flushTable
@@ -218,33 +219,29 @@ proc flushTableFamily(m: var RouteManager, table: uint32, family: uint8) =
   # Collect delete messages (we can't send while receiving the dump)
   var deleteMsgs: seq[seq[byte]]
 
-  m.recvDump(proc(hdr: NlMsgHdr, data: openArray[byte],
-                   payloadSlice: Slice[int]): bool =
+  for (hdr, payloadSlice, bufLen) in m.recvDump():
     if hdr.nlmsgType != RTM_NEWROUTE.uint16:
-      return false
+      continue
 
     let msgStart = payloadSlice.a
-    let msgEnd = payloadSlice.b + 1  # exclusive end
+    let msgEnd = payloadSlice.b + 1
     if msgEnd - msgStart < sizeof(RtMsg):
-      return false
+      continue
 
-    let rtmMsg = readStruct[RtMsg](data, msgStart)
+    let rtmMsg = readStruct[RtMsg](m.recvBuf, msgStart)
 
-    # Determine table from rtm_table and RTA_TABLE attribute
     var routeTable = uint32(rtmMsg.rtmTable)
     let attrStart = msgStart + nlmsgAlign(sizeof(RtMsg))
-    for (attrType, s) in nlAttrs(data[0 ..< msgEnd], attrStart):
+    for (attrType, s) in nlAttrs(m.recvBuf[0 ..< msgEnd], attrStart):
       if attrType == RTA_TABLE.uint16:
-        routeTable = attrU32(data[0 ..< msgEnd], s)
+        routeTable = attrU32(m.recvBuf[0 ..< msgEnd], s)
         break
 
     if routeTable != table:
-      return false
+      continue
 
-    # Build RTM_DELROUTE by reusing the original payload with a new header
-    let delSeq = m.nlSeq + 1  # peek next seq
-    m.nlSeq = delSeq
-    let payload = data[msgStart ..< msgEnd]
+    let delSeq = m.nextSeq()
+    let payload = m.recvBuf[msgStart ..< msgEnd]
     let totalLen = uint32(sizeof(NlMsgHdr) + payload.len)
 
     let delHdr = NlMsgHdr(
@@ -261,8 +258,6 @@ proc flushTableFamily(m: var RouteManager, table: uint32, family: uint8) =
       copyMem(addr delBuf[sizeof(NlMsgHdr)], unsafeAddr payload[0], payload.len)
 
     deleteMsgs.add(delBuf)
-    false  # continue iterating
-  )
 
   # Now send all delete messages
   for delBuf in deleteMsgs:
@@ -310,34 +305,29 @@ proc getAddresses*(m: var RouteManager, ifindex: uint32,
 
   var addrs: seq[AddrInfo]
 
-  m.recvDump(proc(hdr: NlMsgHdr, data: openArray[byte],
-                   payloadSlice: Slice[int]): bool =
+  for (hdr, payloadSlice, bufLen) in m.recvDump():
     if hdr.nlmsgType != RTM_NEWADDR.uint16:
-      return false
+      continue
 
     let msgStart = payloadSlice.a
-    let msgEnd = payloadSlice.b + 1  # exclusive end
+    let msgEnd = payloadSlice.b + 1
     if msgEnd - msgStart < sizeof(IfAddrMsg):
-      return false
+      continue
 
-    let ifaMsg = readStruct[IfAddrMsg](data, msgStart)
+    let ifaMsg = readStruct[IfAddrMsg](m.recvBuf, msgStart)
 
     if ifaMsg.ifaIndex != ifindex or ifaMsg.ifaFamily != family:
-      return false
+      continue
 
-    # Scan for IFA_ADDRESS attribute
     let attrStart = msgStart + nlmsgAlign(sizeof(IfAddrMsg))
-    for (attrType, s) in nlAttrs(data[0 ..< msgEnd], attrStart):
+    for (attrType, s) in nlAttrs(m.recvBuf[0 ..< msgEnd], attrStart):
       if attrType == IFA_ADDRESS.uint16:
         let addrLen = s.b - s.a + 1
         let expectedLen = if family == AF_INET: 4 else: 16
         if addrLen >= expectedLen:
           var addrBytes = newSeq[byte](expectedLen)
-          copyMem(addr addrBytes[0], unsafeAddr data[s.a], expectedLen)
+          copyMem(addr addrBytes[0], unsafeAddr m.recvBuf[s.a], expectedLen)
           addrs.add(AddrInfo(address: addrBytes, prefixLen: ifaMsg.ifaPrefixLen))
         break
-
-    false  # continue iterating
-  )
 
   addrs
