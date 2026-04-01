@@ -1,12 +1,15 @@
 import std/os
 
-# Common release flags
+# Common flags
 switch("mm", "arc")
 switch("define", "useMalloc")
 switch("panics", "on")
+switch("threads", "off")
 
 when defined(release):
   switch("opt", "size")
+  switch("passC", "-flto -fdata-sections -ffunction-sections")
+  switch("passL", "-flto -s -Wl,--gc-sections")
 
 # Cross-compilation profiles
 # Usage: nim c -d:release -d:aarch64 src/nopal.nim
@@ -44,5 +47,4 @@ when defined(mipsel):
 
 # HTTPS feature flag (requires nim-mbedtls)
 # Usage: nim c -d:https src/nopal.nim
-when defined(https):
-  switch("define", "ssl")
+# Links against system mbedTLS — does NOT use Nim's std/net SSL support
