@@ -86,8 +86,9 @@ jobs:
           cd "musl-${MUSL_VERSION}"
 
           # Cross-compile musl using clang targeting the arch
-          CROSS_COMPILE="clang --target=${{ matrix.musl_triple }} " \
           CC="clang --target=${{ matrix.musl_triple }}" \
+          AR=llvm-ar \
+          RANLIB=llvm-ranlib \
           ./configure \
             --prefix=/opt/musl/${{ matrix.nim_target }} \
             --target=${{ matrix.musl_triple }} \
