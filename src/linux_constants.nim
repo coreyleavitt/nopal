@@ -71,7 +71,7 @@ const SIOCGIFADDR* = culong(0x8915)
 const NFNL_SUBSYS_CTNETLINK* = uint8(1)
 const IPCTNL_MSG_CT_DELETE* = uint8(2)
 const CTA_MARK* = cushort(8)
-const CTA_MARK_MASK* = cushort(18)
+const CTA_MARK_MASK* = cushort(21)
 
 # Netlink header struct
 type
