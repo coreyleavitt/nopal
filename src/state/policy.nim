@@ -10,7 +10,7 @@ import ../config/schema
 
 type
   ActiveMember* = object
-    interface*: string
+    `interface`*: string
     mark*: uint32
     weight*: uint32
 
@@ -43,15 +43,13 @@ proc resolvePolicy*(policy: PolicyConfig, members: seq[MemberConfig],
     # Find the tracker
     var foundTracker = false
     for t in trackers:
-      if t.name == memberCfg.interface:
+      if t.name == memberCfg.`interface`:
         foundTracker = true
         if not t.isActive:
           break
-        active.add((memberCfg.metric, ActiveMember(
-          interface: memberCfg.interface,
-          mark: t.mark,
-          weight: memberCfg.weight,
-        )))
+        var am = ActiveMember(mark: t.mark, weight: memberCfg.weight)
+        am.`interface` = memberCfg.`interface`
+        active.add((memberCfg.metric, am))
         break
 
   # Sort by metric (lowest first)
@@ -91,6 +89,10 @@ proc activeTotalWeight*(rp: ResolvedPolicy): uint32 =
 when isMainModule:
   import std/unittest
 
+  proc makeMember(name, iface: string, metric, weight: uint32): MemberConfig =
+    result = MemberConfig(name: name, metric: metric, weight: weight)
+    result.`interface` = iface
+
   proc makeTracker(name: string, index: int, mark: uint32, online: bool): InterfaceTracker =
     var t = newTracker(name, index, mark, 100 + index.uint32,
                        "eth0." & $(index + 2), 3, 5)
@@ -106,8 +108,8 @@ when isMainModule:
         lastResort: lrDefault,
       )
       let members = @[
-        MemberConfig(name: "wan_m1_w50", interface: "wan", metric: 1, weight: 50),
-        MemberConfig(name: "wanb_m1_w50", interface: "wanb", metric: 1, weight: 50),
+        makeMember("wan_m1_w50", "wan", 1, 50),
+        makeMember("wanb_m1_w50", "wanb", 1, 50),
       ]
       let trackers = @[
         makeTracker("wan", 0, 0x0100, true),
@@ -126,8 +128,8 @@ when isMainModule:
         lastResort: lrDefault,
       )
       let members = @[
-        MemberConfig(name: "wan_m1", interface: "wan", metric: 1, weight: 100),
-        MemberConfig(name: "wanb_m2", interface: "wanb", metric: 2, weight: 100),
+        makeMember("wan_m1", "wan", 1, 100),
+        makeMember("wanb_m2", "wanb", 2, 100),
       ]
       let trackers = @[
         makeTracker("wan", 0, 0x0100, false),   # offline
@@ -139,7 +141,7 @@ when isMainModule:
       let tier = resolved.activeTier
       check tier != nil
       check tier.metric == 2
-      check tier.members[0].interface == "wanb"
+      check tier.members[0].`interface` == "wanb"
 
     test "all down":
       let policy = PolicyConfig(
@@ -148,7 +150,7 @@ when isMainModule:
         lastResort: lrUnreachable,
       )
       let members = @[
-        MemberConfig(name: "wan_m", interface: "wan", metric: 1, weight: 50),
+        makeMember("wan_m", "wan", 1, 50),
       ]
       let trackers = @[
         makeTracker("wan", 0, 0x0100, false),

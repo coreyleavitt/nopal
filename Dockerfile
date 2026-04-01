@@ -1,17 +1,35 @@
-FROM opensuse/tumbleweed:latest
+# Stage 1: Tumbleweed + Nim development environment
+# Build: docker build --target nim-dev -t nopal-dev .
+FROM opensuse/tumbleweed:latest AS nim-dev
 
 # Base development tools
 RUN zypper --non-interactive install \
     git \
     gcc \
+    gcc-c++ \
     make \
     curl \
     tar \
     xz \
     gzip \
     bzip2 \
-    patch \
     which \
+    python3 \
+    && zypper clean --all
+
+# Install Nim via choosenim
+RUN curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
+ENV PATH="/root/.nimble/bin:${PATH}"
+
+WORKDIR /src
+
+# Stage 2: Add crosstool-ng for cross-compilation
+# Build: docker build --target cross-dev -t nopal-cross .
+FROM nim-dev AS cross-dev
+
+# Additional build tools for crosstool-ng
+RUN zypper --non-interactive install \
+    patch \
     gawk \
     bison \
     flex \
@@ -21,12 +39,7 @@ RUN zypper --non-interactive install \
     autoconf \
     automake \
     libtool \
-    python3 \
     && zypper clean --all
-
-# Install Nim via choosenim
-RUN curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
-ENV PATH="/root/.nimble/bin:${PATH}"
 
 # Install crosstool-ng
 ARG CTNG_VERSION=1.26.0
@@ -40,6 +53,3 @@ RUN cd /tmp \
     && cd / && rm -rf /tmp/crosstool-ng*
 
 WORKDIR /src
-COPY . .
-
-CMD ["nimble", "test"]
