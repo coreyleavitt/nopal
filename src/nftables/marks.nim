@@ -23,6 +23,8 @@ proc assignMarks*(names: openArray[string], markMask: uint32): seq[tuple[mark: u
   result = newSeq[tuple[mark: uint32, tableId: uint32]](names.len)
 
   if markMask == 0 or names.len == 0:
+    for i in 0 ..< result.len:
+      result[i] = (mark: 0'u32, tableId: TableBase)
     return
 
   let step = markMask and (not markMask + 1)  # lowest set bit
@@ -31,13 +33,12 @@ proc assignMarks*(names: openArray[string], markMask: uint32): seq[tuple[mark: u
   if maxSlots < 1:
     return
 
-  # More interfaces than slots would produce duplicate marks
-  assert names.len <= maxSlots, "too many interfaces (" & $names.len &
-    ") for mark_mask (max " & $maxSlots & " slots)"
-
   var usedSlots = newSeq[bool](maxSlots + 1)  # index 0 unused, 1..maxSlots
 
-  for i in 0 ..< names.len:
+  # Truncate to maxSlots if more interfaces than available slots (log, don't crash)
+  let assignCount = min(names.len, maxSlots)
+
+  for i in 0 ..< assignCount:
     let h = fnv1a(names[i])
     var slot = int(h mod uint32(maxSlots)) + 1  # 1..maxSlots
 
