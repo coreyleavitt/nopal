@@ -20,7 +20,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          zypper --non-interactive install gcc make curl tar xz gzip bzip2 which mbedtls-devel
+          zypper --non-interactive install gcc git make curl tar xz gzip bzip2 which mbedtls-devel
           curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
           echo "$HOME/.nimble/bin" >> $GITHUB_PATH
 
