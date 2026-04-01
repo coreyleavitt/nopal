@@ -6,7 +6,6 @@ FROM opensuse/tumbleweed:latest AS nim-dev
 RUN zypper --non-interactive install \
     git \
     gcc \
-    gcc-c++ \
     make \
     curl \
     tar \
@@ -14,7 +13,6 @@ RUN zypper --non-interactive install \
     gzip \
     bzip2 \
     which \
-    python3 \
     && zypper clean --all
 
 # Install Nim via choosenim
