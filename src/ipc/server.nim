@@ -36,7 +36,8 @@ proc initIpcServer*(path: string, selector: Selector[int]): IpcServer =
 
   # Create socket with 0o600 permissions via umask
   let oldUmask = umask(0o177)
-  result.listenerFd = cint(posix.socket(AF_UNIX.cint, SOCK_STREAM.cint or 0x80000, 0))  # SOCK_CLOEXEC
+  const SockCloexec = 0x80000.cint  # SOCK_CLOEXEC — Linux-specific
+  result.listenerFd = cint(posix.socket(AF_UNIX.cint, SOCK_STREAM.cint or SockCloexec, 0))
   if result.listenerFd < 0:
     discard umask(oldUmask)
     raiseOSError(osLastError())
