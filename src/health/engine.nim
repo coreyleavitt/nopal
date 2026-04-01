@@ -496,6 +496,13 @@ proc resetCounters*(engine: var ProbeEngine, index: int) =
       p.qualityDegraded = false
       return
 
+proc qualityMetrics*(engine: ProbeEngine, index: int): (Option[uint32], uint32) =
+  ## Return (avgRtt, lossPercent) for the given interface's quality window.
+  for p in engine.probes:
+    if p.index == index:
+      return p.computeMetrics()
+  (none(uint32), 0'u32)
+
 when isMainModule:
   # Test helpers — simulated probes (no real sockets)
 
@@ -812,6 +819,330 @@ when isMainModule:
         assert r.isSome
         assert not r.get.qualityOk
         assert r.get.lossPercent == 50
+
+  echo ""
+  echo "=== Additional ProbeEngine tests ==="
+
+  # --- HIGH priority ---
+
+  test "multi_cycle_success_detection":
+    # Run 3 complete cycles with a 2-target, reliability=1 setup.
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 2, 1)
+
+    # Cycle 1: both targets succeed -> success (2 >= 1)
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    doAssert engine.recordTimeout(0).isNone  # mid-cycle
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    let r1 = engine.recordTimeout(0)
+    doAssert r1.isSome
+    doAssert r1.get.success
+
+    # Cycle 2: both targets fail -> failure (0 < 1)
+    engine.simulateSend(0)
+    doAssert engine.recordTimeout(0).isNone  # mid-cycle
+    engine.simulateSend(0)
+    let r2 = engine.recordTimeout(0)
+    doAssert r2.isSome
+    doAssert not r2.get.success
+
+    # Cycle 3: first target succeeds, second fails -> success (1 >= 1)
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    doAssert engine.recordTimeout(0).isNone  # mid-cycle
+    engine.simulateSend(0)
+    let r3 = engine.recordTimeout(0)
+    doAssert r3.isSome
+    doAssert r3.get.success
+
+  test "reliability_capped_to_target_count":
+    # reliability=5 with only 2 targets -> capped to 2
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 2, 5)
+
+    # Both targets succeed -> cycle succeeds (2/2 >= capped reliability 2)
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    doAssert engine.recordTimeout(0).isNone  # mid-cycle
+
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    let r = engine.recordTimeout(0)
+    doAssert r.isSome
+    doAssert r.get.success
+
+  test "latency_threshold_not_evaluated_until_window_full":
+    # latencyThreshold=50ms, window=6 (test helper default).
+    # Push high-RTT probes (200ms). qualityOk=true for first 5 (window not
+    # full), qualityOk=false on the 6th (window full, threshold exceeded).
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1, latencyThreshold = some(50'u32))
+
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 200)
+      let r = engine.recordTimeout(0)
+      doAssert r.isSome
+      if i < 5:
+        doAssert r.get.qualityOk  # window not full yet
+      else:
+        doAssert not r.get.qualityOk  # avg 200 > 50
+        doAssert r.get.avgRttMs == some(200'u32)
+
+  # --- MEDIUM priority ---
+
+  test "latency_threshold_recovers":
+    # latencyThreshold=100ms, window=6. Degrade with high latency, then
+    # recover by pushing low latency until window slides past high values.
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1, latencyThreshold = some(100'u32))
+
+    # Fill window with 150ms -> degraded
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 150)
+      discard engine.recordTimeout(0)
+    doAssert engine.probes[0].qualityDegraded
+
+    # Replace entire window with 20ms -> avg=20 < 100 -> recovered
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 20)
+      discard engine.recordTimeout(0)
+    doAssert not engine.probes[0].qualityDegraded
+
+  test "loss_threshold_below_is_ok":
+    # lossThreshold=50%, window=6. 3 successes + 2 losses + 1 success = 33% < 50%.
+    # But we need exactly 5 probes in window with 40% loss -> use a different approach.
+    # Actually with window=6: push 4 successes and 2 losses -> 33% loss < 50%.
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1, lossThreshold = some(50'u32))
+
+    # 4 successes
+    for i in 0 ..< 4:
+      engine.simulateSend(0)
+      engine.simulateResponse(0)
+      discard engine.recordTimeout(0)
+
+    # 2 losses (timeouts)
+    for i in 0 ..< 2:
+      engine.simulateSend(0)
+      let r = engine.recordTimeout(0)
+      if i == 1:
+        # Window is now full (6 entries): 4 success, 2 loss = 33% < 50%
+        doAssert r.isSome
+        doAssert r.get.qualityOk
+        doAssert r.get.lossPercent == 33
+
+  test "quality_window_slides":
+    # Push entries into a full window, verify old entries drop off.
+    # After filling 6 entries with high RTT, push low-RTT entries and
+    # verify the average reflects newer entries as old ones slide out.
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1, latencyThreshold = some(100'u32))
+
+    # Fill window with 200ms (6 entries) -> avg=200 > 100 -> degraded
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 200)
+      discard engine.recordTimeout(0)
+    doAssert engine.probes[0].qualityDegraded
+
+    # Push 3 low-RTT entries (50ms). Window slides:
+    # After 3 pushes: [200, 200, 200, 50, 50, 50] -> avg=125 > 100 still degraded
+    for i in 0 ..< 3:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 50)
+      discard engine.recordTimeout(0)
+    doAssert engine.probes[0].qualityDegraded  # avg still > 100
+
+    # Push 3 more: window becomes [50, 50, 50, 50, 50, 50] -> avg=50 < 100 -> recovered
+    for i in 0 ..< 3:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 50)
+      discard engine.recordTimeout(0)
+    doAssert not engine.probes[0].qualityDegraded
+
+  # --- LOW priority ---
+
+  test "combined_latency_and_loss_thresholds":
+    # Both thresholds active. Trigger degradation via latency first,
+    # verify loss alone doesn't trigger.
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1,
+                            latencyThreshold = some(100'u32),
+                            lossThreshold = some(40'u32))
+
+    # Fill window with low latency successes -> quality ok
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 20)
+      discard engine.recordTimeout(0)
+    doAssert not engine.probes[0].qualityDegraded
+
+    # Slide in high latency: push 3x 200ms -> window [20, 20, 20, 200, 200, 200]
+    # avg = (20+20+20+200+200+200)/6 = 660/6 = 110 > 100 -> degraded
+    for i in 0 ..< 3:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 200)
+      discard engine.recordTimeout(0)
+    doAssert engine.probes[0].qualityDegraded  # latency threshold breached
+
+    # Recover by replacing with low latency
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 20)
+      discard engine.recordTimeout(0)
+    doAssert not engine.probes[0].qualityDegraded
+
+    # Now try loss only: 2 losses in window of 6 = 33% < 40%, should not degrade
+    for i in 0 ..< 4:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 20)
+      discard engine.recordTimeout(0)
+    for i in 0 ..< 2:
+      engine.simulateSend(0)
+      discard engine.recordTimeout(0)  # timeout = loss
+    doAssert not engine.probes[0].qualityDegraded  # 33% < 40%, no degradation
+
+  test "reset_counters_clears_quality_window":
+    # Call resetCounters, verify quality window is empty and qualityOk=true.
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1, latencyThreshold = some(50'u32))
+
+    # Fill window with high latency -> degraded
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 200)
+      discard engine.recordTimeout(0)
+    doAssert engine.probes[0].qualityDegraded
+
+    # Reset clears everything
+    engine.resetCounters(0)
+
+    # Window is empty -> qualityOk should be true even with high latency
+    engine.simulateSend(0)
+    engine.simulateResponseWithRtt(0, 200)
+    let r = engine.recordTimeout(0)
+    doAssert r.isSome
+    doAssert r.get.qualityOk  # window not full (1/6)
+
+  test "quality_metrics_api":
+    # Call qualityMetrics and verify it returns correct avg_rtt and loss_percent.
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1)
+
+    # No data yet
+    let (avg0, loss0) = engine.qualityMetrics(0)
+    doAssert avg0.isNone
+    doAssert loss0 == 0
+
+    # Add a successful probe with 50ms RTT
+    engine.simulateSend(0)
+    engine.simulateResponseWithRtt(0, 50)
+    discard engine.recordTimeout(0)
+
+    # Add a timeout (loss)
+    engine.simulateSend(0)
+    discard engine.recordTimeout(0)
+
+    let (avg1, loss1) = engine.qualityMetrics(0)
+    doAssert avg1 == some(50'u32)  # only 1 successful probe contributes
+    doAssert loss1 == 50           # 1 loss out of 2
+
+  test "recovery_loss_hysteresis":
+    # lossThreshold=30%, recoveryLoss=10%, window=6.
+    # Trigger degradation with >30% loss.
+    # Verify recovery requires <10% loss (not just <30%).
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1,
+                            lossThreshold = some(30'u32),
+                            recoveryLoss = some(10'u32))
+
+    # 2 successes, 4 timeouts -> 66% loss > 30% -> degraded
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    discard engine.recordTimeout(0)
+
+    engine.simulateSend(0)
+    discard engine.recordTimeout(0)  # timeout
+
+    engine.simulateSend(0)
+    discard engine.recordTimeout(0)  # timeout
+
+    engine.simulateSend(0)
+    discard engine.recordTimeout(0)  # timeout
+
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    discard engine.recordTimeout(0)
+
+    engine.simulateSend(0)
+    discard engine.recordTimeout(0)  # timeout
+    # Window: [success, loss, loss, loss, success, loss] = 66% loss
+    doAssert engine.probes[0].qualityDegraded
+
+    # Slide in mostly successes but keep some loss: 4 success + 2 loss
+    # Window becomes [success, success, success, success, loss, loss] = 33%
+    # 33% not < 10% recovery threshold -> still degraded
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    discard engine.recordTimeout(0)
+
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    discard engine.recordTimeout(0)
+
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    discard engine.recordTimeout(0)
+
+    engine.simulateSend(0)
+    engine.simulateResponse(0)
+    discard engine.recordTimeout(0)
+
+    engine.simulateSend(0)
+    discard engine.recordTimeout(0)  # timeout
+
+    engine.simulateSend(0)
+    discard engine.recordTimeout(0)  # timeout
+    doAssert engine.probes[0].qualityDegraded  # 33% not < 10%
+
+    # Fill entirely with successes -> 0% loss < 10% -> recovered
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponse(0)
+      discard engine.recordTimeout(0)
+    doAssert not engine.probes[0].qualityDegraded
+
+  test "no_recovery_thresholds_uses_failure_thresholds":
+    # No recovery thresholds set. Trigger degradation with latency > threshold.
+    # Verify recovery when latency drops below the same threshold (strict < comparison).
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1, latencyThreshold = some(100'u32))
+
+    # Degrade: fill window with 150ms -> avg=150 > 100
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 150)
+      discard engine.recordTimeout(0)
+    doAssert engine.probes[0].qualityDegraded
+
+    # avg=100: not < 100, stays degraded (strict < comparison for recovery)
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 100)
+      discard engine.recordTimeout(0)
+    doAssert engine.probes[0].qualityDegraded  # 100 not < 100
+
+    # avg=99: < 100, recovers
+    for i in 0 ..< 6:
+      engine.simulateSend(0)
+      engine.simulateResponseWithRtt(0, 99)
+      discard engine.recordTimeout(0)
+    doAssert not engine.probes[0].qualityDegraded
 
   echo ""
   echo "=== Results ==="
