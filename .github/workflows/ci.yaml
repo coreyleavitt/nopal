@@ -2,21 +2,50 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [nim, master]
   pull_request:
 
 jobs:
-  check:
+  check-and-test:
     runs-on: ubuntu-latest
-    container: rust:1.85
+    container:
+      image: opensuse/tumbleweed
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: cargo check
-        run: cargo check
+      - name: Install dependencies
+        run: |
+          zypper --non-interactive install gcc make curl tar xz gzip bzip2 which mbedtls-devel
+          curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
 
-      - name: cargo test
-        run: cargo test
+      - name: Compile
+        run: nim c src/nopal.nim
 
-      - name: cargo check (https feature)
-        run: cargo check --features https
+      - name: Compile with HTTPS
+        run: |
+          nimble install -y https://github.com/coreyleavitt/nim-mbedtls
+          nim c -d:https src/nopal.nim
+
+      - name: Run tests
+        run: |
+          nim c -r src/config/parser.nim
+          nim c -r src/config/diff.nim
+          nim c -r src/state/tracker.nim
+          nim c -r src/state/transition.nim
+          nim c -r src/state/policy.nim
+          nim c -r src/health/dampening.nim
+          nim c -r src/health/engine.nim
+          nim c -r src/health/icmp.nim
+          nim c -r src/health/dns.nim
+          nim c -r src/netlink/socket.nim
+          nim c -r src/nftables/chains.nim
+          nim c -r src/nftables/marks.nim
+          nim c -r src/nftables/ruleset.nim
+          nim c -r src/ipc/protocol.nim
+          nim c -r src/ipc/methods.nim
+          nim c -r src/dnsmanager.nim
+
+      - name: Run HTTPS tests
+        run: nim c -r -d:https src/health/https.nim
