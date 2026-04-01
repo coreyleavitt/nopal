@@ -35,7 +35,7 @@ proc addRegularChain*(rs: var Ruleset, name: string) =
     "family": TableFamily, "table": TableName, "name": name,
   }}})
 
-proc addRule*(rs: var Ruleset, chain: string, expr: varargs[JsonNode]) =
+proc addRule*(rs: var Ruleset, chain: string, expr: openArray[JsonNode]) =
   var exprArr = newJArray()
   for e in expr:
     exprArr.add(e)
