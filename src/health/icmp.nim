@@ -109,7 +109,7 @@ proc buildIcmpPacket*(buf: var array[1500, byte], typ, code: uint8,
   buf[7] = uint8(seq and 0xFF) # sequence low
 
   # Payload: fill with "nopalprb" repeating pattern
-  const pattern = [byte 'n', 'o', 'p', 'a', 'l', 'p', 'r', 'b']
+  const pattern = [0x6E'u8, 0x6F, 0x70, 0x61, 0x6C, 0x70, 0x72, 0x62] # "nopalprb"
   for i in 0 ..< payloadLen:
     buf[8 + i] = pattern[i mod pattern.len]
 
@@ -128,7 +128,7 @@ proc sendIcmpProbe*(fd: cint, target: openArray[byte], family: uint8,
     var sa: Sockaddr_in
     sa.sin_family = AF_INET.TSa_Family
     copyMem(addr sa.sin_addr, unsafeAddr target[0], 4)
-    let ret = sendto(fd, unsafeAddr buf[0], len.SockLen, 0,
+    let ret = sendto(SocketHandle(fd), cast[pointer](unsafeAddr buf[0]), len, 0'i32,
                      cast[ptr SockAddr](addr sa),
                      sizeof(Sockaddr_in).SockLen)
     result = ret >= 0
@@ -136,7 +136,7 @@ proc sendIcmpProbe*(fd: cint, target: openArray[byte], family: uint8,
     var sa: Sockaddr_in6
     sa.sin6_family = AF_INET6.TSa_Family
     copyMem(addr sa.sin6_addr, unsafeAddr target[0], 16)
-    let ret = sendto(fd, unsafeAddr buf[0], len.SockLen, 0,
+    let ret = sendto(SocketHandle(fd), cast[pointer](unsafeAddr buf[0]), len, 0'i32,
                      cast[ptr SockAddr](addr sa),
                      sizeof(Sockaddr_in6).SockLen)
     result = ret >= 0
@@ -146,7 +146,7 @@ proc recvIcmpReply*(fd: cint, buf: var array[1500, byte]): tuple[ok: bool, id, s
   ## Returns (ok, id, seq). ok is false if no valid reply available.
   result = (ok: false, id: 0'u16, seq: 0'u16)
 
-  let n = recv(fd, addr buf[0], buf.len.cint, 0)
+  let n = recv(SocketHandle(fd), cast[pointer](addr buf[0]), buf.len, 0)
   if n < 8:
     return
 
@@ -171,7 +171,7 @@ when isMainModule:
 
   block testKnownPayload:
     ## Known payload "nopalprb" (8 bytes).
-    let data = [byte 'n', 'o', 'p', 'a', 'l', 'p', 'r', 'b']
+    let data = [0x6E'u8, 0x6F, 0x70, 0x61, 0x6C, 0x70, 0x72, 0x62] # "nopalprb"
     let cksum = icmpChecksum(data)
     doAssert cksum != 0, "checksum of non-zero data should not be zero"
     # Verify the validation property: checksum of (data + checksum) == 0
@@ -196,7 +196,7 @@ when isMainModule:
     pkt[1] = 0
     pkt[4] = 0; pkt[5] = 1  # id = 1
     pkt[6] = 0; pkt[7] = 1  # seq = 1
-    let pattern = [byte 'n', 'o', 'p', 'a', 'l', 'p', 'r', 'b']
+    let pattern = [0x6E'u8, 0x6F, 0x70, 0x61, 0x6C, 0x70, 0x72, 0x62]
     for i in 0 ..< 8:
       pkt[8 + i] = pattern[i]
     let cksum = icmpChecksum(pkt)
