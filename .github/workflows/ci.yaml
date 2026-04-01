@@ -10,6 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: opensuse/tumbleweed
+      options: --env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
