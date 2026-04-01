@@ -13,6 +13,7 @@ RUN zypper --non-interactive install \
     gzip \
     bzip2 \
     which \
+    mbedtls-devel \
     && zypper clean --all
 
 # Install Nim via choosenim
