@@ -11,20 +11,8 @@ import std/[posix, os]
 import ../linux_constants
 
 const
-  ETH_P_ARP = 0x0806'u16
   ARPHRD_ETHER = 1'u16
-  ARPOP_REQUEST* = 1'u16
-  ARPOP_REPLY* = 2'u16
   ARP_PKT_LEN = 28
-
-  AF_PACKET = 17.cint
-  SOCK_DGRAM_NB = SOCK_DGRAM.cint
-
-  # ioctl constants
-  SIOCGIFINDEX = 0x8933.culong
-  SIOCGIFHWADDR = 0x8927.culong
-  SIOCGIFADDR = 0x8915.culong
-
   IFNAMSIZ = 16
 
 type
@@ -56,7 +44,7 @@ proc createArpSocket*(device: string): tuple[fd: cint, state: ArpProbeState] =
 
   # Create AF_PACKET socket for ARP
   let proto = htons(ETH_P_ARP).cint
-  let fd = cint(socket(AF_PACKET, SOCK_DGRAM_NB, proto))
+  let fd = cint(socket(linux_constants.AF_PACKET.cint, SOCK_DGRAM.cint, proto))
   if fd < 0:
     raiseOSError(osLastError())
 
@@ -112,7 +100,7 @@ proc createArpSocket*(device: string): tuple[fd: cint, state: ArpProbeState] =
 
   # Bind to interface via sockaddr_ll
   var sll: SockaddrLl
-  sll.sll_family = AF_PACKET.uint16
+  sll.sll_family = linux_constants.AF_PACKET.uint16
   sll.sll_protocol = htons(ETH_P_ARP)
   sll.sll_ifindex = state.ifindex
   if bindSocket(SocketHandle(fd), cast[ptr SockAddr](addr sll),
@@ -150,7 +138,7 @@ proc sendArpProbe*(fd: cint, pkt: ArpPacket, ifindex: cint): bool =
   ## Send an ARP request via sockaddr_ll with broadcast MAC.
   ## Returns true on success.
   var dst: SockaddrLl
-  dst.sll_family = AF_PACKET.uint16
+  dst.sll_family = linux_constants.AF_PACKET.uint16
   dst.sll_protocol = htons(ETH_P_ARP)
   dst.sll_ifindex = ifindex
   dst.sll_halen = 6

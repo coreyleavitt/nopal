@@ -9,15 +9,12 @@
 import std/[posix, os]
 import ../linux_constants
 
-# ICMP type constants
+# Protocol numbers not in Nim's posix module
 const
-  ICMP_ECHO_REQUEST* = 8'u8
-  ICMP_ECHO_REPLY* = 0'u8
-  ICMPV6_ECHO_REQUEST* = 128'u8
-  ICMPV6_ECHO_REPLY* = 129'u8
-
   IPPROTO_ICMP = 1.cint
   IPPROTO_ICMPV6 = 58.cint
+  AF_INET_U8 = uint8(2)
+  AF_INET6_U8 = uint8(10)
 
 func icmpChecksum*(data: openArray[byte]): uint16 =
   ## RFC 1071 ones-complement checksum.
@@ -94,9 +91,8 @@ proc buildIcmpPacket*(buf: var array[1500, byte], typ, code: uint8,
   let payloadLen = max(payloadSize, 8)
   let totalLen = 8 + payloadLen  # 8-byte ICMP header + payload
 
-  # Zero the header area
-  for i in 0 ..< totalLen:
-    buf[i] = 0
+  # Zero the packet buffer
+  zeroMem(addr buf[0], totalLen)
 
   # Fill IcmpEchoHdr fields
   buf[0] = typ         # type

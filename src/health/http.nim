@@ -13,8 +13,7 @@ import ../linux_constants
 const
   HTTP_PORT = 80'u16
   HTTP_REQUEST = "HEAD / HTTP/1.0\r\nHost: health-check\r\nConnection: close\r\n\r\n"
-  HTTP_MSG_NOSIGNAL = 0x4000.cint
-  SOCK_NONBLOCK = 0x800.cint
+  SOCK_NONBLOCK_VAL = 0x800.cint
   SOCK_CLOEXEC_VAL = 0x80000.cint
 
 type
@@ -29,7 +28,7 @@ proc createHttpSocket*(device: string, family: uint8): cint =
   let af = if family == AF_INET.uint8: AF_INET.cint else: AF_INET6.cint
 
   # SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
-  result = cint(socket(af, SOCK_STREAM.cint or SOCK_NONBLOCK or SOCK_CLOEXEC_VAL, 0))
+  result = cint(socket(af, SOCK_STREAM.cint or SOCK_NONBLOCK_VAL or SOCK_CLOEXEC_VAL, 0))
   if result < 0:
     raiseOSError(osLastError())
 
@@ -103,7 +102,7 @@ proc checkHttpConnect*(fd: cint): bool =
 
 proc sendHttpHead*(fd: cint): bool =
   ## Send the HTTP HEAD request. Returns true on success.
-  let ret = send(SocketHandle(fd), cast[pointer](cstring(HTTP_REQUEST)), HTTP_REQUEST.len, HTTP_MSG_NOSIGNAL)
+  let ret = send(SocketHandle(fd), cast[pointer](cstring(HTTP_REQUEST)), HTTP_REQUEST.len, linux_constants.MSG_NOSIGNAL)
   result = ret >= 0
 
 proc recvHttpResponse*(fd: cint, buf: var array[512, byte]): bool =

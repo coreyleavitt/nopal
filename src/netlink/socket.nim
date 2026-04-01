@@ -82,9 +82,6 @@ proc addAttrU32*(b: var NlMsgBuilder, attrType: uint16, val: uint32) =
   copyMem(addr bytes[0], unsafeAddr val, 4)
   b.addAttr(attrType, bytes)
 
-proc addAttrU8*(b: var NlMsgBuilder, attrType: uint16, val: uint8) =
-  b.addAttr(attrType, [val])
-
 proc finish*(b: var NlMsgBuilder): lent seq[byte] =
   ## Patch nlmsg_len and return the complete message buffer.
   let totalLen = uint32(b.buf.len)
@@ -129,7 +126,7 @@ proc attrU32*(data: openArray[byte], s: Slice[int]): uint32 =
 proc attrStr*(data: openArray[byte], s: Slice[int]): string =
   ## Extract a null-terminated string from an attribute payload slice.
   var endPos = s.a
-  while endPos < s.b and data[endPos] != 0:
+  while endPos <= s.b and data[endPos] != 0:
     inc endPos
   let strLen = endPos - s.a
   if strLen > 0:
@@ -191,7 +188,9 @@ proc recvMsg*(s: NetlinkSocket, buf: var seq[byte]): int =
     if errno == EAGAIN or errno == EWOULDBLOCK:
       return 0
     return -1
-  int(n)
+  # Clamp to buffer size: MSG_TRUNC returns the real message size even
+  # when truncated, which would cause OOB reads in nlMsgs callers.
+  min(int(n), buf.len)
 
 proc sendAndAck*(s: NetlinkSocket, data: openArray[byte],
                  buf: var seq[byte], timeoutMs: int = 5000): bool =
