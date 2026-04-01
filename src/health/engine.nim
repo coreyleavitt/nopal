@@ -511,7 +511,8 @@ when isMainModule:
                         latencyThreshold: Option[uint32] = none(uint32),
                         lossThreshold: Option[uint32] = none(uint32),
                         recoveryLatency: Option[uint32] = none(uint32),
-                        recoveryLoss: Option[uint32] = none(uint32)) =
+                        recoveryLoss: Option[uint32] = none(uint32),
+                        qualityWindowSize: int = 6) =
     ## Create an InterfaceProbe with a dummy no-op transport for testing.
     var targets: seq[array[16, byte]] = @[]
     var tStatus: seq[TargetStatus] = @[]
@@ -540,7 +541,7 @@ when isMainModule:
       sendTime: getMonoTime(),
       sendTimeValid: false,
       lastRtt: none(uint32),
-      quality: initQualityWindow(6),
+      quality: initQualityWindow(qualityWindowSize),
       latencyThreshold: latencyThreshold,
       lossThreshold: lossThreshold,
       recoveryLatency: recoveryLatency,
