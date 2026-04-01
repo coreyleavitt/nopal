@@ -4,6 +4,20 @@ nimblecache/
 src/nopal
 src/nopald
 
+# Compiled test/module binaries (Nim compiles to same dir)
+src/config/diff
+src/config/parser
+src/health/arp
+src/health/dampening
+src/health/dns
+src/health/engine
+src/health/http
+src/health/icmp
+src/netlink/socket
+src/state/policy
+src/state/tracker
+src/state/transition
+
 # Test binaries
 tests/t_*
 !tests/t_*.nim
@@ -18,9 +32,3 @@ fuzz/oom-*
 *.swp
 *~
 .DS_Store
-# Nim compiled outputs
-src/health/arp
-src/health/dampening
-src/health/dns
-src/health/http
-src/health/icmp
