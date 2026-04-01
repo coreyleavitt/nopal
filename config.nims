@@ -28,7 +28,7 @@ when defined(aarch64):
   switch("clang.exe", "clang")
   switch("clang.linkerexe", "clang")
   switch("passC", "--target=aarch64-linux-musl --sysroot=/opt/musl/aarch64 " & crossFlags)
-  switch("passL", "--target=aarch64-linux-musl --sysroot=/opt/musl/aarch64 -static -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none")
+  switch("passL", "--target=aarch64-linux-musl --sysroot=/opt/musl/aarch64 -static -fuse-ld=lld -nodefaultlibs -lc")
 
 when defined(armv7hf):
   switch("os", "linux")
@@ -37,7 +37,7 @@ when defined(armv7hf):
   switch("clang.exe", "clang")
   switch("clang.linkerexe", "clang")
   switch("passC", "--target=armv7-linux-musleabihf --sysroot=/opt/musl/armv7hf " & crossFlags)
-  switch("passL", "--target=armv7-linux-musleabihf --sysroot=/opt/musl/armv7hf -static -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none")
+  switch("passL", "--target=armv7-linux-musleabihf --sysroot=/opt/musl/armv7hf -static -fuse-ld=lld -nodefaultlibs -lc")
 
 when defined(mips):
   switch("os", "linux")
@@ -46,7 +46,7 @@ when defined(mips):
   switch("clang.exe", "clang")
   switch("clang.linkerexe", "clang")
   switch("passC", "--target=mips-linux-musl --sysroot=/opt/musl/mips " & crossFlags)
-  switch("passL", "--target=mips-linux-musl --sysroot=/opt/musl/mips -static -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none")
+  switch("passL", "--target=mips-linux-musl --sysroot=/opt/musl/mips -static -fuse-ld=lld -nodefaultlibs -lc")
 
 when defined(mipsel):
   switch("os", "linux")
@@ -55,7 +55,7 @@ when defined(mipsel):
   switch("clang.exe", "clang")
   switch("clang.linkerexe", "clang")
   switch("passC", "--target=mipsel-linux-musl --sysroot=/opt/musl/mipsel " & crossFlags)
-  switch("passL", "--target=mipsel-linux-musl --sysroot=/opt/musl/mipsel -static -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none")
+  switch("passL", "--target=mipsel-linux-musl --sysroot=/opt/musl/mipsel -static -fuse-ld=lld -nodefaultlibs -lc")
 
 # HTTPS feature flag (requires nim-mbedtls)
 # Usage: nim c -d:https src/nopal.nim
