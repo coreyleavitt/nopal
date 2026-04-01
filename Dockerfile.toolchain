@@ -1,0 +1,108 @@
+# nopal cross-compilation toolchain image
+#
+# Builds crosstool-ng musl toolchains for all 4 OpenWrt targets,
+# installs Nim, and provides everything needed to cross-compile nopal.
+#
+# Build:
+#   docker build -f Dockerfile.toolchain -t ghcr.io/coreyleavitt/nopal-toolchain:latest .
+#
+# Push:
+#   echo $(gh auth token) | docker login ghcr.io -u coreyleavitt --password-stdin
+#   docker push ghcr.io/coreyleavitt/nopal-toolchain:latest
+#
+# Use:
+#   docker run --rm -v "$(pwd):/src" -w /src ghcr.io/coreyleavitt/nopal-toolchain:latest \
+#     nim c -d:release -d:aarch64 src/nopal.nim
+
+FROM opensuse/tumbleweed:latest
+
+# Build tools for crosstool-ng + Nim
+RUN zypper --non-interactive install \
+    git \
+    gcc \
+    gcc-c++ \
+    make \
+    curl \
+    tar \
+    xz \
+    gzip \
+    bzip2 \
+    patch \
+    which \
+    gawk \
+    bison \
+    flex \
+    texinfo \
+    help2man \
+    unzip \
+    autoconf \
+    automake \
+    libtool \
+    python3 \
+    wget \
+    file \
+    rsync \
+    mbedtls-devel \
+    && zypper clean --all
+
+# Install crosstool-ng
+ARG CTNG_VERSION=1.26.0
+RUN cd /tmp \
+    && curl -LO "http://crosstool-ng.org/download/crosstool-ng/crosstool-ng-${CTNG_VERSION}.tar.xz" \
+    && tar xf "crosstool-ng-${CTNG_VERSION}.tar.xz" \
+    && cd "crosstool-ng-${CTNG_VERSION}" \
+    && ./configure --prefix=/usr/local \
+    && make -j$(nproc) \
+    && make install \
+    && cd / && rm -rf /tmp/crosstool-ng*
+
+# Build all 4 musl cross-toolchains
+# Each target takes ~15-20 min; total ~60-80 min
+WORKDIR /tmp/ct-ng-build
+
+# aarch64-unknown-linux-musl
+RUN mkdir -p aarch64 && cd aarch64 \
+    && ct-ng aarch64-unknown-linux-musl \
+    && ct-ng build CT_PREFIX=/opt/cross \
+    && cd /tmp/ct-ng-build && rm -rf aarch64
+
+# armv7-unknown-linux-musleabihf
+RUN mkdir -p armv7 && cd armv7 \
+    && ct-ng armv7-unknown-linux-musleabihf \
+    && ct-ng build CT_PREFIX=/opt/cross \
+    && cd /tmp/ct-ng-build && rm -rf armv7
+
+# mips-unknown-linux-musl
+RUN mkdir -p mips && cd mips \
+    && ct-ng mips-unknown-linux-musl \
+    && ct-ng build CT_PREFIX=/opt/cross \
+    && cd /tmp/ct-ng-build && rm -rf mips
+
+# mipsel-unknown-linux-musl
+RUN mkdir -p mipsel && cd mipsel \
+    && ct-ng mipsel-unknown-linux-musl \
+    && ct-ng build CT_PREFIX=/opt/cross \
+    && cd /tmp/ct-ng-build && rm -rf mipsel
+
+# Add all toolchains to PATH
+ENV PATH="/opt/cross/aarch64-unknown-linux-musl/bin:/opt/cross/armv7-unknown-linux-musleabihf/bin:/opt/cross/mips-unknown-linux-musl/bin:/opt/cross/mipsel-unknown-linux-musl/bin:${PATH}"
+
+# Clean up ct-ng build directory
+WORKDIR /
+RUN rm -rf /tmp/ct-ng-build
+
+# Install Nim via choosenim
+RUN curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
+ENV PATH="/root/.nimble/bin:${PATH}"
+
+# Install nim-mbedtls for -d:https builds
+RUN nimble install -y https://github.com/coreyleavitt/nim-mbedtls
+
+# Verify toolchains are accessible
+RUN aarch64-unknown-linux-musl-gcc --version | head -1 \
+    && armv7-unknown-linux-musleabihf-gcc --version | head -1 \
+    && mips-unknown-linux-musl-gcc --version | head -1 \
+    && mipsel-unknown-linux-musl-gcc --version | head -1 \
+    && nim --version | head -1
+
+WORKDIR /src
