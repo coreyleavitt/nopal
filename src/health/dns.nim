@@ -51,7 +51,7 @@ proc encodeDnsQuery*(name: string, buf: var array[512, byte]): int =
     buf[pos] = 0x00
     pos += 1
   else:
-    # Split on '.' and encode each label
+    # Split on '.' and encode each label (with bounds checking)
     var start = 0
     while start <= trimmed.len:
       var dotPos = trimmed.len
@@ -61,6 +61,9 @@ proc encodeDnsQuery*(name: string, buf: var array[512, byte]): int =
           break
       let labelLen = dotPos - start
       let writeLen = min(labelLen, 63)
+      # Bounds check: need 1 (length byte) + writeLen + 1 (null term) + 4 (type+class)
+      if pos + 1 + writeLen + 1 + 4 > buf.len:
+        break  # truncate — name too long for buffer
       buf[pos] = uint8(writeLen)
       pos += 1
       for i in 0 ..< writeLen:
@@ -68,16 +71,16 @@ proc encodeDnsQuery*(name: string, buf: var array[512, byte]): int =
         pos += 1
       start = dotPos + 1
     # Terminating root label
-    buf[pos] = 0x00
-    pos += 1
+    if pos < buf.len:
+      buf[pos] = 0x00
+      pos += 1
 
-  # Type A (0x0001)
-  buf[pos] = 0x00; buf[pos + 1] = 0x01
-  pos += 2
-
-  # Class IN (0x0001)
-  buf[pos] = 0x00; buf[pos + 1] = 0x01
-  pos += 2
+  # Type A (0x0001) + Class IN (0x0001)
+  if pos + 4 <= buf.len:
+    buf[pos] = 0x00; buf[pos + 1] = 0x01
+    pos += 2
+    buf[pos] = 0x00; buf[pos + 1] = 0x01
+    pos += 2
 
   result = pos
 
