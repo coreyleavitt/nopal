@@ -379,3 +379,18 @@ when isMainModule:
       let s = t.probeSuccess(false)
       check s.isSome
       check s.get == isDegraded
+
+    test "quality degraded then probe failure goes offline":
+      var t = makeTracker()
+      discard t.linkUp()
+      for i in 0 ..< 3: discard t.probeSuccess(true)
+      discard t.probeSuccess(false)  # -> degraded via quality
+      check t.state == isDegraded
+
+      # Now actual probe failures accumulate
+      for i in 0 ..< 4:
+        check t.probeFailure().isNone
+      # 5th failure: offline (down_count=5)
+      let s = t.probeFailure()
+      check s.isSome
+      check s.get == isOffline

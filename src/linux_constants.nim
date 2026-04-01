@@ -35,7 +35,7 @@ const NLM_F_MULTI* = cushort(0x02)
 const NLM_F_ACK* = cushort(0x04)
 const NLM_F_ROOT* = cushort(0x100)
 const NLM_F_MATCH* = cushort(0x200)
-const NLM_F_DUMP* = cushort(NLM_F_ROOT or NLM_F_MATCH)
+const NLM_F_DUMP* = cushort(NLM_F_ROOT.int or NLM_F_MATCH.int)
 const NLM_F_CREATE* = cushort(0x400)
 const NLM_F_EXCL* = cushort(0x200)
 

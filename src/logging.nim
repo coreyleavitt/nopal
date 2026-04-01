@@ -20,9 +20,11 @@ type
     ident: string
     fd: cint
 
-proc `=destroy`(h: SyslogHandler) =
+proc close*(h: SyslogHandler) =
+  ## Close the syslog socket. Called explicitly on shutdown.
   if h != nil and h.fd >= 0:
     discard posix.close(h.fd)
+    h.fd = -1
 
 proc levelToSyslog(level: Level): cint =
   case level
