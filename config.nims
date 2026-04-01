@@ -11,15 +11,11 @@ when defined(release):
   switch("passC", "-flto -fdata-sections -ffunction-sections")
   switch("passL", "-flto -s -Wl,--gc-sections")
 
-# Cross-compilation profiles using clang + musl sysroots
+# Cross-compilation profiles using clang + musl sysroots + compiler-rt
 #
 # Clang is a native cross-compiler — one binary targets all architectures.
-# We use -nostdlib to suppress gcc's CRT files and default libraries,
-# then explicitly link musl's CRT objects and libc.
-#
-# clang.options.linker = "" clears Nim's default -ldl
-# -nostdlib suppresses all CRT files (crtbeginT.o, crtend.o) and default libs
-# Then we explicitly provide musl's crt1.o, crti.o, -lc, crtn.o
+# compiler-rt provides builtins (soft-float, etc.) and CRT files,
+# replacing gcc's libgcc and crtbeginT.o/crtend.o.
 #
 # Usage: nim c -d:release -d:aarch64 src/nopal.nim
 
@@ -32,11 +28,7 @@ proc setupCross(target, sysroot: string) =
   switch("clang.options.linker", "")
   switch("passC", "--target=" & target & " --sysroot=" & sysroot & " " & crossCFlags)
   switch("passL", "--target=" & target & " --sysroot=" & sysroot &
-    " -static -fuse-ld=lld -nostdlib" &
-    " " & sysroot & "/lib/crt1.o" &
-    " " & sysroot & "/lib/crti.o" &
-    " -lc" &
-    " " & sysroot & "/lib/crtn.o")
+    " -static -fuse-ld=lld -rtlib=compiler-rt")
 
 when defined(aarch64):
   switch("os", "linux")
