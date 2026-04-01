@@ -34,24 +34,71 @@ jobs:
   compile:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/coreyleavitt/nopal-toolchain:latest
+      image: opensuse/tumbleweed
     strategy:
       fail-fast: false
       matrix:
         include:
           - openwrt_arch: aarch64_cortex-a53
             nim_target: aarch64
+            musl_arch: aarch64
+            musl_triple: aarch64-linux-musl
           - openwrt_arch: arm_cortex-a7
             nim_target: armv7hf
+            musl_arch: arm
+            musl_triple: arm-linux-musleabihf
+            musl_configure_extra: "--with-arch=armv7-a --with-fpu=vfpv3-d16 --with-float=hard"
           - openwrt_arch: mips_24kc
             nim_target: mips
+            musl_arch: mips
+            musl_triple: mips-linux-musl
           - openwrt_arch: mipsel_24kc
             nim_target: mipsel
+            musl_arch: mipsel
+            musl_triple: mipsel-linux-musl
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build
-        run: nim c -d:release -d:https -d:${{ matrix.nim_target }} src/nopal.nim
+      - name: Install build tools
+        run: |
+          zypper --non-interactive install \
+            clang lld make curl tar xz gzip bzip2 which mbedtls-devel
+          curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y --version 2.2.8
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+
+      - name: Install nim-mbedtls
+        run: |
+          export PATH="$HOME/.nimble/bin:$PATH"
+          nimble install -y https://github.com/coreyleavitt/nim-mbedtls
+
+      - name: Build musl sysroot
+        env:
+          MUSL_VERSION: "1.2.5"
+        run: |
+          export PATH="$HOME/.nimble/bin:$PATH"
+          mkdir -p /tmp/musl-build && cd /tmp/musl-build
+          curl -LO "https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz"
+          tar xf "musl-${MUSL_VERSION}.tar.gz"
+          cd "musl-${MUSL_VERSION}"
+
+          # Cross-compile musl using clang targeting the arch
+          CROSS_COMPILE="clang --target=${{ matrix.musl_triple }} " \
+          CC="clang --target=${{ matrix.musl_triple }}" \
+          ./configure \
+            --prefix=/opt/musl/${{ matrix.nim_target }} \
+            --target=${{ matrix.musl_triple }} \
+            ${{ matrix.musl_configure_extra || '' }}
+          make -j$(nproc)
+          make install
+
+          # Verify sysroot
+          ls -la /opt/musl/${{ matrix.nim_target }}/lib/libc.a
+          ls -la /opt/musl/${{ matrix.nim_target }}/include/stdio.h
+
+      - name: Cross-compile nopal
+        run: |
+          export PATH="$HOME/.nimble/bin:$PATH"
+          nim c -d:release -d:${{ matrix.nim_target }} src/nopal.nim
 
       - name: Prepare binary
         run: |
