@@ -32,3 +32,12 @@ fuzz/oom-*
 *.swp
 *~
 .DS_Store
+src/daemon
+src/dnsmanager
+src/ipc/methods
+src/ipc/protocol
+src/ipc/server
+src/nftables/chains
+src/nftables/engine
+src/nftables/marks
+src/nftables/ruleset
