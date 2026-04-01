@@ -8,6 +8,7 @@ import std/[posix, os, strutils, json, endians, net, nativesockets]
 import daemon
 import ipc/protocol
 import logging
+import std/[osproc, strtabs, algorithm]
 
 const
   Version = "0.1.0"
@@ -369,11 +370,97 @@ proc cliReload(socketPath: string) =
 
 proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
   ## Run a command with traffic routed through a specific interface.
-  ## TODO: Implement uidrange ip rules for per-process routing.
-  ## This requires adding ip rule add uidrange <uid>-<uid> lookup <table> prio 1
-  ## then cleaning up after the child process exits.
-  stderr.writeLine "error: 'use' command not yet implemented"
-  quit(1)
+  ## Adds uidrange ip rules, runs the command, cleans up rules on exit.
+
+  # Query daemon for interface table_id and device
+  let req = IpcRequest(id: 1, rpcMethod: "interface.status",
+                       params: %*{"interface": iface})
+  let resp = sendIpcRequest(socketPath, req)
+  if not resp.success:
+    stderr.writeLine "error: " & resp.error
+    quit(1)
+  let tableId = resp.data{"table_id"}.getInt()
+  let device = resp.data{"device"}.getStr()
+  if tableId == 0:
+    stderr.writeLine "error: interface '" & iface & "' has no routing table"
+    quit(1)
+
+  # Get UID for uidrange rule
+  let uid = getuid()
+  let uidRange = $uid & "-" & $uid
+  let tableStr = $tableId
+
+  # Add IPv4 uidrange ip rule (required)
+  var v4Added, v6Added = false
+  let v4ret = execCmd("ip -4 rule add uidrange " & uidRange &
+                      " lookup " & tableStr & " prio 1")
+  if v4ret != 0:
+    stderr.writeLine "error: failed to add IPv4 routing rule"
+    quit(1)
+  v4Added = true
+
+  # Try IPv6 rule (tolerate failure — IPv6 may be disabled)
+  let v6ret = execCmd("ip -6 rule add uidrange " & uidRange &
+                      " lookup " & tableStr & " prio 1")
+  v6Added = v6ret == 0
+
+  # Run user command with DEVICE and INTERFACE env vars
+  var exitCode = 1
+  try:
+    let env = newStringTable({"DEVICE": device, "INTERFACE": iface})
+    let p = startProcess(cmdArgs[0], args = cmdArgs[1..^1],
+                         env = env, options = {poParentStreams, poUsePath})
+    exitCode = p.waitForExit()
+    p.close()
+  except OSError:
+    stderr.writeLine "error: " & getCurrentExceptionMsg()
+
+  # Cleanup rules (always, even on error)
+  if v4Added:
+    discard execCmd("ip -4 rule del uidrange " & uidRange &
+                    " lookup " & tableStr & " prio 1")
+  if v6Added:
+    discard execCmd("ip -6 rule del uidrange " & uidRange &
+                    " lookup " & tableStr & " prio 1")
+
+  quit(exitCode)
+
+proc cliInternal() =
+  ## Dump diagnostic information: ip rules, routing tables, nftables.
+  echo "=== IPv4 IP Rules ==="
+  discard execCmd("ip -4 rule show")
+  echo ""
+  echo "=== IPv6 IP Rules ==="
+  discard execCmd("ip -6 rule show")
+  echo ""
+
+  # Find nopal routing tables (101-354) from rules output
+  echo "=== Nopal Routing Tables ==="
+  let rulesOutput = execProcess("ip -4 rule show")
+  var tables: seq[int]
+  for line in rulesOutput.splitLines():
+    let idx = line.find("lookup ")
+    if idx >= 0:
+      try:
+        var numStr = ""
+        for i in (idx + 7) ..< min(idx + 11, line.len):
+          if line[i] in {'0'..'9'}: numStr.add(line[i])
+          else: break
+        if numStr.len > 0:
+          let tableId = parseInt(numStr)
+          if tableId >= 101 and tableId <= 354 and tableId notin tables:
+            tables.add(tableId)
+      except ValueError: discard
+  tables.sort()
+  for t in tables:
+    echo "--- table " & $t & " (IPv4) ---"
+    discard execCmd("ip -4 route show table " & $t)
+    echo "--- table " & $t & " (IPv6) ---"
+    discard execCmd("ip -6 route show table " & $t)
+    echo ""
+
+  echo "=== nftables Ruleset ==="
+  discard execCmd("nft list table inet nopal")
 
 proc cliRules() =
   ## Dump the nopal nftables ruleset.
@@ -455,6 +542,8 @@ proc runCli(args: seq[string]) =
       cliUse(socketPath, positional[1], positional[2..^1])
     of "rules":
       cliRules()
+    of "internal":
+      cliInternal()
     of "reload":
       cliReload(socketPath)
     of "help":
