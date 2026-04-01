@@ -27,8 +27,8 @@ type
     rfAny, rfIpv4, rfIpv6
 
   InitialState* = enum
-    isOffline,  ## Wait for probes to confirm interface is online (default, safe)
-    isOnline    ## Assume interface is online at startup
+    initOffline,  ## Wait for probes to confirm interface is online (default, safe)
+    initOnline    ## Assume interface is online at startup
 
   GlobalsConfig* = object
     enabled*: bool
@@ -84,7 +84,7 @@ type
 
   MemberConfig* = object
     name*: string
-    `interface`*: string
+    interfaceName*: string
     metric*: uint32
     weight*: uint32
 
@@ -148,7 +148,7 @@ proc defaultInterface*(): InterfaceConfig =
     probeSize: 56,
     upCount: 3,
     downCount: 3,
-    initialState: isOffline,
+    initialState: initOffline,
     checkQuality: true,
     latencyThreshold: 0,
     lossThreshold: 0,

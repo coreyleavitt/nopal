@@ -38,6 +38,6 @@ proc newTracker*(name: string, index: int, mark: uint32, tableId: uint32,
     downCount: downCount,
   )
 
-proc isActive*(t: InterfaceTracker): bool =
+func isActive*(t: InterfaceTracker): bool =
   ## Returns true if enabled and (Online or Degraded).
   t.enabled and (t.state == isOnline or t.state == isDegraded)

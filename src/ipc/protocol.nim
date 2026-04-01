@@ -5,7 +5,7 @@ import std/json
 type
   IpcRequest* = object
     id*: uint64
-    `method`*: string
+    rpcMethod*: string
     params*: JsonNode
 
   IpcResponse* = object

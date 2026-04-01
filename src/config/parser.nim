@@ -2,7 +2,7 @@
 ##
 ## Parses OpenWrt UCI config files and produces a validated NopalConfig.
 
-import schema
+import ./schema
 import ../errors
 import std/[tables, sets, strutils, parseutils, net, logging]
 
@@ -12,19 +12,19 @@ type
     name*: string  ## empty if unnamed
     options*: Table[string, seq[string]]
 
-proc get*(s: UciSection, key: string): string =
+func get*(s: UciSection, key: string): string =
   ## Return first value for key, or "" if missing.
   if key in s.options and s.options[key].len > 0:
     return s.options[key][0]
   return ""
 
-proc getAll*(s: UciSection, key: string): seq[string] =
+func getAll*(s: UciSection, key: string): seq[string] =
   ## Return all values for key, or empty seq if missing.
   if key in s.options:
     return s.options[key]
   return @[]
 
-proc getU32*(s: UciSection, key: string, default: uint32): uint32 =
+func getU32*(s: UciSection, key: string, default: uint32): uint32 =
   ## Parse a uint32 from the first value of key, or return default.
   let v = s.get(key)
   if v == "":
@@ -35,7 +35,7 @@ proc getU32*(s: UciSection, key: string, default: uint32): uint32 =
   except ValueError:
     return default
 
-proc getBool*(s: UciSection, key: string, default: bool): bool =
+func getBool*(s: UciSection, key: string, default: bool): bool =
   ## Parse a boolean value. Recognizes 1/yes/true/on and 0/no/false/off.
   let v = s.get(key).toLowerAscii()
   if v == "":
@@ -48,7 +48,7 @@ proc getBool*(s: UciSection, key: string, default: bool): bool =
   else:
     return default
 
-proc stripQuotes*(s: string): string =
+func stripQuotes*(s: string): string =
   ## Strip matching single or double quotes from start and end.
   if s.len >= 2:
     if (s[0] == '"' and s[^1] == '"') or (s[0] == '\'' and s[^1] == '\''):
@@ -71,7 +71,7 @@ proc parseUci*(text: string): seq[UciSection] =
   ## Tokenize UCI text into sections. Handle config/option/list directives.
   ## Skip blanks and comments. Raise on option outside section.
   result = @[]
-  var current: ptr UciSection = nil
+  var currentIdx = -1
   var lineNum = 0
 
   for rawLine in text.splitLines():
@@ -100,34 +100,33 @@ proc parseUci*(text: string): seq[UciSection] =
       if parts.len >= 3:
         sec.name = stripQuotes(parts[2])
       result.add(sec)
-      current = addr result[result.len - 1]
+      currentIdx = result.len - 1
 
     of "option":
-      if current == nil:
+      if currentIdx < 0:
         raise newException(ConfigError, "line " & $lineNum & ": option outside of section")
       if parts.len < 3:
         raise newException(ConfigError, "line " & $lineNum & ": option directive requires key and value")
       let key = stripQuotes(parts[1])
-      # Value is everything after the key, joined and stripped of quotes
       let value = stripQuotes(parts[2 ..< parts.len].join(" "))
-      current[].options[key] = @[value]
+      result[currentIdx].options[key] = @[value]
 
     of "list":
-      if current == nil:
+      if currentIdx < 0:
         raise newException(ConfigError, "line " & $lineNum & ": list outside of section")
       if parts.len < 3:
         raise newException(ConfigError, "line " & $lineNum & ": list directive requires key and value")
       let key = stripQuotes(parts[1])
       let value = stripQuotes(parts[2 ..< parts.len].join(" "))
-      if key in current[].options:
-        current[].options[key].add(value)
+      if key in result[currentIdx].options:
+        result[currentIdx].options[key].add(value)
       else:
-        current[].options[key] = @[value]
+        result[currentIdx].options[key] = @[value]
 
     else:
       raise newException(ConfigError, "line " & $lineNum & ": unknown directive '" & directive & "'")
 
-proc isContiguousBits(mask: uint32): bool =
+func isContiguousBits(mask: uint32): bool =
   ## Check that a bitmask has contiguous set bits (no gaps).
   if mask == 0:
     return false
@@ -308,9 +307,9 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   if initStr != "":
     case initStr.toLowerAscii()
     of "offline":
-      result.initialState = isOffline
+      result.initialState = initOffline
     of "online":
-      result.initialState = isOnline
+      result.initialState = initOnline
     else:
       warn "interface '" & sec.name & "': unknown initial_state '" & initStr & "', using offline"
 
@@ -364,7 +363,7 @@ proc parseMember*(sec: UciSection): MemberConfig =
 
   result = MemberConfig(
     name: sec.name,
-    `interface`: ifaceName,
+    interfaceName: ifaceName,
     metric: sec.getU32("metric", 0),
     weight: sec.getU32("weight", 1),
   )
@@ -573,8 +572,8 @@ proc validate*(config: var NopalConfig) =
 
   # Members must reference existing interfaces
   for member in config.members:
-    if member.`interface` notin ifaceNames:
-      raise newException(ConfigError, "member '" & member.name & "' references non-existent interface '" & member.`interface` & "'")
+    if member.interfaceName notin ifaceNames:
+      raise newException(ConfigError, "member '" & member.name & "' references non-existent interface '" & member.interfaceName & "'")
 
   # Policies must reference existing members
   for policy in config.policies:
@@ -704,7 +703,7 @@ config rule default_rule
       check cfg.interfaces[1].weight == 2'u32
       check cfg.members.len == 2
       check cfg.members[0].name == "wan1_m1"
-      check cfg.members[0].`interface` == "wan1"
+      check cfg.members[0].interfaceName == "wan1"
       check cfg.members[1].name == "wan2_m1"
       check cfg.policies.len == 1
       check cfg.policies[0].name == "balanced"

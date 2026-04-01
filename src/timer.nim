@@ -12,7 +12,7 @@ type
     kind*: TimerKind
     index*: int
 
-proc `<`*(a, b: TimerEntry): bool =
+func `<`*(a, b: TimerEntry): bool =
   a.deadline < b.deadline
 
 type

@@ -2,7 +2,7 @@
 
 import std/osproc
 import std/json
-import ruleset
+import ./ruleset
 
 proc applyRuleset*(rs: Ruleset): bool =
   discard # not yet implemented
