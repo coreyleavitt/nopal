@@ -8,7 +8,7 @@ import std/os
 proc runDaemon(configPath: string) =
   quit("daemon not yet implemented")
 
-proc runCli(args: seq[string]) =
+proc runCli(args: openArray[string]) =
   quit("cli not yet implemented")
 
 when isMainModule:

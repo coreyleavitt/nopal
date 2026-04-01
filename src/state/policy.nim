@@ -5,12 +5,12 @@
 ## the first one with at least one online member.
 
 import std/algorithm
-import tracker
+import ./tracker
 import ../config/schema
 
 type
   ActiveMember* = object
-    `interface`*: string
+    interfaceName*: string
     mark*: uint32
     weight*: uint32
 
@@ -23,8 +23,8 @@ type
     tiers*: seq[Tier]
     lastResort*: LastResort
 
-proc resolvePolicy*(policy: PolicyConfig, members: seq[MemberConfig],
-                    trackers: seq[InterfaceTracker]): ResolvedPolicy =
+proc resolvePolicy*(policy: PolicyConfig, members: openArray[MemberConfig],
+                    trackers: openArray[InterfaceTracker]): ResolvedPolicy =
   ## Resolve a policy config against current interface states.
   var active: seq[tuple[metric: uint32, member: ActiveMember]]
 
@@ -43,12 +43,12 @@ proc resolvePolicy*(policy: PolicyConfig, members: seq[MemberConfig],
     # Find the tracker
     var foundTracker = false
     for t in trackers:
-      if t.name == memberCfg.`interface`:
+      if t.name == memberCfg.interfaceName:
         foundTracker = true
         if not t.isActive:
           break
         var am = ActiveMember(mark: t.mark, weight: memberCfg.weight)
-        am.`interface` = memberCfg.`interface`
+        am.interfaceName = memberCfg.interfaceName
         active.add((memberCfg.metric, am))
         break
 
@@ -69,18 +69,18 @@ proc resolvePolicy*(policy: PolicyConfig, members: seq[MemberConfig],
     lastResort: policy.lastResort,
   )
 
-proc activeTier*(rp: ResolvedPolicy): ptr Tier =
-  ## Get the active tier (first tier with members, i.e. lowest metric).
-  ## Returns nil if no tiers.
-  if rp.tiers.len > 0:
-    result = unsafeAddr rp.tiers[0]
-  else:
-    result = nil
+func hasActiveTier*(rp: ResolvedPolicy): bool =
+  rp.tiers.len > 0
 
-proc isEmpty*(rp: ResolvedPolicy): bool =
+func activeTier*(rp: ResolvedPolicy): lent Tier =
+  ## Get the active tier (first tier with members, i.e. lowest metric).
+  ## Caller must check hasActiveTier() first.
+  rp.tiers[0]
+
+func isEmpty*(rp: ResolvedPolicy): bool =
   rp.tiers.len == 0
 
-proc activeTotalWeight*(rp: ResolvedPolicy): uint32 =
+func activeTotalWeight*(rp: ResolvedPolicy): uint32 =
   ## Total weight across the active tier (for nftables numgen).
   if rp.tiers.len > 0:
     for m in rp.tiers[0].members:
@@ -91,7 +91,7 @@ when isMainModule:
 
   proc makeMember(name, iface: string, metric, weight: uint32): MemberConfig =
     result = MemberConfig(name: name, metric: metric, weight: weight)
-    result.`interface` = iface
+    result.interfaceName = iface
 
   proc makeTracker(name: string, index: int, mark: uint32, online: bool): InterfaceTracker =
     var t = newTracker(name, index, mark, 100 + index.uint32,
@@ -138,10 +138,10 @@ when isMainModule:
 
       let resolved = resolvePolicy(policy, members, trackers)
       check resolved.tiers.len == 1
+      check resolved.hasActiveTier
       let tier = resolved.activeTier
-      check tier != nil
       check tier.metric == 2
-      check tier.members[0].`interface` == "wanb"
+      check tier.members[0].interfaceName == "wanb"
 
     test "all down":
       let policy = PolicyConfig(

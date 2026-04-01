@@ -4,7 +4,7 @@
 ## so the daemon can apply targeted updates instead of a full
 ## teardown/rebuild on every reload.
 
-import schema
+import ./schema
 
 type
   ConfigDiff* = object
@@ -16,14 +16,14 @@ type
     routingChanged*: bool
     interfaceOrderChanged*: bool
 
-proc needsFullRebuild*(d: ConfigDiff): bool =
+func needsFullRebuild*(d: ConfigDiff): bool =
   ## Whether a full rebuild is required (globals, interface set changes).
   d.globalsChanged or
     d.addedInterfaces.len > 0 or
     d.removedInterfaces.len > 0 or
     d.interfaceOrderChanged
 
-proc needsNftables*(d: ConfigDiff): bool =
+func needsNftables*(d: ConfigDiff): bool =
   ## Whether nftables regeneration is needed.
   d.routingChanged or d.changedInterfaces.len > 0
 

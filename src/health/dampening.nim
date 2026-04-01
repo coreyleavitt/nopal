@@ -69,10 +69,10 @@ proc applyFailure*(ds: var DampeningState): bool =
 
   ds.suppressed
 
-proc isSuppressed*(ds: DampeningState): bool =
+func isSuppressed*(ds: DampeningState): bool =
   ds.suppressed
 
-proc shouldReuse*(ds: DampeningState): bool =
+func shouldReuse*(ds: DampeningState): bool =
   ds.penalty < ds.reuse.float64
 
 proc reset*(ds: var DampeningState) =

@@ -6,7 +6,6 @@
 import std/logging
 import std/strutils
 import std/posix
-import std/times
 
 const
   LOG_DAEMON = 3 shl 3  # facility
@@ -20,6 +19,10 @@ type
   SyslogHandler* = ref object of Logger
     ident: string
     fd: cint
+
+proc `=destroy`(h: SyslogHandler) =
+  if h != nil and h.fd >= 0:
+    discard posix.close(h.fd)
 
 proc levelToSyslog(level: Level): cint =
   case level
