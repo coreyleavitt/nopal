@@ -24,7 +24,7 @@ func getAll*(s: UciSection, key: string): seq[string] =
     return s.options[key]
   return @[]
 
-func getU32*(s: UciSection, key: string, default: uint32): uint32 =
+proc getU32*(s: UciSection, key: string, default: uint32): uint32 =
   ## Parse a uint32 from the first value of key, or return default.
   let v = s.get(key)
   if v == "":
@@ -80,71 +80,49 @@ func isValidIpv6(s: string): bool =
     return false
 
   # Check for mixed notation (IPv6 with embedded IPv4 at the end)
-  # e.g. ::ffff:192.168.1.1
-  let lastColon = s.rfind(':')
-  if lastColon >= 0 and lastColon + 1 < s.len:
-    let tail = s[lastColon + 1 ..< s.len]
-    if '.' in tail:
-      # Mixed notation: validate the IPv4 part and treat the rest as IPv6
-      if not isValidIpv4(tail):
-        return false
-      # The prefix before the IPv4 must be a valid IPv6 prefix
-      # that ends with ':' and would have 2 groups replaced by the IPv4
-      let prefix = s[0 ..< lastColon]
-      # prefix should look like valid IPv6 groups possibly with ::
-      # The IPv4 part replaces the last 2 groups of 8
-      let dcCount = prefix.count("::")
-      if dcCount > 1:
-        return false
-      # Split on :: first
-      if dcCount == 1:
-        let dcParts = prefix.split("::")
-        var groupCount = 0
-        for p in dcParts:
-          if p.len > 0:
-            for g in p.split(':'):
-              if g.len == 0 or g.len > 4:
-                return false
-              for c in g:
-                if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
-                  return false
-              inc groupCount
-        # With mixed notation, IPv4 replaces 2 groups, so max 6 groups total
-        if groupCount > 6:
-          return false
-      else:
-        # No ::, just colon-separated groups ending with :
-        if prefix.len == 0:
-          return false
-        # prefix should not end with ':'? Actually it can be like "64:ff9b:"
-        # Wait - the prefix is everything before the last ':', so it includes
-        # trailing colon only if there were consecutive colons.
-        # Let me re-check: s = "64:ff9b::192.168.1.1", lastColon=8, prefix="64:ff9b:"
-        # Actually no, let me re-derive. For "::ffff:1.2.3.4":
-        #   lastColon = 6 (the colon before "1.2.3.4")
-        #   prefix = "::ffff"
-        # For "64:ff9b::1.2.3.4":
-        #   lastColon = 8
-        #   prefix = "64:ff9b:"  -- this has :: at the end... no wait
-        #   "64:ff9b::1.2.3.4" - positions: 6,7 are '::', lastColon = 8? No.
-        #   Let me just count: 6->':',7->':',8->'1'... lastColon = 7
-        #   prefix = "64:ff9b:" -- trailing colon from the ::
-        # Actually this is getting complicated. Let me handle the prefix
-        # by stripping trailing colon if any, since it came from the :: split.
-        let trimmed = if prefix.endsWith(":"): prefix[0 ..< prefix.len - 1] else: prefix
-        if trimmed.len == 0:
-          return false
-        let groups = trimmed.split(':')
-        for g in groups:
-          if g.len == 0 or g.len > 4:
-            return false
-          for c in g:
-            if c notin {'0'..'9', 'a'..'f', 'A'..'F'}:
-              return false
-        # IPv4 part = 2 groups, so need exactly 6 explicit groups
-        if groups.len != 6:
-          return false
-      return true
+  # e.g. ::ffff:192.168.1.1 or 64:ff9b::192.168.1.1
+  if '.' in s:
+    # Find the start of the IPv4 part by scanning backwards for a colon
+    # that is followed by a digit (not another colon)
+    var splitPos = -1
+    for i in countdown(s.len - 1, 0):
+      if s[i] == ':':
+        splitPos = i
+        break
+    if splitPos < 0:
+      return false
+    let ipv4Part = s[splitPos + 1 ..< s.len]
+    if not isValidIpv4(ipv4Part):
+      return false
+    # The prefix is the IPv6 portion including trailing colon
+    # Strip the trailing colon to get just the hex groups
+    let prefix = s[0 ..< splitPos]
+    # Validate the prefix as IPv6 groups (with :: allowed)
+    # IPv4 replaces the last 2 of 8 groups, so prefix can have at most 6
+    let dcCount = prefix.count("::")
+    if dcCount > 1:
+      return false
+    if dcCount == 1:
+      let dcParts = prefix.split("::")
+      var groupCount = 0
+      for p in dcParts:
+        if p.len > 0:
+          for g in p.split(':'):
+            if g.len == 0 or g.len > 4: return false
+            for c in g:
+              if c notin {'0'..'9', 'a'..'f', 'A'..'F'}: return false
+            inc groupCount
+      if groupCount > 6: return false
+    else:
+      # No :: — must have exactly 6 explicit groups
+      if prefix.len == 0: return false
+      let groups = prefix.split(':')
+      for g in groups:
+        if g.len == 0 or g.len > 4: return false
+        for c in g:
+          if c notin {'0'..'9', 'a'..'f', 'A'..'F'}: return false
+      if groups.len != 6: return false
+    return true
 
   # Pure IPv6 validation
   let dcCount = s.count("::")
