@@ -19,14 +19,15 @@ endef
 
 define Package/nopal/description
   Multi-WAN policy routing and failover manager for OpenWrt.
-  Replaces mwan3 with a single Rust daemon using native nftables.
+  Single statically-linked Nim binary with zero runtime dependencies.
+  Native nftables JSON API, netlink sockets, health probes.
 endef
 
 define Package/nopal/conffiles
 /etc/config/nopal
 endef
 
-# Cross-compilation is handled externally via cargo.
+# Cross-compilation is handled externally (Nim + crosstool-ng).
 # The pre-built binary is expected at $(PKG_BUILD_DIR)/nopald
 define Build/Compile
 	@echo "Using pre-built binary"
@@ -35,6 +36,7 @@ endef
 define Package/nopal/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/nopald $(1)/usr/sbin/nopald
+	ln -sf nopald $(1)/usr/sbin/nopal
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/nopal.init $(1)/etc/init.d/nopal
