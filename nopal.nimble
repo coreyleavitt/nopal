@@ -8,3 +8,6 @@ bin           = @["nopal"]
 
 # Dependencies
 requires "nim >= 2.0.0"
+
+# Optional: HTTPS probe support (compile with -d:https)
+# requires "mbedtls >= 1.0.0"
