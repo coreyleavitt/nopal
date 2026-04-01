@@ -81,8 +81,8 @@ proc dispatch*(req: IpcRequest, view: DaemonView): (IpcResponse, DispatchAction)
       req.params["interface"].getStr()
     else:
       ""
-    if ifaceName == "":
-      return (errorResponse(req.id, "missing 'interface' parameter"), daNone)
+    if ifaceName == "" or ifaceName.len > 64:
+      return (errorResponse(req.id, "missing or invalid 'interface' parameter"), daNone)
 
     for t in view.trackers[]:
       if t.name == ifaceName:

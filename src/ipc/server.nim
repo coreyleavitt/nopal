@@ -97,9 +97,12 @@ proc acceptClient*(s: var IpcServer, selector: Selector[int]): int =
 
   id
 
-proc readClient*(s: var IpcServer, clientId: int): seq[IpcRequest] =
+proc removeClient*(s: var IpcServer, clientId: int, selector: Selector[int])
+  ## Forward declaration — defined below.
+
+proc readClient*(s: var IpcServer, clientId: int, selector: Selector[int]): seq[IpcRequest] =
   ## Read and parse complete frames from a client. Returns parsed requests.
-  ## Handles disconnect (removes client internally).
+  ## On disconnect, removes client via removeClient (proper selector cleanup).
   result = @[]
   if clientId notin s.clients:
     return
@@ -107,16 +110,19 @@ proc readClient*(s: var IpcServer, clientId: int): seq[IpcRequest] =
   var buf: array[4096, byte]
   let client = addr s.clients[clientId]
 
-  # Non-blocking read loop
+  # Non-blocking read loop with per-client buffer budget
   while true:
     let n = posix.recv(SocketHandle(client.fd), cast[pointer](addr buf[0]), buf.len, 0)
     if n <= 0:
       if n == 0 or (n < 0 and errno != EAGAIN and errno != EWOULDBLOCK):
-        # Disconnect
-        discard posix.close(client.fd)
-        s.clients.del(clientId)
+        s.removeClient(clientId, selector)
         return
       break  # EAGAIN
+    # Budget check: cap readBuf to MaxMsgSize + 4 (one max frame)
+    if client.readBuf.len + n > int(MaxMsgSize) + 4:
+      warn "IPC client " & $clientId & " readbuf overflow, disconnecting"
+      s.removeClient(clientId, selector)
+      return
     for i in 0 ..< n:
       client.readBuf.add(buf[i])
 
@@ -126,8 +132,7 @@ proc readClient*(s: var IpcServer, clientId: int): seq[IpcRequest] =
     bigEndian32(addr frameLen, addr client.readBuf[0])
     if frameLen > MaxMsgSize:
       warn "IPC client " & $clientId & " sent oversized message, disconnecting"
-      discard posix.close(client.fd)
-      s.clients.del(clientId)
+      s.removeClient(clientId, selector)
       return
 
     let totalLen = 4 + int(frameLen)
@@ -136,7 +141,7 @@ proc readClient*(s: var IpcServer, clientId: int): seq[IpcRequest] =
 
     # Parse JSON payload
     try:
-      let jsonStr = newString(int(frameLen))
+      var jsonStr = newString(int(frameLen))
       if frameLen > 0:
         copyMem(addr jsonStr[0], addr client.readBuf[4], int(frameLen))
       let j = parseJson(jsonStr)
@@ -150,7 +155,8 @@ proc readClient*(s: var IpcServer, clientId: int): seq[IpcRequest] =
     # Remove consumed bytes
     client.readBuf = client.readBuf[totalLen .. ^1]
 
-proc sendResponse*(s: var IpcServer, clientId: int, resp: IpcResponse) =
+proc sendResponse*(s: var IpcServer, clientId: int, resp: IpcResponse,
+                   selector: Selector[int]) =
   ## Send a framed response to a client.
   if clientId notin s.clients:
     return
@@ -169,20 +175,24 @@ proc sendResponse*(s: var IpcServer, clientId: int, resp: IpcResponse) =
     frame.add(byte(c))
 
   let client = addr s.clients[clientId]
-  let n = posix.send(SocketHandle(client.fd), cast[pointer](addr frame[0]),
-                     frame.len, 0x4000)  # MSG_NOSIGNAL
-  if n < 0:
-    discard posix.close(client.fd)
-    s.clients.del(clientId)
+  var sent = 0
+  while sent < frame.len:
+    let n = posix.send(SocketHandle(client.fd),
+                       cast[pointer](addr frame[sent]),
+                       frame.len - sent, 0x4000)  # MSG_NOSIGNAL
+    if n <= 0:
+      s.removeClient(clientId, selector)
+      return
+    sent += n
 
-proc broadcastEvent*(s: var IpcServer, event: IpcResponse) =
+proc broadcastEvent*(s: var IpcServer, event: IpcResponse, selector: Selector[int]) =
   ## Send event to all subscribed clients.
   var ids: seq[int]
   for id, client in s.clients:
     if client.subscribed:
       ids.add(id)
   for id in ids:
-    s.sendResponse(id, event)
+    s.sendResponse(id, event, selector)
 
 proc removeClient*(s: var IpcServer, clientId: int, selector: Selector[int]) =
   ## Deregister and close a client connection.
