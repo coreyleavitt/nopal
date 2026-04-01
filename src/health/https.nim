@@ -107,7 +107,7 @@ when defined(https):
         raiseOSError(osLastError())
 
   proc isConnected(fd: cint): bool =
-    var pfd: Pollfd
+    var pfd: TPollfd
     pfd.fd = fd
     pfd.events = linux_constants.POLLOUT
     pfd.revents = 0
@@ -187,7 +187,7 @@ when defined(https):
       return false
 
     mbedtls_ssl_conf_authmode(conn.sslConf, MBEDTLS_SSL_VERIFY_REQUIRED)
-    mbedtls_ssl_conf_ca_chain(conn.sslConf, cast[pointer](conn.cacert), nil)
+    mbedtls_ssl_conf_ca_chain(conn.sslConf, conn.cacert, nil)
     mbedtls_ssl_conf_rng(conn.sslConf, cast[pointer](mbedtls_ctr_drbg_random),
                           cast[pointer](conn.ctrDrbgCtx))
 
