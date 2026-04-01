@@ -31,6 +31,10 @@ proc assignMarks*(names: openArray[string], markMask: uint32): seq[tuple[mark: u
   if maxSlots < 1:
     return
 
+  # More interfaces than slots would produce duplicate marks
+  assert names.len <= maxSlots, "too many interfaces (" & $names.len &
+    ") for mark_mask (max " & $maxSlots & " slots)"
+
   var usedSlots = newSeq[bool](maxSlots + 1)  # index 0 unused, 1..maxSlots
 
   for i in 0 ..< names.len:
