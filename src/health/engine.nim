@@ -24,25 +24,32 @@ type
 
 type
   QualityWindow* = object
-    buf: array[6, Option[uint32]]  ## None = loss, Some(rtt_ms) = success
-    pos: int                       ## next write position
-    count: int                     ## number of entries (max 6)
+    buf: seq[Option[uint32]]  ## None = loss, Some(rtt_ms) = success
+    pos: int                  ## next write position
+    count: int                ## number of valid entries
+    capacity*: int            ## max window size (0 = quality monitoring disabled)
 
-proc initQualityWindow*(): QualityWindow =
-  result = QualityWindow(pos: 0, count: 0)
-  for i in 0 ..< 6:
-    result.buf[i] = none(uint32)
+proc initQualityWindow*(capacity: int = 10): QualityWindow =
+  ## Create a quality window. Capacity 0 disables quality monitoring.
+  let cap = max(capacity, 0)
+  result = QualityWindow(pos: 0, count: 0, capacity: cap)
+  if cap > 0:
+    result.buf = newSeq[Option[uint32]](cap)
 
 proc push*(w: var QualityWindow, val: Option[uint32]) =
+  if w.capacity <= 0: return
   w.buf[w.pos] = val
-  w.pos = (w.pos + 1) mod 6
-  if w.count < 6:
+  w.pos = (w.pos + 1) mod w.capacity
+  if w.count < w.capacity:
     inc w.count
 
 proc len*(w: QualityWindow): int = w.count
 
+proc isFull*(w: QualityWindow): bool =
+  w.capacity > 0 and w.count >= w.capacity
+
 proc clear*(w: var QualityWindow) =
-  for i in 0 ..< 6:
+  for i in 0 ..< w.buf.len:
     w.buf[i] = none(uint32)
   w.pos = 0
   w.count = 0
@@ -156,11 +163,11 @@ proc computeMetrics(p: InterfaceProbe): (Option[uint32], uint32) =
 
 proc evaluateQuality(p: var InterfaceProbe): (Option[uint32], uint32, bool) =
   let (avgRtt, lossPct) = p.computeMetrics()
-  if p.quality.len == 0:
+  if p.quality.capacity <= 0 or p.quality.len == 0:
     return (none(uint32), 0'u32, true)
 
-  # Only evaluate thresholds once the window is full (6 entries)
-  if p.quality.len < 6:
+  # Only evaluate thresholds once the window is full
+  if not p.quality.isFull:
     return (avgRtt, lossPct, true)
 
   var qualityOk: bool
@@ -306,6 +313,7 @@ proc addInterface*(engine: var ProbeEngine, index: int, name, device: string,
                    lossThreshold: Option[uint32] = none(uint32),
                    recoveryLatency: Option[uint32] = none(uint32),
                    recoveryLoss: Option[uint32] = none(uint32),
+                   qualityWindowSize: int = 10,
                    probeSize: int = 56) =
   ## Parse target IPs to bytes, expand by count, create transport socket,
   ## initialise cycle state. Adds the interface to the engine.
@@ -346,7 +354,7 @@ proc addInterface*(engine: var ProbeEngine, index: int, name, device: string,
     sendTime: getMonoTime(),
     sendTimeValid: false,
     lastRtt: none(uint32),
-    quality: initQualityWindow(),
+    quality: initQualityWindow(qualityWindowSize),
     latencyThreshold: latencyThreshold,
     lossThreshold: lossThreshold,
     recoveryLatency: recoveryLatency,
@@ -488,88 +496,86 @@ proc resetCounters*(engine: var ProbeEngine, index: int) =
       p.qualityDegraded = false
       return
 
-# ===================================================================
-# Test helpers — simulated probes (no real sockets)
-# ===================================================================
-
-proc addTestInterface(engine: var ProbeEngine, index: int, name: string,
-                      numTargets: int, reliability: uint32,
-                      latencyThreshold: Option[uint32] = none(uint32),
-                      lossThreshold: Option[uint32] = none(uint32),
-                      recoveryLatency: Option[uint32] = none(uint32),
-                      recoveryLoss: Option[uint32] = none(uint32)) =
-  ## Create an InterfaceProbe with a dummy no-op transport for testing.
-  var targets: seq[array[16, byte]] = @[]
-  var tStatus: seq[TargetStatus] = @[]
-  for i in 0 ..< numTargets:
-    var ip: array[16, byte]
-    ip[0] = 8; ip[1] = 8; ip[2] = 8; ip[3] = (i + 1).byte
-    targets.add(ip)
-    tStatus.add(TargetStatus(ip: ip, isV6: false, up: false, lastRttMs: none(uint32)))
-
-  let effectiveReliability = max(min(reliability, numTargets.uint32), 1'u32)
-
-  engine.probes.add(InterfaceProbe(
-    index: index,
-    name: name,
-    device: "test0",
-    targets: targets,
-    targetIsV6: false,
-    transport: ProbeTransport(kind: tkIcmp, icmpFd: -1, icmpFamily: 4),
-    reliability: effectiveReliability,
-    pending: false,
-    seqNum: 0,
-    cycleResults: newSeq[bool](numTargets),
-    cycleRtts: newSeqOfCap[Option[uint32]](numTargets),
-    targetStatus: tStatus,
-    cyclePos: 0,
-    sendTime: getMonoTime(),
-    sendTimeValid: false,
-    lastRtt: none(uint32),
-    quality: initQualityWindow(),
-    latencyThreshold: latencyThreshold,
-    lossThreshold: lossThreshold,
-    recoveryLatency: recoveryLatency,
-    recoveryLoss: recoveryLoss,
-    qualityDegraded: false,
-    probeSize: 56,
-  ))
-  engine.probes[^1].cycleRtts.setLen(numTargets)
-
-proc simulateSend(engine: var ProbeEngine, index: int) =
-  ## Set pending=true and sendTime without using a real socket.
-  for p in engine.probes.mitems:
-    if p.index == index:
-      p.pending = true
-      p.seqNum += 1
-      p.sendTime = getMonoTime()
-      p.sendTimeValid = true
-      p.lastRtt = none(uint32)
-      return
-
-proc simulateResponse(engine: var ProbeEngine, index: int) =
-  ## Record a success for the current cycle position.
-  for p in engine.probes.mitems:
-    if p.index == index:
-      p.pending = false
-      p.cycleResults[p.cyclePos] = true
-      p.lastRtt = some(10'u32)  # default 10ms RTT
-      return
-
-proc simulateResponseWithRtt(engine: var ProbeEngine, index: int, rttMs: uint32) =
-  ## Record a success with a specific RTT.
-  for p in engine.probes.mitems:
-    if p.index == index:
-      p.pending = false
-      p.cycleResults[p.cyclePos] = true
-      p.lastRtt = some(rttMs)
-      return
-
-# ===================================================================
-# Tests
-# ===================================================================
-
 when isMainModule:
+  # Test helpers — simulated probes (no real sockets)
+
+  proc addTestInterface(engine: var ProbeEngine, index: int, name: string,
+                        numTargets: int, reliability: uint32,
+                        latencyThreshold: Option[uint32] = none(uint32),
+                        lossThreshold: Option[uint32] = none(uint32),
+                        recoveryLatency: Option[uint32] = none(uint32),
+                        recoveryLoss: Option[uint32] = none(uint32)) =
+    ## Create an InterfaceProbe with a dummy no-op transport for testing.
+    var targets: seq[array[16, byte]] = @[]
+    var tStatus: seq[TargetStatus] = @[]
+    for i in 0 ..< numTargets:
+      var ip: array[16, byte]
+      ip[0] = 8; ip[1] = 8; ip[2] = 8; ip[3] = (i + 1).byte
+      targets.add(ip)
+      tStatus.add(TargetStatus(ip: ip, isV6: false, up: false, lastRttMs: none(uint32)))
+
+    let effectiveReliability = max(min(reliability, numTargets.uint32), 1'u32)
+
+    engine.probes.add(InterfaceProbe(
+      index: index,
+      name: name,
+      device: "test0",
+      targets: targets,
+      targetIsV6: false,
+      transport: ProbeTransport(kind: tkIcmp, icmpFd: -1, icmpFamily: 4),
+      reliability: effectiveReliability,
+      pending: false,
+      seqNum: 0,
+      cycleResults: newSeq[bool](numTargets),
+      cycleRtts: newSeqOfCap[Option[uint32]](numTargets),
+      targetStatus: tStatus,
+      cyclePos: 0,
+      sendTime: getMonoTime(),
+      sendTimeValid: false,
+      lastRtt: none(uint32),
+      quality: initQualityWindow(6),
+      latencyThreshold: latencyThreshold,
+      lossThreshold: lossThreshold,
+      recoveryLatency: recoveryLatency,
+      recoveryLoss: recoveryLoss,
+      qualityDegraded: false,
+      probeSize: 56,
+    ))
+    engine.probes[^1].cycleRtts.setLen(numTargets)
+
+  proc simulateSend(engine: var ProbeEngine, index: int) =
+    ## Set pending=true and sendTime without using a real socket.
+    for p in engine.probes.mitems:
+      if p.index == index:
+        p.pending = true
+        p.seqNum += 1
+        p.sendTime = getMonoTime()
+        p.sendTimeValid = true
+        p.lastRtt = none(uint32)
+        return
+
+  proc simulateResponse(engine: var ProbeEngine, index: int) =
+    ## Record a success for the current cycle position.
+    for p in engine.probes.mitems:
+      if p.index == index:
+        p.pending = false
+        p.cycleResults[p.cyclePos] = true
+        p.lastRtt = some(10'u32)  # default 10ms RTT
+        return
+
+  proc simulateResponseWithRtt(engine: var ProbeEngine, index: int, rttMs: uint32) =
+    ## Record a success with a specific RTT.
+    for p in engine.probes.mitems:
+      if p.index == index:
+        p.pending = false
+        p.cycleResults[p.cyclePos] = true
+        p.lastRtt = some(rttMs)
+        return
+
+  # ===================================================================
+  # Tests
+  # ===================================================================
+
   var passed = 0
   var failed = 0
 
@@ -589,27 +595,27 @@ when isMainModule:
   echo "=== QualityWindow tests ==="
 
   test "empty window returns zero loss and no avg":
-    var w = initQualityWindow()
+    var w = initQualityWindow(6)
     assert w.len == 0
     assert w.avgRtt.isNone
     assert w.lossPercent == 0
 
   test "push and read single success":
-    var w = initQualityWindow()
+    var w = initQualityWindow(6)
     w.push(some(42'u32))
     assert w.len == 1
     assert w.avgRtt == some(42'u32)
     assert w.lossPercent == 0
 
   test "push and read single loss":
-    var w = initQualityWindow()
+    var w = initQualityWindow(6)
     w.push(none(uint32))
     assert w.len == 1
     assert w.avgRtt.isNone
     assert w.lossPercent == 100
 
   test "mixed success and loss":
-    var w = initQualityWindow()
+    var w = initQualityWindow(6)
     w.push(some(100'u32))
     w.push(none(uint32))
     w.push(some(200'u32))
@@ -618,7 +624,7 @@ when isMainModule:
     assert w.lossPercent == 33        # 1/3 = 33%
 
   test "wraps around at capacity 6":
-    var w = initQualityWindow()
+    var w = initQualityWindow(6)
     for i in 1 .. 6:
       w.push(some(i.uint32 * 10))
     assert w.len == 6
@@ -631,7 +637,7 @@ when isMainModule:
     assert w.avgRtt == some(45'u32)
 
   test "clear resets window":
-    var w = initQualityWindow()
+    var w = initQualityWindow(6)
     w.push(some(50'u32))
     w.push(some(60'u32))
     w.clear()
