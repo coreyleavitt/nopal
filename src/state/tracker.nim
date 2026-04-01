@@ -6,7 +6,7 @@
 ## Both Online and Degraded participate in routing. Degraded means
 ## reachable but with poor quality, not unreachable.
 
-import std/[monotimes, options, logging]
+import std/[monotimes, options, logging, strformat]
 import ../health/dampening
 
 type
@@ -86,18 +86,18 @@ proc probeSuccess*(t: var InterfaceTracker, qualityOk: bool): Option[InterfaceSt
         damp.decay()
         t.dampening = some(damp)
         if damp.isSuppressed:
-          info t.name & ": probing -> online blocked by dampening"
+          info fmt"{t.name}: probing -> online blocked by dampening"
           return none[InterfaceState]()
 
       if qualityOk:
         t.state = isOnline
         t.onlineSince = some(getMonoTime())
         t.offlineSince = none[MonoTime]()
-        info t.name & ": probing -> online (" & $t.successCount & " successes)"
+        info fmt"{t.name}: probing -> online ({t.successCount} successes)"
         return some(isOnline)
       else:
         t.state = isDegraded
-        warn t.name & ": probing -> degraded (quality threshold)"
+        warn fmt"{t.name}: probing -> degraded (quality threshold)"
         return some(isDegraded)
     return none[InterfaceState]()
 
@@ -110,16 +110,16 @@ proc probeSuccess*(t: var InterfaceTracker, qualityOk: bool): Option[InterfaceSt
       damp.decay()
       t.dampening = some(damp)
       if damp.isSuppressed:
-        info t.name & ": degraded -> online blocked by dampening"
+        info fmt"{t.name}: degraded -> online blocked by dampening"
         return none[InterfaceState]()
     t.state = isOnline
-    info t.name & ": degraded -> online (recovered)"
+    info fmt"{t.name}: degraded -> online (recovered)"
     return some(isOnline)
 
   of isOnline:
     if not qualityOk:
       t.state = isDegraded
-      warn t.name & ": online -> degraded (quality threshold)"
+      warn fmt"{t.name}: online -> degraded (quality threshold)"
       return some(isDegraded)
     return none[InterfaceState]()
 
@@ -132,7 +132,7 @@ proc applyDampeningFailure(t: var InterfaceTracker) =
     let suppressed = damp.applyFailure()
     t.dampening = some(damp)
     if suppressed:
-      warn t.name & ": dampening suppressed (penalty: " & $damp.penalty & ")"
+      warn fmt"{t.name}: dampening suppressed (penalty: {damp.penalty})"
 
 proc probeFailure*(t: var InterfaceTracker): Option[InterfaceState] =
   ## Record a failed probe. Returns new state if a transition occurred.
@@ -142,7 +142,7 @@ proc probeFailure*(t: var InterfaceTracker): Option[InterfaceState] =
   case t.state
   of isOnline:
     t.state = isDegraded
-    warn t.name & ": online -> degraded (probe failure)"
+    warn fmt"{t.name}: online -> degraded (probe failure)"
     return some(isDegraded)
 
   of isDegraded:
@@ -151,7 +151,7 @@ proc probeFailure*(t: var InterfaceTracker): Option[InterfaceState] =
       t.state = isOffline
       t.offlineSince = some(getMonoTime())
       t.onlineSince = none[MonoTime]()
-      warn t.name & ": degraded -> offline (" & $t.failCount & " failures)"
+      warn fmt"{t.name}: degraded -> offline ({t.failCount} failures)"
       return some(isOffline)
     return none[InterfaceState]()
 
@@ -161,7 +161,7 @@ proc probeFailure*(t: var InterfaceTracker): Option[InterfaceState] =
       t.state = isOffline
       t.offlineSince = some(getMonoTime())
       t.onlineSince = none[MonoTime]()
-      warn t.name & ": probing -> offline (" & $t.failCount & " failures)"
+      warn fmt"{t.name}: probing -> offline ({t.failCount} failures)"
       return some(isOffline)
     return none[InterfaceState]()
 
@@ -176,7 +176,7 @@ proc linkUp*(t: var InterfaceTracker): Option[InterfaceState] =
     t.failCount = 0
     t.state = isProbing
     t.offlineSince = none[MonoTime]()
-    info t.name & ": " & $t.state & " -> probing (link up)"
+    info fmt"{t.name}: {t.state} -> probing (link up)"
     return some(isProbing)
   else:
     return none[InterfaceState]()
@@ -193,7 +193,7 @@ proc linkDown*(t: var InterfaceTracker): Option[InterfaceState] =
     t.state = isOffline
     t.offlineSince = some(getMonoTime())
     t.onlineSince = none[MonoTime]()
-    warn t.name & ": " & $prev & " -> offline (link down)"
+    warn fmt"{t.name}: {prev} -> offline (link down)"
     return some(isOffline)
 
 when isMainModule:

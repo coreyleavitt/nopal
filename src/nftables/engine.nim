@@ -4,14 +4,14 @@
 ## apply or none do. This avoids intermediate states where traffic could
 ## be misrouted.
 
-import std/[osproc, json, logging, streams, strutils]
+import std/[osproc, json, logging, streams, strutils, strformat]
 import ./ruleset
 
 proc applyRuleset*(rs: Ruleset): bool =
   ## Serialize ruleset to JSON and pipe to nft for atomic application.
   ## Returns true on success, false on error (logged).
   let jsonStr = $rs.toJson()
-  debug "applying nftables ruleset (" & $jsonStr.len & " bytes)"
+  debug fmt"applying nftables ruleset ({jsonStr.len} bytes)"
 
   let process = startProcess("nft", args = ["-j", "-f", "-"],
                              options = {poUsePath, poStdErrToStdOut})
@@ -23,7 +23,7 @@ proc applyRuleset*(rs: Ruleset): bool =
   let output = process.outputStream().readAll()
   let exitCode = process.waitForExit()
   if exitCode != 0:
-    error "nft failed (exit " & $exitCode & "): " & output
+    error fmt"nft failed (exit {exitCode}): {output}"
     process.close()
     return false
 
@@ -40,6 +40,6 @@ proc cleanup*(): bool =
   if exitCode != 0:
     if "No such file or directory" notin output and
        "does not exist" notin output:
-      warn "nft cleanup failed: " & output
+      warn fmt"nft cleanup failed: {output}"
       return false
   true
