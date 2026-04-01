@@ -106,17 +106,14 @@ jobs:
           LLVM_VERSION: "19.1.7"
         run: |
           cd /tmp
-          curl -LO "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/compiler-rt-${LLVM_VERSION}.src.tar.xz"
-          tar xf "compiler-rt-${LLVM_VERSION}.src.tar.xz"
 
-          # Also need cmake modules from LLVM source (compiler-rt expects ../cmake/)
-          curl -LO "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/cmake-${LLVM_VERSION}.src.tar.xz"
-          tar xf "cmake-${LLVM_VERSION}.src.tar.xz"
-          # Place cmake modules where compiler-rt expects them (sibling to compiler-rt dir)
-          mv "cmake-${LLVM_VERSION}.src" cmake
+          # Download full llvm-project source (compiler-rt needs the cmake modules
+          # from the top-level project, not just the compiler-rt subdirectory)
+          curl -LO "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz"
+          tar xf "llvm-project-${LLVM_VERSION}.src.tar.xz"
 
           mkdir -p build-rt && cd build-rt
-          cmake "/tmp/compiler-rt-${LLVM_VERSION}.src" \
+          cmake "/tmp/llvm-project-${LLVM_VERSION}.src/compiler-rt" \
             -G Ninja \
             -DCMAKE_AR=$(which llvm-ar) \
             -DCMAKE_NM=$(which llvm-nm) \
@@ -139,7 +136,7 @@ jobs:
             -DCOMPILER_RT_BUILD_ORC=OFF \
             -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
             -DCOMPILER_RT_INCLUDE_TESTS=OFF \
-            -DLLVM_CMAKE_DIR="/tmp/cmake/Modules"
+            -DLLVM_CMAKE_DIR="/tmp/llvm-project-${LLVM_VERSION}.src/cmake/Modules"
           ninja builtins crt
 
           # Install to clang's resource directory so -rtlib=compiler-rt finds them
