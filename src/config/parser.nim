@@ -4,7 +4,7 @@
 
 import ./schema
 import ../errors
-import std/[tables, sets, strutils, parseutils, logging]
+import std/[tables, sets, strutils, parseutils, options, logging]
 
 type
   UciSection* = object
@@ -214,19 +214,19 @@ proc parseUci*(text: string): seq[UciSection] =
     of "option":
       if currentIdx < 0:
         raise newException(ConfigError, "line " & $lineNum & ": option outside of section")
-      if parts.len < 3:
-        raise newException(ConfigError, "line " & $lineNum & ": option directive requires key and value")
+      if parts.len < 2:
+        raise newException(ConfigError, "line " & $lineNum & ": option directive requires a key")
       let key = stripQuotes(parts[1])
-      let value = stripQuotes(parts[2 ..< parts.len].join(" "))
+      let value = if parts.len >= 3: stripQuotes(parts[2 ..< parts.len].join(" ")) else: ""
       result[currentIdx].options[key] = @[value]
 
     of "list":
       if currentIdx < 0:
         raise newException(ConfigError, "line " & $lineNum & ": list outside of section")
-      if parts.len < 3:
-        raise newException(ConfigError, "line " & $lineNum & ": list directive requires key and value")
+      if parts.len < 2:
+        raise newException(ConfigError, "line " & $lineNum & ": list directive requires a key")
       let key = stripQuotes(parts[1])
-      let value = stripQuotes(parts[2 ..< parts.len].join(" "))
+      let value = if parts.len >= 3: stripQuotes(parts[2 ..< parts.len].join(" ")) else: ""
       if key in result[currentIdx].options:
         result[currentIdx].options[key].add(value)
       else:
@@ -236,13 +236,15 @@ proc parseUci*(text: string): seq[UciSection] =
       warn "line " & $lineNum & ": unknown directive '" & directive & "', skipping"
       continue
 
-func isContiguousBits(mask: uint32): bool =
-  ## Check that a bitmask has contiguous set bits (no gaps).
+func isValidMarkMask(mask: uint32): bool =
+  ## Check that a bitmask has contiguous set bits and at least 2 usable slots.
   if mask == 0:
     return false
-  # A contiguous mask + its lowest bit forms a power of 2
   let filled = mask or (mask - 1)  # fill bits below lowest set bit
-  return (filled and (filled + 1)) == 0
+  if (filled and (filled + 1)) != 0:
+    return false  # non-contiguous
+  let step = mask and (not mask + 1)  # lowest set bit
+  mask div step >= 2
 
 proc parseGlobals*(sec: UciSection): GlobalsConfig =
   ## Convert a UCI section of type 'globals' to GlobalsConfig.
@@ -288,8 +290,8 @@ proc parseGlobals*(sec: UciSection): GlobalsConfig =
     warn "globals: mark_mask must not be zero, using default"
     result.markMask = defaultGlobals().markMask
 
-  if not isContiguousBits(result.markMask):
-    warn "globals: mark_mask 0x" & toHex(result.markMask) & " must have contiguous bits, using default"
+  if not isValidMarkMask(result.markMask):
+    warn "globals: mark_mask 0x" & toHex(result.markMask) & " must have contiguous bits with >=2 slots, using default"
     result.markMask = defaultGlobals().markMask
 
   # rt_table_lookup
@@ -331,18 +333,13 @@ proc mapTrackMethod(s: string, ifaceName: string): TrackMethod =
     warn "interface '" & ifaceName & "': unknown track_method '" & s & "', using 'ping'"
     return tmPing
 
-proc parseFlushTrigger(s: string): ConntrackFlushTrigger =
+func parseFlushTrigger(s: string): options.Option[ConntrackFlushTrigger] =
   case s.toLowerAscii()
-  of "ifup":
-    return cftIfUp
-  of "ifdown":
-    return cftIfDown
-  of "connected":
-    return cftConnected
-  of "disconnected":
-    return cftDisconnected
-  else:
-    raise newException(ConfigError, "unknown flush_conntrack trigger '" & s & "'")
+  of "ifup": some(cftIfUp)
+  of "ifdown": some(cftIfDown)
+  of "connected": some(cftConnected)
+  of "disconnected": some(cftDisconnected)
+  else: none(ConntrackFlushTrigger)
 
 proc parseInterface*(sec: UciSection): InterfaceConfig =
   ## Convert a UCI section of type 'interface' to InterfaceConfig.
@@ -486,7 +483,11 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   if flushList.len > 0:
     result.flushConntrack = @[]
     for ft in flushList:
-      result.flushConntrack.add(parseFlushTrigger(ft))
+      let parsed = parseFlushTrigger(ft)
+      if parsed.isSome:
+        result.flushConntrack.add(parsed.get)
+      else:
+        warn "interface '" & sec.name & "': unknown flush_conntrack trigger '" & ft & "', skipping"
 
 proc parseMember*(sec: UciSection): MemberConfig =
   ## Convert a UCI section of type 'member' to MemberConfig.
@@ -653,6 +654,7 @@ proc parseRule*(sec: UciSection): RuleConfig =
   # ipset
   let ipset = sec.get("ipset")
   if ipset != "":
+    validateName(ctx & " ipset", ipset)
     result.ipset = ipset
 
   # sticky
