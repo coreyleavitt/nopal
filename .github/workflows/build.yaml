@@ -35,6 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: opensuse/tumbleweed
+      options: --env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +66,7 @@ jobs:
       - name: Install build tools
         run: |
           zypper --non-interactive install \
-            clang lld make curl tar xz gzip bzip2 which mbedtls-devel
+            clang lld git make curl tar xz gzip bzip2 which mbedtls-devel
           curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y --version 2.2.8
           echo "$HOME/.nimble/bin" >> $GITHUB_PATH
 
