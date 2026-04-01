@@ -1,7 +1,5 @@
 ## nftables engine: pipes JSON ruleset to `nft -j -f -` for atomic application.
 
-import std/osproc
-import std/json
 import ./ruleset
 
 proc applyRuleset*(rs: Ruleset): bool =

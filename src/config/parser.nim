@@ -4,7 +4,7 @@
 
 import ./schema
 import ../errors
-import std/[tables, sets, strutils, parseutils, options, logging]
+import std/[tables, sets, strutils, options, logging]
 
 type
   UciSection* = object
@@ -31,6 +31,8 @@ proc getU32*(s: UciSection, key: string, default: uint32): uint32 =
     return default
   try:
     let parsed = parseUInt(v)
+    if parsed > uint32.high:
+      return default
     return uint32(parsed)
   except ValueError:
     return default
