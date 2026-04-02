@@ -41,7 +41,7 @@ proc createIcmpSocket*(device: string, family: uint8, ttl: int): cint =
   let af = if family == AF_INET.uint8: AF_INET.cint else: AF_INET6.cint
   let proto = if family == AF_INET.uint8: IPPROTO_ICMP else: IPPROTO_ICMPV6
 
-  result = cint(socket(af, SOCK_DGRAM.cint, proto))
+  result = cint(socket(af, SOCK_RAW.cint, proto))
   if result < 0:
     raiseOSError(osLastError())
 
