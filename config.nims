@@ -21,34 +21,40 @@ when defined(release):
 
 const crossCFlags = "-Oz -fno-unwind-tables -fno-asynchronous-unwind-tables -fmerge-all-constants -fvisibility=hidden"
 
-proc setupCross(target, sysroot: string) =
+proc setupCross(target, sysroot, cpuFlags: string) =
   switch("cc", "clang")
   switch("clang.exe", "clang")
   switch("clang.linkerexe", "clang")
   switch("clang.options.linker", "")
-  switch("passC", "--target=" & target & " --sysroot=" & sysroot & " " & crossCFlags)
+  switch("passC", "--target=" & target & " --sysroot=" & sysroot & " " & cpuFlags & " " & crossCFlags)
   switch("passL", "--target=" & target & " --sysroot=" & sysroot &
-    " -static -fuse-ld=lld -rtlib=compiler-rt")
+    " " & cpuFlags & " -static -fuse-ld=lld -rtlib=compiler-rt")
 
 when defined(aarch64):
   switch("os", "linux")
   switch("cpu", "arm64")
-  setupCross("aarch64-linux-musl", "/opt/musl/aarch64")
+  setupCross("aarch64-linux-musl", "/opt/musl/aarch64", "")
 
 when defined(armv7hf):
   switch("os", "linux")
   switch("cpu", "arm")
-  setupCross("armv7-linux-musleabihf", "/opt/musl/armv7hf")
+  # OpenWrt arm_cortex-a7: ARMv7-A with hardware float, NEON
+  setupCross("armv7-linux-musleabihf", "/opt/musl/armv7hf",
+    "-march=armv7-a -mfpu=neon -mfloat-abi=hard")
 
 when defined(mips):
   switch("os", "linux")
   switch("cpu", "mips")
-  setupCross("mips-linux-musl", "/opt/musl/mips")
+  # OpenWrt mips_24kc: MIPS32r2, soft-float (24Kc has no FPU)
+  setupCross("mips-linux-musl", "/opt/musl/mips",
+    "-march=mips32r2 -msoft-float")
 
 when defined(mipsel):
   switch("os", "linux")
   switch("cpu", "mipsel")
-  setupCross("mipsel-linux-musl", "/opt/musl/mipsel")
+  # OpenWrt mipsel_24kc: MIPS32r2 little-endian, soft-float
+  setupCross("mipsel-linux-musl", "/opt/musl/mipsel",
+    "-march=mips32r2 -msoft-float")
 
 # HTTPS feature flag (requires nim-mbedtls)
 # Usage: nim c -d:https src/nopal.nim

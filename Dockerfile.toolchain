@@ -51,11 +51,11 @@ RUN cd /tmp \
 COPY scripts/build-target.sh /tmp/build-target.sh
 RUN chmod +x /tmp/build-target.sh
 
-# Build all 4 targets
-RUN /tmp/build-target.sh aarch64-linux-musl /opt/musl/aarch64
-RUN /tmp/build-target.sh arm-linux-musleabihf /opt/musl/armv7hf
-RUN /tmp/build-target.sh mips-linux-musl /opt/musl/mips
-RUN /tmp/build-target.sh mipsel-linux-musl /opt/musl/mipsel
+# Build all 4 targets (4th arg = extra CFLAGS for ISA/FPU matching OpenWrt subtargets)
+RUN /tmp/build-target.sh aarch64-linux-musl /opt/musl/aarch64 "" ""
+RUN /tmp/build-target.sh arm-linux-musleabihf /opt/musl/armv7hf "" "-march=armv7-a -mfpu=neon -mfloat-abi=hard"
+RUN /tmp/build-target.sh mips-linux-musl /opt/musl/mips "" "-march=mips32r2 -msoft-float"
+RUN /tmp/build-target.sh mipsel-linux-musl /opt/musl/mipsel "" "-march=mips32r2 -msoft-float"
 
 # Clean up source downloads (~1.5GB)
 RUN rm -rf /tmp/musl-* /tmp/llvm-project-* /tmp/build-target.sh
