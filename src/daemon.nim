@@ -133,12 +133,9 @@ proc buildRulesFromConfig(config: NopalConfig): seq[RuleInfo] =
 proc checkHookScript(path: string): bool =
   path.len > 0 and fileExists(path)
 
-proc initDaemon*(configPath: string, signalFd: cint): Daemon =
-  ## Load config, discover WANs, create all subsystem components,
-  ## register fds with selector, assign marks, build trackers.
-  var config = loadConfig(configPath)
-
-  # Discover WANs from OpenWrt firewall/network config
+proc enrichConfigWithDiscovery(config: var NopalConfig) =
+  ## Discover WANs from OpenWrt firewall/network config and enrich
+  ## the parsed config with discovered interfaces, members, policies.
   let discovered = discoverWanInterfaces()
   if discovered.len > 0:
     let enriched = buildDiscoveredConfig(
@@ -164,6 +161,12 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
       config.rules = enriched.rules
   elif config.interfaces.len == 0:
     warn "no WAN interfaces discovered and none configured — daemon will have nothing to manage"
+
+proc initDaemon*(configPath: string, signalFd: cint): Daemon =
+  ## Load config, discover WANs, create all subsystem components,
+  ## register fds with selector, assign marks, build trackers.
+  var config = loadConfig(configPath)
+  enrichConfigWithDiscovery(config)
 
   info fmt"loaded config: {config.interfaces.len} interfaces, {config.policies.len} policies, {config.rules.len} rules"
 
@@ -1079,6 +1082,9 @@ proc handleReload(d: var Daemon) =
   except CatchableError as e:
     error fmt"failed to reload config: {e.msg}"
     return
+
+  # Re-run WAN discovery (interfaces may have changed)
+  enrichConfigWithDiscovery(newConfig)
 
   let cfgDiff = diff(d.config, newConfig)
   if not cfgDiff.changed:
