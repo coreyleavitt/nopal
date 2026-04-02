@@ -2,7 +2,8 @@
 """Hardware test harness for nopal.
 
 Runs on the OpenWrt device itself. Exercises daemon lifecycle, health probes,
-failover, hot reload, and IPC. Uses `nopal status --json` for assertions.
+failover, hot reload, policy routing, and memory stability.
+Uses `nopal status --json` for assertions.
 
 Usage:
     # Install python3 (uses tmpfs overlay, doesn't eat flash)
@@ -12,18 +13,20 @@ Usage:
     python3 hwtest.py [--phase PHASE]
 
 Phases:
-    1  Binary and install validation
-    2  Daemon lifecycle (start, status, stop)
-    3  Health probes (requires configured WAN)
-    4  Failover (requires dual WAN)
-    5  Hot reload
-    all  Run all phases (default)
+    1      Binary and install validation
+    2      Daemon lifecycle (start, status, stop)
+    3      Health probes (requires configured WAN)
+    4      Failover (requires dual WAN)
+    4wait  Poll for state change after manual cable disconnect
+    5      Hot reload
+    6      Policy routing and connected bypass
+    soak   Memory stability (long-running, Ctrl-C to stop)
+    all    Run phases 1-6 (default)
 """
 
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -35,6 +38,8 @@ import time
 PASS = 0
 FAIL = 0
 SKIP = 0
+
+SOCKET_PATH = "/var/run/nopal.sock"
 
 
 def timestamp():
@@ -75,11 +80,6 @@ def nopal_status(iface=None):
         raise RuntimeError(f"invalid JSON from 'nopal status --json': {e}\n{r.stdout[:200]}")
 
 
-def service(action):
-    """Control the init service."""
-    return run(f"/etc/init.d/nopal {action}")
-
-
 def get_pid():
     """Get nopald PID, or None if not running."""
     r = run("pidof nopald", check=False)
@@ -92,12 +92,16 @@ def get_pid():
 
 
 def get_rss_kb(pid):
-    """Read VmRSS from /proc directly (no shell piping)."""
+    """Read VmRSS from /proc directly (no shell piping). Returns int KB or None."""
     try:
         with open(f"/proc/{pid}/status") as f:
             for line in f:
                 if line.startswith("VmRSS:"):
-                    return line.strip()
+                    # "VmRSS:    1234 kB"
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        return int(parts[1])
+                    return None
     except (OSError, IOError):
         pass
     return None
@@ -108,11 +112,34 @@ def daemon_is_running():
     return get_pid() is not None
 
 
-def wait_for_state(iface, target_state, timeout=120, poll=2):
-    """Poll until interface reaches target state or timeout.
+def wait_for_socket(timeout=15):
+    """Poll until the IPC socket appears."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(SOCKET_PATH):
+            return True
+        time.sleep(0.5)
+    return False
 
+
+def wait_for_exit(timeout=10):
+    """Poll until nopald process is gone."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not daemon_is_running():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def wait_for_state(iface, target_states, timeout=120, poll=2):
+    """Poll until interface reaches one of the target states or timeout.
+
+    target_states can be a string or list of strings.
     Returns (reached, last_state) — last_state is useful for diagnostics.
     """
+    if isinstance(target_states, str):
+        target_states = [target_states]
     deadline = time.time() + timeout
     last_state = "unknown"
     while time.time() < deadline:
@@ -123,12 +150,25 @@ def wait_for_state(iface, target_state, timeout=120, poll=2):
             for i in status.get("interfaces", []):
                 if i["name"] == iface:
                     last_state = i["state"]
-                    if last_state == target_state:
+                    if last_state in target_states:
                         return True, last_state
         except Exception as e:
             last_state = f"error: {e}"
         time.sleep(poll)
     return False, last_state
+
+
+def check_logs_for_errors():
+    """Check logread for nopal error/critical messages. Returns list of lines."""
+    r = run("logread", check=False)
+    if r.returncode != 0:
+        return []
+    errors = []
+    for line in r.stdout.splitlines():
+        low = line.lower()
+        if "nopal" in low and any(k in low for k in ["error", "crit", "panic", "segfault"]):
+            errors.append(line.strip())
+    return errors
 
 
 def log(msg):
@@ -158,16 +198,27 @@ def section(name):
 
 
 def ensure_daemon():
-    """Start daemon if not running. Returns True if running after attempt."""
-    if daemon_is_running():
+    """Start daemon if not running, wait for socket. Returns True if ready."""
+    if daemon_is_running() and os.path.exists(SOCKET_PATH):
         return True
     log("Starting daemon...")
     r = run("/etc/init.d/nopal start", check=False)
     if r.returncode != 0:
         log(f"init script failed: {r.stderr.strip()}")
         return False
-    time.sleep(3)
-    return daemon_is_running()
+    if not wait_for_socket(timeout=15):
+        log("Timed out waiting for IPC socket")
+        return daemon_is_running()
+    return True
+
+
+def stop_daemon():
+    """Stop daemon and wait for process exit."""
+    run("/etc/init.d/nopal stop", check=False)
+    if not wait_for_exit(timeout=10):
+        log("Warning: daemon still running after stop + 10s")
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +241,6 @@ def phase1():
         log(f"binary: {r.stdout.strip()}")
         machine = os.uname().machine
         elf_info = r.stdout.lower()
-        # Basic arch sanity: mipsel device should have MIPS ELF, etc.
         if "mips" in machine.lower():
             test("binary matches arch", "mips" in elf_info, detail=elf_info[:80])
         elif "aarch64" in machine.lower():
@@ -208,6 +258,10 @@ def phase1():
         log(f"version: {ver}")
         test("version is not empty", len(ver) > 0)
 
+    r = run(["nopal", "--help"], check=False)
+    test("nopal --help runs", r.returncode == 0,
+         detail=r.stderr.strip() if r.returncode != 0 else None)
+
     test("init script exists", os.path.isfile("/etc/init.d/nopal"))
     test("default config exists", os.path.isfile("/etc/config/nopal"))
     test("rpcd plugin exists", os.path.isfile("/usr/libexec/rpcd/nopal"))
@@ -221,8 +275,7 @@ def phase2():
     section("Phase 2: Daemon lifecycle")
 
     # Make sure it's stopped first
-    run("/etc/init.d/nopal stop", check=False)
-    time.sleep(1)
+    stop_daemon()
 
     # Start
     log("Starting daemon...")
@@ -230,16 +283,14 @@ def phase2():
     test("daemon starts", r.returncode == 0,
          detail=r.stderr.strip() if r.returncode != 0 else None)
 
-    time.sleep(3)
+    socket_ready = wait_for_socket(timeout=15)
+    test("IPC socket appears", socket_ready)
 
     # Check process
     pid = get_pid()
     test("nopald process running", pid is not None)
     if pid:
         log(f"PID: {pid}")
-
-    # Check socket
-    test("IPC socket exists", os.path.exists("/var/run/nopal.sock"))
 
     # Query status
     try:
@@ -258,14 +309,17 @@ def phase2():
     if pid:
         rss = get_rss_kb(pid)
         if rss:
-            log(f"Memory: {rss}")
+            log(f"Memory: VmRSS {rss} kB")
+
+    # Check for error-level log messages
+    errors = check_logs_for_errors()
+    test("no error-level log messages", len(errors) == 0,
+         detail=f"{len(errors)} errors, first: {errors[0][:100]}" if errors else None)
 
     # Stop
     log("Stopping daemon...")
-    service("stop")
-    time.sleep(2)
-
-    test("daemon stopped cleanly", not daemon_is_running())
+    stopped = stop_daemon()
+    test("daemon stopped cleanly", stopped)
 
 
 # ---------------------------------------------------------------------------
@@ -297,23 +351,26 @@ def phase3():
         state = iface["state"]
         log(f"\n  Interface: {name}, state: {state}, device: {iface.get('device', '?')}")
 
+        # Wait for interface to leave init if needed
         if state == "init":
             log(f"  Waiting for {name} to leave init state...")
-            reached, last_state = wait_for_state(name, "probing", timeout=15)
+            reached, state = wait_for_state(name, ["probing", "online"], timeout=20)
             if not reached:
-                # Maybe it went straight to online, or daemon died
-                reached_online, last_state = wait_for_state(name, "online", timeout=5)
-                if reached_online:
-                    state = "online"
-                else:
-                    test(f"{name}: not stuck in init", False, detail=f"last state: {last_state}")
-                    continue
-            else:
-                state = "probing"
+                test(f"{name}: not stuck in init", False, detail=f"last state: {state}")
+                continue
 
         test(f"{name}: not stuck in init", state != "init", detail=f"state={state}")
 
         if state == "online":
+            # Re-fetch to get current counters (original iface data may be stale)
+            try:
+                fresh = nopal_status()
+                for i in fresh["interfaces"]:
+                    if i["name"] == name:
+                        iface = i
+                        break
+            except RuntimeError:
+                pass
             test(f"{name}: has success count",
                  iface.get("success_count", 0) > 0,
                  detail=f"success_count={iface.get('success_count', 0)}")
@@ -339,6 +396,13 @@ def phase3():
                     pass
         elif state == "offline":
             test(f"{name}: expected online or probing", False, detail=f"state=offline")
+
+    # Check for errors after probe cycle
+    errors = check_logs_for_errors()
+    if errors:
+        log(f"Warning: {len(errors)} error-level log message(s) during probing")
+        for e in errors[:3]:
+            log(f"  {e[:120]}")
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +431,12 @@ def phase4():
 
     log(f"Online interfaces: {[i['name'] for i in online]}")
     primary = online[0]["name"]
+
+    # Capture before-state for comparison
+    log("Capturing nftables rules before disconnect...")
+    r = run("nopal rules", check=False)
+    if r.returncode == 0:
+        log(f"Rules (first 300 chars):\n{r.stdout[:300]}")
 
     test("failover preconditions met (2+ WANs online)", True)
 
@@ -403,6 +473,9 @@ def phase4_wait():
     deadline = time.time() + 120
     while time.time() < deadline:
         try:
+            if not daemon_is_running():
+                log("  Daemon died during poll!")
+                break
             status = nopal_status()
         except RuntimeError:
             log("  Failed to query status (daemon may have crashed)")
@@ -464,7 +537,9 @@ def phase5():
     test("reload command succeeds", r.returncode == 0,
          detail=r.stderr.strip() if r.returncode != 0 else None)
 
-    time.sleep(3)
+    # Wait for socket readiness (reload may briefly disrupt)
+    time.sleep(1)
+    wait_for_socket(timeout=10)
 
     # Check daemon still running
     test("daemon still running after reload", daemon_is_running())
@@ -498,6 +573,167 @@ def phase5():
 
 
 # ---------------------------------------------------------------------------
+# Phase 6: Policy routing and connected bypass
+# ---------------------------------------------------------------------------
+
+def phase6():
+    section("Phase 6: Policy routing and connected bypass")
+
+    if not ensure_daemon():
+        test("daemon running for policy test", False, detail="could not start daemon")
+        return
+
+    try:
+        status = nopal_status()
+    except RuntimeError as e:
+        test("fetch status", False, detail=str(e))
+        return
+
+    # Policies
+    policies = status.get("policies", [])
+    test("has policies", len(policies) > 0,
+         detail=f"got {len(policies)} policies")
+
+    for pol in policies:
+        name = pol.get("name", "?")
+        members = pol.get("active_members", [])
+        tier = pol.get("active_tier", -1)
+        log(f"  Policy: {name}, active members: {members}, tier: {tier}")
+        test(f"policy '{name}': has active members",
+             len(members) > 0,
+             detail=f"members={members}")
+
+    # Connected bypass
+    try:
+        r = nopal_cmd(["connected"])
+        test("nopal connected succeeds", True)
+        if r.stdout.strip():
+            lines = r.stdout.strip().splitlines()
+            log(f"  Bypass networks: {len(lines)} entries")
+            for line in lines[:5]:
+                log(f"    {line.strip()}")
+    except RuntimeError as e:
+        test("nopal connected succeeds", False, detail=str(e))
+
+    # nftables rules
+    try:
+        r = nopal_cmd(["rules"])
+        test("nopal rules succeeds", True)
+        rules_out = r.stdout
+        # Basic sanity: should contain our policy chain
+        test("nftables has policy rules",
+             "policy" in rules_out.lower() or "nopal" in rules_out.lower(),
+             detail=f"output length: {len(rules_out)}")
+        log(f"  Rules output: {len(rules_out)} bytes")
+    except RuntimeError as e:
+        test("nopal rules succeeds", False, detail=str(e))
+
+    # Status files
+    for iface in status.get("interfaces", []):
+        name = iface["name"]
+        status_file = f"/var/run/nopal/{name}/status"
+        test(f"{name}: status file exists",
+             os.path.isfile(status_file),
+             detail=status_file)
+
+
+# ---------------------------------------------------------------------------
+# Soak: Memory stability
+# ---------------------------------------------------------------------------
+
+def phase_soak():
+    section("Soak: Memory stability test")
+
+    if not ensure_daemon():
+        test("daemon running for soak", False, detail="could not start daemon")
+        return
+
+    pid = get_pid()
+    if not pid:
+        test("got daemon PID", False)
+        return
+
+    initial_rss = get_rss_kb(pid)
+    if initial_rss is None:
+        test("read initial RSS", False, detail="could not read /proc/*/status")
+        return
+
+    log(f"Initial PID: {pid}, RSS: {initial_rss} kB")
+    log("Sampling every 60s. Press Ctrl-C to stop and see results.")
+    log("Will also query status and reload periodically to exercise the daemon.\n")
+
+    samples = [(time.time(), initial_rss)]
+    interval = 60
+    iteration = 0
+
+    try:
+        while True:
+            time.sleep(interval)
+            iteration += 1
+
+            # Check daemon is still alive
+            current_pid = get_pid()
+            if current_pid is None:
+                log("DAEMON DIED! Soak test aborted.")
+                test("daemon survived soak", False, detail=f"died after {iteration} iterations")
+                break
+            if current_pid != pid:
+                log(f"PID changed: {pid} -> {current_pid} (daemon restarted?)")
+                pid = current_pid
+
+            rss = get_rss_kb(pid)
+            if rss is None:
+                log(f"  [{iteration}] Could not read RSS")
+                continue
+
+            samples.append((time.time(), rss))
+            delta = rss - initial_rss
+            elapsed_min = (samples[-1][0] - samples[0][0]) / 60
+            log(f"  [{iteration}] RSS: {rss} kB (delta: {delta:+d} kB, "
+                f"elapsed: {elapsed_min:.0f}m)")
+
+            # Periodically exercise the daemon
+            if iteration % 5 == 0:
+                try:
+                    nopal_status()
+                    log(f"  [{iteration}] Status query OK")
+                except RuntimeError:
+                    log(f"  [{iteration}] Status query FAILED")
+
+            if iteration % 15 == 0:
+                try:
+                    run("nopal reload", check=False)
+                    log(f"  [{iteration}] Reload OK")
+                except RuntimeError:
+                    log(f"  [{iteration}] Reload FAILED")
+
+            # Check for error logs
+            errors = check_logs_for_errors()
+            if errors:
+                log(f"  [{iteration}] {len(errors)} error-level log messages")
+
+    except KeyboardInterrupt:
+        log("\nSoak interrupted by user.")
+
+    if len(samples) >= 2:
+        final_rss = samples[-1][1]
+        growth = final_rss - initial_rss
+        elapsed_min = (samples[-1][0] - samples[0][0]) / 60
+        log(f"\nSoak results:")
+        log(f"  Duration: {elapsed_min:.0f} minutes, {len(samples)} samples")
+        log(f"  Initial RSS: {initial_rss} kB")
+        log(f"  Final RSS:   {final_rss} kB")
+        log(f"  Growth:      {growth:+d} kB")
+
+        # Pass if growth < 100 kB (per issue #81)
+        test("memory growth < 100 kB", growth < 100,
+             detail=f"grew {growth} kB over {elapsed_min:.0f}m")
+    else:
+        log("Not enough samples for analysis")
+        test("soak ran long enough", False, detail="need at least 2 samples")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -505,15 +741,17 @@ def main():
     parser = argparse.ArgumentParser(description="nopal hardware test harness")
     parser.add_argument(
         "--phase", default="all",
-        help="Phase to run: 1, 2, 3, 4, 4wait, 5, or all"
+        help="Phase to run: 1, 2, 3, 4, 4wait, 5, 6, soak, or all"
     )
     args = parser.parse_args()
 
     print(f"nopal hardware test harness")
     try:
-        print(f"device: {os.uname().machine}")
+        machine = os.uname().machine
+        print(f"device: {machine}")
     except Exception:
-        print("device: unknown")
+        machine = "unknown"
+        print(f"device: {machine}")
 
     phases = {
         "1": phase1,
@@ -522,10 +760,12 @@ def main():
         "4": phase4,
         "4wait": phase4_wait,
         "5": phase5,
+        "6": phase6,
+        "soak": phase_soak,
     }
 
     if args.phase == "all":
-        for p in ["1", "2", "3", "4", "5"]:
+        for p in ["1", "2", "3", "4", "5", "6"]:
             try:
                 phases[p]()
             except Exception as e:
