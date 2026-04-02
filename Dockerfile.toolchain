@@ -17,10 +17,11 @@
 FROM opensuse/tumbleweed:latest
 
 # Build tools
-RUN zypper --non-interactive install \
+RUN zypper --non-interactive refresh \
+    && zypper --non-interactive install \
     clang lld llvm \
     cmake ninja \
-    git make curl tar xz gzip bzip2 which \
+    git make curl tar xz gzip bzip2 which findutils rsync \
     mbedtls-devel \
     && zypper clean --all
 
