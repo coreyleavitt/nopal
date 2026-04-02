@@ -35,9 +35,9 @@ jobs:
 
       - name: Build APK
         run: |
-          # Normalize version for APK (e.g. 0.1.0a1 -> 0.1.0_alpha1)
+          # Normalize version for APK (e.g. 0.2.0-alpha.1 -> 0.2.0_alpha1)
           VERSION=$(echo "${{ inputs.version }}" | sed -E \
-            's/a([0-9]+)/_alpha\1/; s/b([0-9]+)/_beta\1/; s/rc([0-9]+)/_rc\1/')
+            's/-(alpha|beta|rc)\.([0-9]+)/_\1\2/')
           RELEASE="${{ inputs.pkg_release }}"
           ARCH="${{ matrix.openwrt_arch }}"
 

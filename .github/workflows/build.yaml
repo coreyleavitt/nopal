@@ -1,37 +1,150 @@
-name: Build
+name: Release
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version (e.g. 0.1.0)"
+      bump:
+        description: 'Version bump type (use "none" to only increment prerelease number)'
         required: true
-      pkg_release:
-        description: "Package release number"
-        default: "1"
-  push:
-    tags: ["v*"]
+        type: choice
+        options:
+          - none
+          - patch
+          - minor
+          - major
+          - stable
+      prerelease:
+        description: 'Prerelease label (or none for stable release)'
+        required: true
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - alpha
+          - beta
+          - rc
+
+permissions:
+  contents: write
 
 jobs:
-  resolve-version:
+  prepare-version:
+    name: Prepare version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.v.outputs.version }}
-      pkg_release: ${{ steps.v.outputs.pkg_release }}
+      version: ${{ steps.version.outputs.version }}
+      commit_sha: ${{ steps.version.outputs.commit_sha }}
     steps:
-      - name: Determine version
-        id: v
+      - uses: actions/checkout@v4
+
+      - name: Compute and apply version
+        id: version
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-            echo "pkg_release=${{ inputs.pkg_release }}" >> "$GITHUB_OUTPUT"
-          else
-            TAG="${{ github.ref_name }}"
-            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-            echo "pkg_release=1" >> "$GITHUB_OUTPUT"
+          BUMP="${{ inputs.bump }}"
+          PRERELEASE="${{ inputs.prerelease }}"
+
+          # Read current version from nopal.nimble.
+          CURRENT=$(grep '^version' nopal.nimble | head -1 | sed 's/version *= *"\(.*\)"/\1/')
+          echo "Current version: $CURRENT"
+
+          # Parse current version.
+          BASE=$(echo "$CURRENT" | sed 's/-.*//')
+          MAJOR=$(echo "$BASE" | cut -d. -f1)
+          MINOR=$(echo "$BASE" | cut -d. -f2)
+          PATCH=$(echo "$BASE" | cut -d. -f3)
+          CURRENT_PRE_TYPE=$(echo "$CURRENT" | sed -n 's/.*-\([a-z]*\)\.\([0-9]*\)$/\1/p')
+          CURRENT_PRE_NUM=$(echo "$CURRENT" | sed -n 's/.*-\([a-z]*\)\.\([0-9]*\)$/\2/p')
+
+          # Validate inputs.
+          if [ "$BUMP" = "none" ] && [ "$PRERELEASE" = "no" ]; then
+            echo "::error::bump=none requires a prerelease label"
+            exit 1
+          fi
+          if [ "$BUMP" = "stable" ] && [ -z "$CURRENT_PRE_TYPE" ]; then
+            echo "::error::bump=stable requires a current prerelease version"
+            exit 1
           fi
 
+          # Apply version bump.
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+            stable|none) ;; # keep base version as-is
+          esac
+
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+
+          # Apply prerelease suffix.
+          if [ "$BUMP" = "stable" ] || [ "$PRERELEASE" = "no" ]; then
+            : # stable release, no suffix
+          elif [ "$BUMP" = "none" ] && [ "$CURRENT_PRE_TYPE" = "$PRERELEASE" ]; then
+            # Same prerelease type, just increment the number.
+            PRE_NUM=$((${CURRENT_PRE_NUM:-0} + 1))
+            VERSION="${VERSION}-${PRERELEASE}.${PRE_NUM}"
+          else
+            # New prerelease series.
+            VERSION="${VERSION}-${PRERELEASE}.1"
+          fi
+
+          echo "New version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Update all version sources.
+          sed -i "0,/^version .*/s//version       = \"$VERSION\"/" nopal.nimble
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VERSION/" openwrt/Makefile
+          sed -i "s/Version = \".*\"/Version = \"$VERSION\"/" src/nopal.nim
+          sed -i "s/version: \".*\",/version: \"$VERSION\",/" src/ipc/methods.nim
+
+          # Commit via GitHub API (signed).
+          make_blob() {
+            base64 -w 0 "$1" | jq -Rs '{content: ., encoding: "base64"}' | \
+              gh api repos/${{ github.repository }}/git/blobs --input - --jq '.sha'
+          }
+
+          NIMBLE_BLOB=$(make_blob nopal.nimble)
+          MAKEFILE_BLOB=$(make_blob openwrt/Makefile)
+          NOPAL_BLOB=$(make_blob src/nopal.nim)
+          METHODS_BLOB=$(make_blob src/ipc/methods.nim)
+
+          TREE_SHA=$(gh api repos/${{ github.repository }}/git/trees \
+            --input <(jq -n \
+              --arg base "${{ github.sha }}" \
+              --arg nimble "$NIMBLE_BLOB" \
+              --arg makefile "$MAKEFILE_BLOB" \
+              --arg nopal "$NOPAL_BLOB" \
+              --arg methods "$METHODS_BLOB" \
+              '{base_tree: $base, tree: [
+                {path: "nopal.nimble", mode: "100644", type: "blob", sha: $nimble},
+                {path: "openwrt/Makefile", mode: "100644", type: "blob", sha: $makefile},
+                {path: "src/nopal.nim", mode: "100644", type: "blob", sha: $nopal},
+                {path: "src/ipc/methods.nim", mode: "100644", type: "blob", sha: $methods}
+              ]}') \
+            --jq '.sha')
+
+          COMMIT_SHA=$(gh api repos/${{ github.repository }}/git/commits \
+            -f message="Release v${VERSION}" \
+            -f tree="$TREE_SHA" \
+            -f "parents[]=${{ github.sha }}" \
+            --jq '.sha')
+
+          # Update branch ref.
+          gh api repos/${{ github.repository }}/git/refs/heads/${{ github.ref_name }} \
+            -X PATCH \
+            -f sha="$COMMIT_SHA"
+
+          # Create tag.
+          gh api repos/${{ github.repository }}/git/refs \
+            -f ref="refs/tags/v${VERSION}" \
+            -f sha="$COMMIT_SHA"
+
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   compile:
+    name: Build (${{ matrix.openwrt_arch }})
+    needs: prepare-version
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/coreyleavitt/nopal-toolchain:latest
@@ -49,6 +162,8 @@ jobs:
             nim_target: mipsel
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-version.outputs.commit_sha }}
 
       - name: Cross-compile nopal
         run: nim c -d:release -d:https -d:${{ matrix.nim_target }} src/nopal.nim
@@ -65,24 +180,23 @@ jobs:
           path: nopald
 
   package-ipk:
-    needs: [resolve-version, compile]
+    needs: [prepare-version, compile]
     uses: ./.github/workflows/package-ipk.yaml
     with:
-      version: ${{ needs.resolve-version.outputs.version }}
-      pkg_release: ${{ needs.resolve-version.outputs.pkg_release }}
+      version: ${{ needs.prepare-version.outputs.version }}
+      pkg_release: "1"
 
   package-apk:
-    needs: [resolve-version, compile]
+    needs: [prepare-version, compile]
     uses: ./.github/workflows/package-apk.yaml
     with:
-      version: ${{ needs.resolve-version.outputs.version }}
-      pkg_release: ${{ needs.resolve-version.outputs.pkg_release }}
+      version: ${{ needs.prepare-version.outputs.version }}
+      pkg_release: "1"
 
   release:
-    needs: [resolve-version, compile, package-ipk, package-apk]
+    name: Create release
+    needs: [prepare-version, compile, package-ipk, package-apk]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -104,9 +218,13 @@ jobs:
           done
           cd release && sha256sum * > SHA256SUMS
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.resolve-version.outputs.version }}
-          files: release/*
-          generate_release_notes: true
+      - name: Create GitHub release
+        run: |
+          VERSION="${{ needs.prepare-version.outputs.version }}"
+          if echo "$VERSION" | grep -qE '\-(alpha|beta|rc)\.'; then
+            gh release create "v$VERSION" release/* --repo ${{ github.repository }} --generate-notes --prerelease
+          else
+            gh release create "v$VERSION" release/* --repo ${{ github.repository }} --generate-notes
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
