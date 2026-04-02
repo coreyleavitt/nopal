@@ -150,6 +150,7 @@ type
 
   ProbeEngine* = object
     probes: seq[InterfaceProbe]
+    invalidFdInterfaces*: seq[string]  ## interfaces skipped by getFds due to fd < 0
 
 # ===================================================================
 # QualityWindow on InterfaceProbe — helper
@@ -482,12 +483,19 @@ proc recordTimeout*(engine: var ProbeEngine, index: int): Option[ProbeResult] =
   ))
 
 proc getFds*(engine: ProbeEngine): seq[tuple[slot: int, fd: cint]] =
+  ## Collect all valid file descriptors from all probes for selector
+  ## registration. Skips any transport with uninitialized fd (< 0)
+  ## and records the interface name in `invalidFdInterfaces`.
   var res: seq[tuple[slot: int, fd: cint]] = @[]
   var slot = 0
+  engine.invalidFdInterfaces.setLen(0)
   for p in engine.probes:
     let fds = dispatchGetFds(p.transport)
     for fd in fds:
-      res.add((slot: slot, fd: fd))
+      if fd < 0:
+        engine.invalidFdInterfaces.add(p.name)
+      else:
+        res.add((slot: slot, fd: fd))
       inc slot
   res
 
@@ -1155,6 +1163,43 @@ when isMainModule:
       engine.simulateResponseWithRtt(0, 99)
       discard engine.recordTimeout(0)
     doAssert not engine.probes[0].qualityDegraded
+
+  echo ""
+  echo "=== Transport fd safety tests ==="
+
+  test "getFds_filters_uninitialized_fd":
+    # getFds must skip transports with fd=-1 and record them.
+    # This catches the production bug where makeProbeTransport created
+    # ProbeTransport objects without calling createXxxSocket.
+    var engine = initProbeEngine()
+    engine.addTestInterface(0, "wan", 1, 1)
+    # addTestInterface uses fd=-1 intentionally for simulation
+    let fds = engine.getFds()
+    doAssert fds.len == 0, "getFds must not return fd=-1 entries"
+    doAssert engine.invalidFdInterfaces.len == 1,
+      "getFds must record invalid fd interfaces"
+    doAssert engine.invalidFdInterfaces[0] == "wan"
+
+  test "dispatchGetFds_returns_stored_fd":
+    # dispatchGetFds must return the exact fd stored in each transport kind.
+    let t1 = ProbeTransport(kind: tkIcmp, icmpFd: 42.cint, icmpFamily: 2)
+    doAssert dispatchGetFds(t1) == @[42.cint], "ICMP fd not surfaced"
+
+    let t2 = ProbeTransport(kind: tkDns, dnsFd: 43.cint, dnsFamily: 2,
+                             dnsQueryLen: 0)
+    doAssert dispatchGetFds(t2) == @[43.cint], "DNS fd not surfaced"
+
+    let t3 = ProbeTransport(kind: tkHttp, httpFd: 44.cint, httpFamily: 2,
+                             httpDevice: "", httpPort: 80,
+                             httpState: hsIdle)
+    doAssert dispatchGetFds(t3) == @[44.cint], "HTTP fd not surfaced"
+
+    let t4 = ProbeTransport(kind: tkArp, arpFd: 45.cint, arpIfindex: 3)
+    doAssert dispatchGetFds(t4) == @[45.cint], "ARP fd not surfaced"
+
+    let t5 = ProbeTransport(kind: tkHttps, httpsFamily: 2,
+                             httpsDevice: "", httpsPort: 443)
+    doAssert dispatchGetFds(t5) == @[], "HTTPS should return no fds"
 
   echo ""
   echo "=== Results ==="

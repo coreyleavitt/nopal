@@ -1019,6 +1019,8 @@ proc initializeInterfaces(d: var Daemon) =
   # Register probe socket fds with selector
   for (slot, fd) in d.probeEngine.getFds():
     d.selector.registerHandle(fd.int, {Read}, ProbeTokenBase + slot)
+  for name in d.probeEngine.invalidFdInterfaces:
+    error fmt"probe socket creation failed for interface '{name}' — probes will not work"
 
   # Set up routes and DNS for initial_state=online interfaces
   for index in onlineIndices:
@@ -1213,6 +1215,8 @@ proc handleReload(d: var Daemon) =
   # Register new probe sockets with selector
   for (slot, fd) in d.probeEngine.getFds():
     d.selector.registerHandle(fd.int, {Read}, ProbeTokenBase + slot)
+  for name in d.probeEngine.invalidFdInterfaces:
+    error fmt"probe socket creation failed for interface '{name}' — probes will not work"
 
   # Restore routes and DNS for Online and Degraded interfaces
   var restoreIndices: seq[int]
