@@ -39,13 +39,17 @@ RUN nimble install -y https://github.com/coreyleavitt/nim-mbedtls
 # Build musl sysroots + compiler-rt builtins for all 4 targets
 ARG MUSL_VERSION=1.2.5
 ARG LLVM_VERSION=19.1.7
+ARG KERNEL_VERSION=6.12.74
+ENV KERNEL_VERSION=${KERNEL_VERSION}
 
 # Download sources once
 RUN cd /tmp \
     && curl -LO "https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz" \
     && curl -LO "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" \
+    && curl -LO "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz" \
     && tar xf "musl-${MUSL_VERSION}.tar.gz" \
-    && tar xf "llvm-project-${LLVM_VERSION}.src.tar.xz"
+    && tar xf "llvm-project-${LLVM_VERSION}.src.tar.xz" \
+    && tar xf "linux-${KERNEL_VERSION}.tar.xz"
 
 # Helper script to build musl sysroot + compiler-rt for one target
 COPY scripts/build-target.sh /tmp/build-target.sh
@@ -58,7 +62,7 @@ RUN /tmp/build-target.sh mips-linux-musl /opt/musl/mips "" "-march=mips32r2 -mso
 RUN /tmp/build-target.sh mipsel-linux-musl /opt/musl/mipsel "" "-march=mips32r2 -msoft-float"
 
 # Clean up source downloads (~1.5GB)
-RUN rm -rf /tmp/musl-* /tmp/llvm-project-* /tmp/build-target.sh
+RUN rm -rf /tmp/musl-* /tmp/llvm-project-* /tmp/linux-* /tmp/build-target.sh
 
 # Verify everything is in place
 RUN clang --version | head -1 \
