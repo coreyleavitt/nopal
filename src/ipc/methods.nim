@@ -62,7 +62,7 @@ proc buildStatus(view: DaemonView): DaemonStatus =
     ))
 
   DaemonStatus(
-    version: "0.1.0",
+    version: "0.1.0-alpha.1",
     uptimeSecs: uptime,
     interfaces: ifaces,
     policies: pols,
