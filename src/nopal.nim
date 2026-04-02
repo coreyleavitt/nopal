@@ -203,7 +203,7 @@ proc printInterfaceTable(interfaces: JsonNode) =
     let state = iface{"state"}.getStr("-")
     let enabled = if iface{"enabled"}.getBool(false): "yes" else: "no"
     let rttVal = iface{"avg_rtt_ms"}
-    let rtt = if rttVal.kind != JNull: fmt"{rttVal.getFloat()}ms" else: "-"
+    let rtt = if rttVal != nil and rttVal.kind != JNull: fmt"{rttVal.getFloat()}ms" else: "-"
     let lossVal = iface{"loss_percent"}.getInt(0)
     let loss = fmt"{lossVal}%"
     let successes = iface{"success_count"}.getInt(0)
@@ -232,7 +232,7 @@ proc printInterfaceDetail(iface: JsonNode) =
   echo fmt"  Mark:      0x{mark}"
   echo fmt"  Table:     {tableId}"
   let rttVal = iface{"avg_rtt_ms"}
-  let rtt = if rttVal.kind != JNull: fmt"{rttVal.getFloat()}ms" else: "-"
+  let rtt = if rttVal != nil and rttVal.kind != JNull: fmt"{rttVal.getFloat()}ms" else: "-"
   let lossVal = iface{"loss_percent"}.getInt(0)
   let okCount = iface{"success_count"}.getInt(0)
   let failCount = iface{"fail_count"}.getInt(0)
@@ -247,12 +247,13 @@ proc printPolicyTable(policies: JsonNode) =
 
   for policy in policies:
     let name = policy{"name"}.getStr("-")
-    let tier = if policy{"active_tier"}.kind != JNull:
-                 $policy{"active_tier"}.getInt()
+    let tierVal = policy{"active_tier"}
+    let tier = if tierVal != nil and tierVal.kind != JNull:
+                 $tierVal.getInt()
                else:
                  "-"
     let members = policy{"active_members"}
-    let membersStr = if members.kind == JArray and members.len > 0:
+    let membersStr = if members != nil and members.kind == JArray and members.len > 0:
                        var parts: seq[string] = @[]
                        for m in members:
                          parts.add m.getStr()
@@ -298,7 +299,7 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
   echo ""
 
   let interfaces = resp.data{"interfaces"}
-  if interfaces.kind != JArray or interfaces.len == 0:
+  if interfaces == nil or interfaces.kind != JArray or interfaces.len == 0:
     echo "No interfaces configured."
   else:
     echo "Interfaces:"
@@ -307,7 +308,7 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
   echo ""
 
   let policies = resp.data{"policies"}
-  if policies.kind != JArray or policies.len == 0:
+  if policies == nil or policies.kind != JArray or policies.len == 0:
     echo "No policies configured."
   else:
     echo "Policies:"
@@ -322,10 +323,10 @@ proc cliInterfaces(socketPath: string, jsonMode: bool) =
 
   let interfaces = resp.data{"interfaces"}
   if jsonMode:
-    echo interfaces.pretty()
+    if interfaces != nil: echo interfaces.pretty()
     return
 
-  if interfaces.kind != JArray or interfaces.len == 0:
+  if interfaces == nil or interfaces.kind != JArray or interfaces.len == 0:
     echo "No interfaces configured."
   else:
     printInterfaceTable(interfaces)
@@ -339,10 +340,10 @@ proc cliPolicies(socketPath: string, jsonMode: bool) =
 
   let policies = resp.data{"policies"}
   if jsonMode:
-    echo policies.pretty()
+    if policies != nil: echo policies.pretty()
     return
 
-  if policies.kind != JArray or policies.len == 0:
+  if policies == nil or policies.kind != JArray or policies.len == 0:
     echo "No policies configured."
   else:
     printPolicyTable(policies)
@@ -360,7 +361,7 @@ proc cliConnected(socketPath: string, jsonMode: bool) =
 
   echo "Connected networks (bypassed from policy routing):"
   let networks = resp.data{"networks"}
-  if networks.kind == JArray:
+  if networks != nil and networks.kind == JArray:
     for net in networks:
       echo fmt"  {net.getStr()}"
 
