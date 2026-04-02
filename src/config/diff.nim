@@ -168,3 +168,30 @@ when isMainModule:
       check d.routingChanged
       check not d.needsFullRebuild
       check d.needsNftables
+
+    test "unchanged interface preserves state on reload":
+      # When an interface exists in both old and new configs with same settings,
+      # it should NOT appear in addedInterfaces, removedInterfaces, or
+      # changedInterfaces — meaning the daemon preserves its tracker state
+      # (including Degraded) without interruption.
+      var a = minimalConfig()
+      a.interfaces.add(testInterface("wan"))
+      var b = minimalConfig()
+      b.interfaces.add(testInterface("wan"))
+      let d = diff(a, b)
+      check not d.changed  # identical configs
+
+    test "changed threshold triggers interface change":
+      # Changing quality thresholds on an interface marks it as changed.
+      # The daemon will rebuild its probe engine, resetting the quality window.
+      var a = minimalConfig()
+      a.interfaces.add(testInterface("wan"))
+      var b = minimalConfig()
+      var wan = testInterface("wan")
+      wan.latencyThreshold = 200
+      b.interfaces.add(wan)
+      let d = diff(a, b)
+      check d.changed
+      check d.changedInterfaces == @["wan"]
+      check d.addedInterfaces.len == 0
+      check d.removedInterfaces.len == 0

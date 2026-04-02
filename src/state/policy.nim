@@ -93,13 +93,17 @@ when isMainModule:
     result = MemberConfig(name: name, metric: metric, weight: weight)
     result.interfaceName = iface
 
-  proc makeTracker(name: string, index: int, mark: uint32, online: bool): InterfaceTracker =
+  proc makeTracker(name: string, index: int, mark: uint32,
+                   state: InterfaceState = isInit): InterfaceTracker =
     let devIdx = index + 2
     var t = newTracker(name, index, mark, 100 + index.uint32,
                        fmt"eth0.{devIdx}", 3, 5)
-    if online:
-      t.state = isOnline
+    t.state = state
     t
+
+  # Backwards compat for existing tests
+  proc makeOnlineTracker(name: string, index: int, mark: uint32, online: bool): InterfaceTracker =
+    makeTracker(name, index, mark, if online: isOnline else: isInit)
 
   suite "policy resolution":
     test "balanced both online":
@@ -113,8 +117,8 @@ when isMainModule:
         makeMember("wanb_m1_w50", "wanb", 1, 50),
       ]
       let trackers = @[
-        makeTracker("wan", 0, 0x0100, true),
-        makeTracker("wanb", 1, 0x0200, true),
+        makeOnlineTracker("wan", 0, 0x0100, true),
+        makeOnlineTracker("wanb", 1, 0x0200, true),
       ]
 
       let resolved = resolvePolicy(policy, members, trackers)
@@ -133,8 +137,8 @@ when isMainModule:
         makeMember("wanb_m2", "wanb", 2, 100),
       ]
       let trackers = @[
-        makeTracker("wan", 0, 0x0100, false),   # offline
-        makeTracker("wanb", 1, 0x0200, true),   # online
+        makeOnlineTracker("wan", 0, 0x0100, false),   # offline
+        makeOnlineTracker("wanb", 1, 0x0200, true),   # online
       ]
 
       let resolved = resolvePolicy(policy, members, trackers)
@@ -154,9 +158,92 @@ when isMainModule:
         makeMember("wan_m", "wan", 1, 50),
       ]
       let trackers = @[
-        makeTracker("wan", 0, 0x0100, false),
+        makeOnlineTracker("wan", 0, 0x0100, false),
       ]
 
       let resolved = resolvePolicy(policy, members, trackers)
       check resolved.isEmpty
       check resolved.lastResort == lrUnreachable
+
+    test "degraded interface included in policy":
+      # Core promise: degraded interfaces stay in the routing policy
+      let policy = PolicyConfig(
+        name: "balanced",
+        members: @["wan_m", "wanb_m"],
+        lastResort: lrDefault,
+      )
+      let members = @[
+        makeMember("wan_m", "wan", 1, 50),
+        makeMember("wanb_m", "wanb", 1, 50),
+      ]
+      let trackers = @[
+        makeTracker("wan", 0, 0x0100, isOnline),
+        makeTracker("wanb", 1, 0x0200, isDegraded),
+      ]
+
+      let resolved = resolvePolicy(policy, members, trackers)
+      check resolved.tiers.len == 1
+      check resolved.tiers[0].members.len == 2  # both included
+      check resolved.activeTotalWeight == 100
+
+    test "degraded with online alternative both in same tier":
+      # Degraded doesn't get demoted to a lower tier
+      let policy = PolicyConfig(
+        name: "failover",
+        members: @["wan_m1", "wanb_m1"],
+        lastResort: lrDefault,
+      )
+      let members = @[
+        makeMember("wan_m1", "wan", 1, 100),
+        makeMember("wanb_m1", "wanb", 1, 100),
+      ]
+      let trackers = @[
+        makeTracker("wan", 0, 0x0100, isOnline),
+        makeTracker("wanb", 1, 0x0200, isDegraded),
+      ]
+
+      let resolved = resolvePolicy(policy, members, trackers)
+      check resolved.tiers.len == 1
+      check resolved.tiers[0].members.len == 2
+      # Both at metric 1, degraded doesn't change tier placement
+      check resolved.tiers[0].metric == 1
+
+    test "only degraded no online":
+      # All interfaces degraded — policy still works
+      let policy = PolicyConfig(
+        name: "balanced",
+        members: @["wan_m"],
+        lastResort: lrDefault,
+      )
+      let members = @[
+        makeMember("wan_m", "wan", 1, 50),
+      ]
+      let trackers = @[
+        makeTracker("wan", 0, 0x0100, isDegraded),
+      ]
+
+      let resolved = resolvePolicy(policy, members, trackers)
+      check resolved.hasActiveTier
+      check resolved.tiers[0].members.len == 1
+      check resolved.tiers[0].members[0].interfaceName == "wan"
+
+    test "degraded excluded when offline":
+      # Offline is not active — only degraded and online count
+      let policy = PolicyConfig(
+        name: "balanced",
+        members: @["wan_m", "wanb_m"],
+        lastResort: lrDefault,
+      )
+      let members = @[
+        makeMember("wan_m", "wan", 1, 50),
+        makeMember("wanb_m", "wanb", 1, 50),
+      ]
+      let trackers = @[
+        makeTracker("wan", 0, 0x0100, isDegraded),
+        makeTracker("wanb", 1, 0x0200, isOffline),
+      ]
+
+      let resolved = resolvePolicy(policy, members, trackers)
+      check resolved.tiers.len == 1
+      check resolved.tiers[0].members.len == 1  # only degraded, not offline
+      check resolved.tiers[0].members[0].interfaceName == "wan"
