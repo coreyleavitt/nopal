@@ -11,7 +11,7 @@ import logging
 import std/[osproc, strtabs, algorithm]
 
 const
-  Version = "0.1.0-alpha.4"
+  Version = "0.1.0-alpha.5"
   DefaultConfig = "/etc/config/nopal"
   DefaultSocket = "/var/run/nopal.sock"
 
