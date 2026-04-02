@@ -7,12 +7,12 @@
 ## cycle evaluated after all targets have been probed. A cycle succeeds when
 ## at least `reliability` targets respond.
 
-import std/[options, times, deques, monotimes, strutils]
-
-# ---------------------------------------------------------------------------
-# Forward-declared stub types from Phase 2 transport modules.
-# In production these come from icmp.nim, dns.nim, http.nim, arp.nim.
-# ---------------------------------------------------------------------------
+import std/[options, times, deques, monotimes, strutils, posix]
+import ../linux_constants
+import ./icmp
+import ./dns
+import ./http
+import ./arp
 
 type
   HttpProbeState* = enum
@@ -217,23 +217,34 @@ proc dispatchSend*(transport: var ProbeTransport, target: array[16, byte],
                    isV6: bool, seqNum: uint16, id: uint16,
                    payloadSize: int): bool =
   ## Send a probe via the appropriate transport. Returns true on success.
-  ## In production, this calls the Phase 2 module procs.
+  let family = if isV6: uint8(10) else: uint8(2)  # AF_INET6 / AF_INET
   case transport.kind
   of tkIcmp:
-    # Would call: sendIcmpProbe(transport.icmpFd, target, seqNum, id, payloadSize)
-    return false  # stub — real impl in icmp.nim
+    var buf: array[1500, byte]
+    let typ = if isV6: ICMPV6_ECHO_REQUEST else: ICMP_ECHO_REQUEST
+    let pktLen = buildIcmpPacket(buf, typ, 0, id, seqNum, payloadSize)
+    return sendIcmpProbe(transport.icmpFd, target, family,
+                         buf.toOpenArray(0, pktLen - 1), pktLen)
   of tkDns:
-    # Would call: sendDnsProbe(transport.dnsFd, target, transport.dnsQueryBuf, transport.dnsQueryLen)
-    return false
+    return sendDnsProbe(transport.dnsFd, target, family, seqNum,
+                        transport.dnsQueryBuf, transport.dnsQueryLen)
   of tkHttp:
-    # Would call: startHttpConnect(transport.httpFd, target, transport.httpPort)
-    return false
+    let ok = startHttpConnect(transport.httpFd, target, family,
+                              transport.httpPort)
+    if ok: transport.httpState = hsConnecting
+    return ok
   of tkHttps:
-    # Would call: startHttpsConnect(state, target, family, seqNum)
-    return false
+    return false  # HTTPS uses separate state machine
   of tkArp:
-    # Would call: sendArpProbe(transport.arpFd, target, transport.arpIfindex, ...)
-    return false
+    var pkt: ArpPacket
+    var targetIp: array[4, byte]
+    copyMem(addr targetIp[0], unsafeAddr target[0], 4)
+    buildArpRequest(pkt,
+      ArpProbeState(ifindex: transport.arpIfindex,
+                    senderMac: transport.arpSenderMac,
+                    senderIp: transport.arpSenderIp),
+      targetIp)
+    return sendArpProbe(transport.arpFd, pkt, transport.arpIfindex)
   of tkComposite:
     var anyOk = false
     for sub in transport.subs.mitems:
@@ -245,14 +256,35 @@ proc dispatchRecv*(transport: var ProbeTransport): Option[tuple[seqNum: uint16, 
   ## Non-blocking receive. Returns (seq, id) on match, none otherwise.
   case transport.kind
   of tkIcmp:
+    var buf: array[1500, byte]
+    let (ok, id, seq) = recvIcmpReply(transport.icmpFd, buf)
+    if ok: return some((seqNum: seq, id: id))
     return none(tuple[seqNum: uint16, id: uint16])
   of tkDns:
+    var buf: array[512, byte]
+    let (ok, txid) = recvDnsReply(transport.dnsFd, buf)
+    if ok: return some((seqNum: txid, id: 0'u16))
     return none(tuple[seqNum: uint16, id: uint16])
   of tkHttp:
+    if transport.httpState == hsConnecting:
+      if checkHttpConnect(transport.httpFd):
+        transport.httpState = hsSending
+        if sendHttpHead(transport.httpFd):
+          transport.httpState = hsReceiving
+    if transport.httpState == hsReceiving:
+      var buf: array[512, byte]
+      if recvHttpResponse(transport.httpFd, buf):
+        transport.httpState = hsIdle
+        return some((seqNum: 0'u16, id: 0'u16))
     return none(tuple[seqNum: uint16, id: uint16])
   of tkHttps:
     return none(tuple[seqNum: uint16, id: uint16])
   of tkArp:
+    var buf: array[64, byte]
+    var targetIp: array[4, byte]
+    copyMem(addr targetIp[0], addr transport.arpSenderIp[0], 4)
+    if recvArpReply(transport.arpFd, buf, targetIp):
+      return some((seqNum: 0'u16, id: 0'u16))
     return none(tuple[seqNum: uint16, id: uint16])
   of tkComposite:
     for sub in transport.subs.mitems:
@@ -278,11 +310,19 @@ proc dispatchGetFds*(transport: ProbeTransport): seq[cint] =
 proc dispatchClose*(transport: var ProbeTransport) =
   ## Close file descriptors held by the transport.
   case transport.kind
-  of tkIcmp: discard  # Would call: close(transport.icmpFd)
-  of tkDns: discard
-  of tkHttp: discard
-  of tkHttps: discard  # Would call: closeHttpsConn
-  of tkArp: discard
+  of tkIcmp:
+    if transport.icmpFd >= 0: discard posix.close(transport.icmpFd)
+    transport.icmpFd = -1
+  of tkDns:
+    if transport.dnsFd >= 0: discard posix.close(transport.dnsFd)
+    transport.dnsFd = -1
+  of tkHttp:
+    if transport.httpFd >= 0: discard posix.close(transport.httpFd)
+    transport.httpFd = -1
+  of tkHttps: discard  # HTTPS cleanup handled separately
+  of tkArp:
+    if transport.arpFd >= 0: discard posix.close(transport.arpFd)
+    transport.arpFd = -1
   of tkComposite:
     for sub in transport.subs.mitems:
       dispatchClose(sub)

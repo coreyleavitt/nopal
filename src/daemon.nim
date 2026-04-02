@@ -295,8 +295,11 @@ proc makeProbeTransport(cfg: InterfaceConfig): ProbeTransport =
       of afIpv6: uint8(10)
       of afBoth: uint8(2)
     let fd = createDnsSocket(cfg.device, family)
+    var queryBuf: array[512, byte]
+    let queryName = if cfg.dnsQueryName.len > 0: cfg.dnsQueryName else: "example.com"
+    let queryLen = encodeDnsQuery(queryName, queryBuf)
     ProbeTransport(kind: tkDns, dnsFd: fd, dnsFamily: family,
-                   dnsQueryLen: 0)
+                   dnsQueryBuf: queryBuf, dnsQueryLen: queryLen)
   of tmHttp, tmHttps:
     let family = case cfg.family
       of afIpv4: uint8(2)
