@@ -142,6 +142,42 @@ when isMainModule:
       check not resp.success
       check "unknown method" in resp.error
 
+    test "status reports degraded state with quality metrics":
+      var trackers = @[newTracker("wan", 0, 0x100, 101, "eth0", 3, 5)]
+      trackers[0].state = isDegraded
+      trackers[0].avgRttMs = some(150'u32)
+      trackers[0].lossPercent = 30
+      trackers[0].successCount = 7
+      trackers[0].failCount = 3
+      let config = NopalConfig(
+        globals: defaultGlobals(),
+        policies: @[PolicyConfig(name: "balanced",
+                                  members: @["wan_m"],
+                                  lastResort: lrDefault)],
+        members: @[MemberConfig(name: "wan_m", interfaceName: "wan",
+                                 metric: 1, weight: 50)],
+      )
+      var connected: seq[string] = @[]
+      let view = DaemonView(
+        trackers: addr trackers,
+        config: unsafeAddr config,
+        startTime: getMonoTime(),
+        connectedNetworks: addr connected,
+      )
+      let req = IpcRequest(id: 1, rpcMethod: "status")
+      let (resp, action) = dispatch(req, view)
+      check resp.success
+      let iface = resp.data["interfaces"][0]
+      check iface["state"].getStr == "degraded"
+      check iface["avg_rtt_ms"].getInt == 150
+      check iface["loss_percent"].getInt == 30
+      check iface["success_count"].getInt == 7
+      check iface["fail_count"].getInt == 3
+      # Degraded interface should be in active policy members
+      let pol = resp.data["policies"][0]
+      check pol["active_members"].len == 1
+      check pol["active_members"][0].getStr == "wan"
+
     test "dispatch config.reload sets action":
       var trackers: seq[InterfaceTracker] = @[]
       let config = NopalConfig(globals: defaultGlobals())
