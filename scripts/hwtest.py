@@ -57,6 +57,8 @@ def run(cmd, check=True, capture=True, timeout=60):
         r = subprocess.run(
             cmd, capture_output=capture, text=True, timeout=timeout
         )
+    except FileNotFoundError:
+        raise RuntimeError(f"command not found: {cmd[0] if isinstance(cmd, list) else cmd}")
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"command timed out ({timeout}s): {cmd}")
     if check and r.returncode != 0:
@@ -264,9 +266,12 @@ def phase1():
         target = os.readlink("/usr/sbin/nopal")
         test("nopal symlink points to nopald", "nopald" in target, detail=target)
 
-    # Check ELF architecture matches device
-    r = run("file /usr/sbin/nopald", check=False)
-    if r.returncode == 0:
+    # Check ELF architecture matches device (file command may not be available)
+    try:
+        r = run("file /usr/sbin/nopald", check=False)
+    except RuntimeError:
+        r = None
+    if r and r.returncode == 0:
         log(f"binary: {r.stdout.strip()}")
         machine = os.uname().machine
         elf_info = r.stdout.lower()
