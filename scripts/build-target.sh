@@ -13,6 +13,19 @@ CC="clang --target=$TARGET $EXTRA_CFLAGS" AR=llvm-ar RANLIB=llvm-ranlib \
 make -j$(nproc) && make install
 cd /tmp && rm -rf "musl-build-$TARGET"
 
+echo "=== Installing Linux kernel headers into sysroot ==="
+# Determine kernel ARCH from target triple
+case "$TARGET" in
+  aarch64-*)  KARCH=arm64 ;;
+  arm-*)      KARCH=arm ;;
+  mips-*)     KARCH=mips ;;
+  mipsel-*)   KARCH=mips ;;
+  *)          echo "Unknown target arch: $TARGET"; exit 1 ;;
+esac
+cd /tmp/linux-${KERNEL_VERSION}
+make ARCH=$KARCH INSTALL_HDR_PATH=$SYSROOT headers_install
+cd /tmp
+
 echo "=== Building compiler-rt builtins for $TARGET ==="
 mkdir -p "/tmp/rt-build-$TARGET" && cd "/tmp/rt-build-$TARGET"
 cmake "/tmp/llvm-project-${LLVM_VERSION}.src/compiler-rt" -G Ninja \
