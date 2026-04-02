@@ -248,6 +248,38 @@ func isValidMarkMask(mask: uint32): bool =
   let step = mask and (not mask + 1)  # lowest set bit
   mask div step >= 2
 
+proc mapTrackMethod(s: string, ifaceName: string): TrackMethod =
+  ## Map a string to TrackMethod, with mwan3 compatibility warnings.
+  case s.toLowerAscii()
+  of "ping":
+    return tmPing
+  of "dns":
+    return tmDns
+  of "http":
+    return tmHttp
+  of "https":
+    return tmHttps
+  of "arping":
+    return tmArping
+  of "composite":
+    return tmComposite
+  # mwan3 compatibility
+  of "nping-tcp":
+    warn fmt"interface '{ifaceName}': track_method 'nping-tcp' is not supported, using 'http' instead"
+    return tmHttp
+  of "nping-udp":
+    warn fmt"interface '{ifaceName}': track_method 'nping-udp' is not supported, using 'dns' instead"
+    return tmDns
+  of "nping-icmp":
+    warn fmt"interface '{ifaceName}': track_method 'nping-icmp' is not supported, using 'ping' instead"
+    return tmPing
+  of "nping-arp":
+    warn fmt"interface '{ifaceName}': track_method 'nping-arp' is not supported, using 'arping' instead"
+    return tmArping
+  else:
+    warn fmt"interface '{ifaceName}': unknown track_method '{s}', using 'ping'"
+    return tmPing
+
 proc parseGlobals*(sec: UciSection): GlobalsConfig =
   ## Convert a UCI section of type 'globals' to GlobalsConfig.
   result = defaultGlobals()
@@ -296,44 +328,24 @@ proc parseGlobals*(sec: UciSection): GlobalsConfig =
     warn fmt"globals: mark_mask 0x{toHex(result.markMask)} must have contiguous bits with >=2 slots, using default"
     result.markMask = defaultGlobals().markMask
 
+  # Default probe settings (inherited by interfaces that don't override)
+  let tm = sec.get("track_method")
+  if tm != "":
+    result.trackMethod = mapTrackMethod(tm, "globals")
+  let ips = sec.getAll("track_ip")
+  if ips.len > 0:
+    result.trackIp = ips
+  result.probeInterval = sec.getU32("probe_interval", result.probeInterval)
+  result.probeTimeout = sec.getU32("probe_timeout", result.probeTimeout)
+  result.upCount = sec.getU32("up_count", result.upCount)
+  result.downCount = sec.getU32("down_count", result.downCount)
+
   # rt_table_lookup
   for v in sec.getAll("rt_table_lookup"):
     try:
       result.rtTableLookup.add(uint32(parseUInt(v)))
     except ValueError:
       warn fmt"Ignoring invalid rt_table_lookup value '{v}'"
-
-proc mapTrackMethod(s: string, ifaceName: string): TrackMethod =
-  ## Map a string to TrackMethod, with mwan3 compatibility warnings.
-  case s.toLowerAscii()
-  of "ping":
-    return tmPing
-  of "dns":
-    return tmDns
-  of "http":
-    return tmHttp
-  of "https":
-    return tmHttps
-  of "arping":
-    return tmArping
-  of "composite":
-    return tmComposite
-  # mwan3 compatibility
-  of "nping-tcp":
-    warn fmt"interface '{ifaceName}': track_method 'nping-tcp' is not supported, using 'http' instead"
-    return tmHttp
-  of "nping-udp":
-    warn fmt"interface '{ifaceName}': track_method 'nping-udp' is not supported, using 'dns' instead"
-    return tmDns
-  of "nping-icmp":
-    warn fmt"interface '{ifaceName}': track_method 'nping-icmp' is not supported, using 'ping' instead"
-    return tmPing
-  of "nping-arp":
-    warn fmt"interface '{ifaceName}': track_method 'nping-arp' is not supported, using 'arping' instead"
-    return tmArping
-  else:
-    warn fmt"interface '{ifaceName}': unknown track_method '{s}', using 'ping'"
-    return tmPing
 
 func parseFlushTrigger(s: string): options.Option[ConntrackFlushTrigger] =
   case s.toLowerAscii()

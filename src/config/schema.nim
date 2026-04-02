@@ -40,6 +40,13 @@ type
     rtTableLookup*: seq[uint32]
     logging*: bool
     markMask*: uint32
+    # Default probe settings — inherited by interfaces that don't override them
+    trackMethod*: TrackMethod
+    trackIp*: seq[string]
+    probeInterval*: uint32
+    probeTimeout*: uint32
+    upCount*: uint32
+    downCount*: uint32
 
   InterfaceConfig* = object
     name*: string
@@ -127,6 +134,12 @@ proc defaultGlobals*(): GlobalsConfig =
     rtTableLookup: @[],
     logging: false,
     markMask: 0xFF00'u32,
+    trackMethod: tmPing,
+    trackIp: @["8.8.8.8", "1.1.1.1"],
+    probeInterval: 5,
+    probeTimeout: 2,
+    upCount: 3,
+    downCount: 3,
   )
 
 proc defaultInterface*(): InterfaceConfig =
