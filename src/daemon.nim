@@ -14,6 +14,10 @@ import ./state/policy
 import ./state/transition
 import ./health/engine
 import ./health/dampening
+import ./health/icmp
+import ./health/dns
+import ./health/http
+import ./health/arp
 import ./nftables/marks
 import ./nftables/chains
 import ./nftables/engine as nftEngine
@@ -276,21 +280,22 @@ proc resolveAllPolicies(d: Daemon): seq[ResolvedPolicy] =
     result.add(resolvePolicy(p, d.config.members, d.trackers))
 
 proc makeProbeTransport(cfg: InterfaceConfig): ProbeTransport =
-  ## Create a probe transport based on the configured track method.
-  ## Returns the appropriate transport variant for the engine.
+  ## Create a probe transport with a live socket for the configured method.
   case cfg.trackMethod
   of tmPing:
     let family = case cfg.family
       of afIpv4: uint8(2)    # AF_INET
       of afIpv6: uint8(10)   # AF_INET6
       of afBoth: uint8(2)    # Default to IPv4
-    ProbeTransport(kind: tkIcmp, icmpFd: -1, icmpFamily: family)
+    let fd = createIcmpSocket(cfg.device, family, cfg.maxTtl.int)
+    ProbeTransport(kind: tkIcmp, icmpFd: fd, icmpFamily: family)
   of tmDns:
     let family = case cfg.family
       of afIpv4: uint8(2)
       of afIpv6: uint8(10)
       of afBoth: uint8(2)
-    ProbeTransport(kind: tkDns, dnsFd: -1, dnsFamily: family,
+    let fd = createDnsSocket(cfg.device, family)
+    ProbeTransport(kind: tkDns, dnsFd: fd, dnsFamily: family,
                    dnsQueryLen: 0)
   of tmHttp, tmHttps:
     let family = case cfg.family
@@ -300,11 +305,13 @@ proc makeProbeTransport(cfg: InterfaceConfig): ProbeTransport =
     let port = if cfg.trackPort > 0: uint16(cfg.trackPort)
                elif cfg.trackMethod == tmHttp: 80'u16
                else: 443'u16
-    ProbeTransport(kind: tkHttp, httpFd: -1, httpFamily: family,
+    let fd = createHttpSocket(cfg.device, family)
+    ProbeTransport(kind: tkHttp, httpFd: fd, httpFamily: family,
                    httpDevice: cfg.device, httpPort: port,
                    httpState: hsIdle)
   of tmArping:
-    ProbeTransport(kind: tkArp, arpFd: -1, arpIfindex: 0)
+    let (fd, state) = createArpSocket(cfg.device)
+    ProbeTransport(kind: tkArp, arpFd: fd, arpIfindex: state.ifindex)
   of tmComposite:
     ProbeTransport(kind: tkComposite, subs: @[])
 
