@@ -564,19 +564,26 @@ proc runCli(args: seq[string]) =
     quit(1)
 
 # ---------------------------------------------------------------------------
-# Main -- argv[0] dispatch
+# Dispatch logic -- argv[0] based
+# ---------------------------------------------------------------------------
+
+proc isDaemonMode*(argv0: string, args: seq[string]): bool =
+  ## Returns true if this invocation should run as daemon.
+  ## Uses argv0 directly (preserves symlink name) rather than
+  ## getAppFilename() which resolves symlinks on Linux.
+  let prog = extractFilename(argv0)
+  prog == "nopald" or "--daemon" in args or "-d" in args
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 
 when isMainModule:
   let args = commandLineParams()
-
-  # Use argv[0] for dispatch — paramStr(0) preserves the symlink name
-  # (unlike getAppFilename() which resolves symlinks on Linux).
   let argv0 = paramStr(0)
-  let prog = extractFilename(argv0)
   let allArgs = @[argv0] & args
 
-  if prog == "nopald" or "--daemon" in args or "-d" in args:
+  if isDaemonMode(argv0, args):
     runDaemon(allArgs)
   else:
     runCli(allArgs)
