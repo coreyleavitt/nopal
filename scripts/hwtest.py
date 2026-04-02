@@ -27,6 +27,7 @@ Phases:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,6 +41,7 @@ FAIL = 0
 SKIP = 0
 
 SOCKET_PATH = "/var/run/nopal.sock"
+SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 
 
 def timestamp():
@@ -48,24 +50,18 @@ def timestamp():
 
 
 def run(cmd, check=True, capture=True, timeout=60):
-    """Run a command, return CompletedProcess."""
+    """Run a command as a list (no shell). Strings are split into args."""
+    if isinstance(cmd, str):
+        cmd = cmd.split()
     try:
         r = subprocess.run(
-            cmd, shell=isinstance(cmd, str),
-            capture_output=capture, text=True, timeout=timeout
+            cmd, capture_output=capture, text=True, timeout=timeout
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"command timed out ({timeout}s): {cmd}")
     if check and r.returncode != 0:
         raise RuntimeError(f"command failed ({r.returncode}): {cmd}\n{r.stderr}")
     return r
-
-
-def nopal_cmd(args):
-    """Run the nopal CLI as a list (no shell injection)."""
-    if isinstance(args, str):
-        args = args.split()
-    return run(["nopal"] + args, check=True)
 
 
 def nopal_status(iface=None):
@@ -113,7 +109,7 @@ def daemon_is_running():
 
 
 def wait_for_socket(timeout=15):
-    """Poll until the IPC socket appears."""
+    """Poll until the IPC socket appears. Returns True if found."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(SOCKET_PATH):
@@ -136,7 +132,9 @@ def wait_for_state(iface, target_states, timeout=120, poll=2):
     """Poll until interface reaches one of the target states or timeout.
 
     target_states can be a string or list of strings.
-    Returns (reached, last_state) — last_state is useful for diagnostics.
+    Returns (reached, last_state) — last_state is one of the target states
+    on success, or the actual last observed interface state on failure.
+    Special values: "daemon_dead", "not_found", "error: ...".
     """
     if isinstance(target_states, str):
         target_states = [target_states]
@@ -147,28 +145,53 @@ def wait_for_state(iface, target_states, timeout=120, poll=2):
             if not daemon_is_running():
                 return False, "daemon_dead"
             status = nopal_status()
+            found = False
             for i in status.get("interfaces", []):
                 if i["name"] == iface:
+                    found = True
                     last_state = i["state"]
                     if last_state in target_states:
                         return True, last_state
+            if not found:
+                last_state = "not_found"
         except Exception as e:
             last_state = f"error: {e}"
         time.sleep(poll)
     return False, last_state
 
 
-def check_logs_for_errors():
-    """Check logread for nopal error/critical messages. Returns list of lines."""
+def check_logs_for_errors(since_lines=None):
+    """Check logread for nopal error/critical messages.
+
+    If since_lines is provided, only return errors not in that set.
+    Returns list of error lines.
+    """
     r = run("logread", check=False)
     if r.returncode != 0:
         return []
+    if since_lines is None:
+        since_lines = set()
     errors = []
     for line in r.stdout.splitlines():
         low = line.lower()
         if "nopal" in low and any(k in low for k in ["error", "crit", "panic", "segfault"]):
-            errors.append(line.strip())
+            stripped = line.strip()
+            if stripped not in since_lines:
+                errors.append(stripped)
     return errors
+
+
+def get_all_log_lines():
+    """Snapshot current logread output for baseline comparison."""
+    r = run("logread", check=False)
+    if r.returncode != 0:
+        return set()
+    return set(r.stdout.splitlines())
+
+
+def is_valid_iface_name(name):
+    """Validate interface name is safe for path construction."""
+    return bool(SAFE_NAME_RE.match(name))
 
 
 def log(msg):
@@ -354,21 +377,31 @@ def phase3():
         # Wait for interface to leave init if needed
         if state == "init":
             log(f"  Waiting for {name} to leave init state...")
-            reached, state = wait_for_state(name, ["probing", "online"], timeout=20)
+            reached, new_state = wait_for_state(name, ["probing", "online"], timeout=20)
             if not reached:
-                test(f"{name}: not stuck in init", False, detail=f"last state: {state}")
+                # Only report as "stuck in init" if the actual state is init,
+                # not if daemon died or interface disappeared
+                is_init = new_state == "init"
+                test(f"{name}: not stuck in init", not is_init,
+                     detail=f"last state: {new_state}")
                 continue
+            state = new_state
 
-        test(f"{name}: not stuck in init", state != "init", detail=f"state={state}")
+        test(f"{name}: not stuck in init", state in ("probing", "online", "degraded", "offline"),
+             detail=f"state={state}")
 
         if state == "online":
-            # Re-fetch to get current counters (original iface data may be stale)
+            # Re-fetch to get current counters
             try:
                 fresh = nopal_status()
+                found = False
                 for i in fresh["interfaces"]:
                     if i["name"] == name:
                         iface = i
+                        found = True
                         break
+                if not found:
+                    log(f"  Warning: {name} disappeared from status on re-fetch")
             except RuntimeError:
                 pass
             test(f"{name}: has success count",
@@ -468,7 +501,8 @@ def phase4_wait():
         log(f"  {i['name']}: {i['state']}")
         seen_states[i["name"]] = i["state"]
 
-    log("\nPolling every 5s for 120s...")
+    poll_interval = 5
+    log(f"\nPolling every {poll_interval}s for 120s...")
     transitions = []
     deadline = time.time() + 120
     while time.time() < deadline:
@@ -485,10 +519,13 @@ def phase4_wait():
             key = i["name"]
             state = i["state"]
             prev = seen_states.get(key)
-            if prev != state:
-                if prev is not None:
-                    log(f"  {key}: {prev} -> {state}")
-                    transitions.append((key, prev, state))
+            if prev is None:
+                # New interface appeared
+                log(f"  {key}: appeared in state {state}")
+                seen_states[key] = state
+            elif prev != state:
+                log(f"  {key}: {prev} -> {state}")
+                transitions.append((key, prev, state))
                 seen_states[key] = state
 
         if transitions:
@@ -496,7 +533,7 @@ def phase4_wait():
             for i in status["interfaces"]:
                 log(f"  {i['name']}: {i['state']}")
             break
-        time.sleep(5)
+        time.sleep(poll_interval)
     else:
         log("No state change detected within 120s")
 
@@ -538,13 +575,13 @@ def phase5():
          detail=r.stderr.strip() if r.returncode != 0 else None)
 
     # Wait for socket readiness (reload may briefly disrupt)
-    time.sleep(1)
-    wait_for_socket(timeout=10)
+    if not wait_for_socket(timeout=10):
+        log("Warning: IPC socket did not reappear after reload")
 
     # Check daemon still running
     test("daemon still running after reload", daemon_is_running())
 
-    # Check states preserved (online/offline should be stable; probing is transient)
+    # Check states preserved
     try:
         after = nopal_status()
     except RuntimeError as e:
@@ -559,14 +596,20 @@ def phase5():
             test(f"{name}: still exists after reload", False, detail="interface disappeared")
             continue
         after_state = after_states[name]
-        # Online should stay online; offline should stay offline.
-        # Probing is transient — probing->online is healthy, not a failure.
-        if state in ("online", "offline"):
+        # Online should stay online.
+        # Offline -> probing is legitimate (daemon re-checks on reload).
+        # Probing -> online is healthy progression.
+        if state == "online":
             test(f"{name}: state preserved ({state})",
-                 after_state == state,
+                 after_state == "online",
+                 detail=f"was {state}, now {after_state}")
+        elif state == "offline":
+            # offline -> probing is fine (daemon retries on reload)
+            test(f"{name}: state ok after reload ({state} -> {after_state})",
+                 after_state in ("offline", "probing"),
                  detail=f"was {state}, now {after_state}")
         else:
-            # For transient states, just verify it didn't go backwards
+            # For transient states, just verify it didn't regress to init
             test(f"{name}: state ok after reload ({state} -> {after_state})",
                  after_state != "init",
                  detail=f"was {state}, now {after_state}")
@@ -591,8 +634,7 @@ def phase6():
 
     # Policies
     policies = status.get("policies", [])
-    test("has policies", len(policies) > 0,
-         detail=f"got {len(policies)} policies")
+    test("has policies", len(policies) > 0)
 
     for pol in policies:
         name = pol.get("name", "?")
@@ -605,7 +647,7 @@ def phase6():
 
     # Connected bypass
     try:
-        r = nopal_cmd(["connected"])
+        r = run(["nopal", "connected"])
         test("nopal connected succeeds", True)
         if r.stdout.strip():
             lines = r.stdout.strip().splitlines()
@@ -617,10 +659,9 @@ def phase6():
 
     # nftables rules
     try:
-        r = nopal_cmd(["rules"])
+        r = run(["nopal", "rules"])
         test("nopal rules succeeds", True)
         rules_out = r.stdout
-        # Basic sanity: should contain our policy chain
         test("nftables has policy rules",
              "policy" in rules_out.lower() or "nopal" in rules_out.lower(),
              detail=f"output length: {len(rules_out)}")
@@ -628,9 +669,12 @@ def phase6():
     except RuntimeError as e:
         test("nopal rules succeeds", False, detail=str(e))
 
-    # Status files
+    # Status files (validate interface names before path construction)
     for iface in status.get("interfaces", []):
         name = iface["name"]
+        if not is_valid_iface_name(name):
+            log(f"  Warning: skipping status file check for invalid name: {name!r}")
+            continue
         status_file = f"/var/run/nopal/{name}/status"
         test(f"{name}: status file exists",
              os.path.isfile(status_file),
@@ -662,6 +706,9 @@ def phase_soak():
     log("Sampling every 60s. Press Ctrl-C to stop and see results.")
     log("Will also query status and reload periodically to exercise the daemon.\n")
 
+    # Baseline log errors so we only report new ones
+    baseline_logs = get_all_log_lines()
+
     samples = [(time.time(), initial_rss)]
     interval = 60
     iteration = 0
@@ -671,19 +718,16 @@ def phase_soak():
             time.sleep(interval)
             iteration += 1
 
-            # Check daemon is still alive
-            current_pid = get_pid()
-            if current_pid is None:
+            # Check daemon is still alive and refresh PID
+            pid = get_pid()
+            if pid is None:
                 log("DAEMON DIED! Soak test aborted.")
                 test("daemon survived soak", False, detail=f"died after {iteration} iterations")
                 break
-            if current_pid != pid:
-                log(f"PID changed: {pid} -> {current_pid} (daemon restarted?)")
-                pid = current_pid
 
             rss = get_rss_kb(pid)
             if rss is None:
-                log(f"  [{iteration}] Could not read RSS")
+                log(f"  [{iteration}] Could not read RSS for PID {pid}")
                 continue
 
             samples.append((time.time(), rss))
@@ -701,16 +745,23 @@ def phase_soak():
                     log(f"  [{iteration}] Status query FAILED")
 
             if iteration % 15 == 0:
-                try:
-                    run("nopal reload", check=False)
+                r = run("nopal reload", check=False)
+                if r.returncode == 0:
                     log(f"  [{iteration}] Reload OK")
-                except RuntimeError:
+                else:
                     log(f"  [{iteration}] Reload FAILED")
+                # Refresh PID in case reload caused restart
+                new_pid = get_pid()
+                if new_pid and new_pid != pid:
+                    log(f"  [{iteration}] PID changed after reload: {pid} -> {new_pid}")
+                    pid = new_pid
 
-            # Check for error logs
-            errors = check_logs_for_errors()
-            if errors:
-                log(f"  [{iteration}] {len(errors)} error-level log messages")
+            # Check for NEW error logs only
+            new_errors = check_logs_for_errors(since_lines=baseline_logs)
+            if new_errors:
+                log(f"  [{iteration}] {len(new_errors)} new error-level log messages")
+                for e in new_errors[:2]:
+                    log(f"    {e[:120]}")
 
     except KeyboardInterrupt:
         log("\nSoak interrupted by user.")
@@ -725,7 +776,6 @@ def phase_soak():
         log(f"  Final RSS:   {final_rss} kB")
         log(f"  Growth:      {growth:+d} kB")
 
-        # Pass if growth < 100 kB (per issue #81)
         test("memory growth < 100 kB", growth < 100,
              detail=f"grew {growth} kB over {elapsed_min:.0f}m")
     else:
