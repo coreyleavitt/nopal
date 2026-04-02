@@ -138,20 +138,26 @@ proc sendIcmpProbe*(fd: cint, target: openArray[byte], family: uint8,
 proc recvIcmpReply*(fd: cint, buf: var array[1500, byte]): tuple[ok: bool, id, seq: uint16] =
   ## Non-blocking receive of an ICMP echo reply.
   ## Returns (ok, id, seq). ok is false if no valid reply available.
+  ## For SOCK_RAW IPv4, the kernel includes the 20-byte IP header.
+  ## For SOCK_RAW IPv6, the kernel strips the IP header.
   result = (ok: false, id: 0'u16, seq: 0'u16)
 
   let n = recv(SocketHandle(fd), cast[pointer](addr buf[0]), buf.len, 0)
-  if n < 8:
+  if n < 28:  # min: 20 IP header + 8 ICMP header
     return
 
-  # For SOCK_DGRAM ICMP sockets the kernel strips the IP header,
-  # so buf starts directly with the ICMP header.
-  let replyType = buf[0]
+  # IPv4 SOCK_RAW: skip the IP header (IHL field gives length in 32-bit words)
+  let ihl = int(buf[0] and 0x0F) * 4
+  if ihl < 20 or ihl + 8 > n:
+    return
+
+  let icmpOff = ihl
+  let replyType = buf[icmpOff]
   if replyType != ICMP_ECHO_REPLY and replyType != ICMPV6_ECHO_REPLY:
     return
 
-  let id = (uint16(buf[4]) shl 8) or uint16(buf[5])
-  let seq = (uint16(buf[6]) shl 8) or uint16(buf[7])
+  let id = (uint16(buf[icmpOff + 4]) shl 8) or uint16(buf[icmpOff + 5])
+  let seq = (uint16(buf[icmpOff + 6]) shl 8) or uint16(buf[icmpOff + 7])
   result = (ok: true, id: id, seq: seq)
 
 when isMainModule:
