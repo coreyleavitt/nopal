@@ -392,7 +392,7 @@ proc buildPolicyChain(rs: var Ruleset, policy: PolicyInfo) =
           vmapEntries.add(%*[slot, {"goto": {"target": "mark_" & member.interfaceName}}])
           slot += 1
       rs.addRule(chainName, @[
-        %*{"vmap": {"key": {"numgen": {"mode": "inc", "mod": total, "offset": 0}}, "data": vmapEntries}}
+        %*{"vmap": {"key": {"numgen": {"mode": "inc", "mod": total, "offset": 0}}, "data": {"set": vmapEntries}}}
       ])
 
 proc buildMarkChain(rs: var Ruleset, iface: InterfaceInfo) =
@@ -476,7 +476,7 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
         mapEntries.add(%*[slot, member.mark])
         slot += 1
     rs.addRule(chainName, @[
-      %*{"mangle": {"key": {"meta": {"key": "mark"}}, "value": {"map": {"key": {"numgen": {"mode": "inc", "mod": total, "offset": 0}}, "data": mapEntries}}}},
+      %*{"mangle": {"key": {"meta": {"key": "mark"}}, "value": {"map": {"key": {"numgen": {"mode": "inc", "mod": total, "offset": 0}}, "data": {"set": mapEntries}}}}},
       saveMarkToCt()
     ])
 
