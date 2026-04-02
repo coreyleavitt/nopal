@@ -2,14 +2,14 @@
 
 Multi-WAN policy routing manager for OpenWrt. Drop-in replacement for
 [mwan3](https://openwrt.org/docs/guide-user/network/wan/multiwan/mwan3),
-written in Rust as a single statically-linked binary with zero runtime
+written in Nim as a single statically-linked binary with zero runtime
 dependencies.
 
 ## Why nopal over mwan3?
 
 | | mwan3 | nopal |
 |---|---|---|
-| Implementation | Shell scripts + per-interface tracker processes | Single async Rust binary |
+| Implementation | Shell scripts + per-interface tracker processes | Single async Nim binary |
 | Firewall | iptables (requires `iptables-nft` shim on 22.03+) | Native nftables JSON API |
 | Dependencies | arping, httping, nping, ipset, iptables, conntrack-tools | None |
 | Config reload | Full stop + start | Hot reload with state preservation |
@@ -19,7 +19,7 @@ dependencies.
 | `mwan3 use` | `LD_PRELOAD` sockopt wrapper (fails on static binaries) | UID-range ip rules |
 | Status API | Shell reads status files | Unix socket IPC with event subscription |
 | Route dampening | None | RFC 2439 exponential penalty + decay |
-| Binary size | ~50 KB scripts + many dependency packages | ~800 KB static binary |
+| Binary size | ~50 KB scripts + many dependency packages | ~150-300 KB static binary |
 
 ## Feature Comparison
 
@@ -32,7 +32,7 @@ nopal implements every mwan3 feature and adds several that mwan3 lacks.
 | ICMP ping | `ping` binary | Raw ICMP socket | Configurable TTL, payload size |
 | ARP | `arping` binary | Native `AF_PACKET` | Layer-2 probe for same-segment gateways |
 | HTTP | `httping` binary | Native TCP + HTTP/1.0 | Detects captive portals (non-2xx = fail) |
-| HTTPS | `httping --ssl` | Native rustls TLS | Feature-gated: `--features https` |
+| HTTPS | `httping --ssl` | Native mbedTLS | Compile with `-d:https`, links system mbedTLS |
 | DNS | `nslookup` binary | Raw UDP DNS probe | Configurable query name |
 | Composite | N/A | OR-logic across methods | Any method succeeding = up |
 | nping-* | nmap `nping` binary | Not supported | Warns with native alternative suggestions |
@@ -90,14 +90,14 @@ flapping between online and offline:
 ### State Machine
 
 ```
-Init ──link_up──> Probing ──up_count successes──> Online
-                    │                                │
-                    │ down_count failures             │ quality degraded
+Init --link_up--> Probing --up_count successes--> Online
+                    |                                |
+                    | down_count failures             | quality degraded
                     v                                v
-                 Offline <──down_count failures── Degraded
-                    ^                                │
-                    │           quality recovered     │
-                    └──────────── Online <────────────┘
+                 Offline <--down_count failures-- Degraded
+                    ^                                |
+                    |           quality recovered     |
+                    +------------ Online <------------+
 ```
 
 Five states: `Init`, `Probing`, `Online`, `Degraded`, `Offline`.
@@ -107,7 +107,7 @@ mwan3 uses four (online/offline/connecting/disconnecting).
 
 | Feature | mwan3 | nopal |
 |---|---|---|
-| IPC protocol | None (reads status files) | Unix socket, MessagePack-RPC |
+| IPC protocol | None (reads status files) | Unix socket, JSON-RPC |
 | Event subscription | None | Clients receive state change events |
 | Hot reload | Full restart | SIGHUP or `nopal reload`, preserves state |
 | Hook script | `/etc/mwan3.user` | `/etc/nopal.user` (same env vars + `FIRSTCONNECT`) |
@@ -225,65 +225,151 @@ nopal version             # print version
 
 ## Building
 
-Requires Rust 1.85+.
+Requires Nim 2.2+.
 
 ```sh
 # Standard build
-cargo build --release
+nim c src/nopal.nim
 
-# With HTTPS probe support
-cargo build --release --features https
+# Release build (size-optimized, static)
+nim c -d:release src/nopal.nim
 
-# Cross-compile for OpenWrt (example: aarch64)
-cargo build --release --target aarch64-unknown-linux-musl
+# With HTTPS probe support (requires nim-mbedtls + system mbedTLS)
+nim c -d:release -d:https src/nopal.nim
+
+# Cross-compile for OpenWrt targets
+nim c -d:release -d:https -d:aarch64 src/nopal.nim
+nim c -d:release -d:https -d:armv7hf src/nopal.nim
+nim c -d:release -d:https -d:mips src/nopal.nim
+nim c -d:release -d:https -d:mipsel src/nopal.nim
 ```
 
-The release profile is optimized for size (`opt-level = "z"`, LTO, strip).
+Cross-compilation uses clang + musl sysroots + compiler-rt builtins.
+Target profiles are defined in `config.nims`. A pre-built toolchain image
+is available at `ghcr.io/coreyleavitt/nopal-toolchain:latest`.
+
+## Testing
+
+```sh
+# Run all module tests
+nim c -r src/config/parser.nim
+nim c -r src/config/diff.nim
+nim c -r src/state/tracker.nim
+nim c -r src/state/transition.nim
+nim c -r src/state/policy.nim
+nim c -r src/health/dampening.nim
+nim c -r src/health/engine.nim
+nim c -r src/health/icmp.nim
+nim c -r src/health/dns.nim
+nim c -r src/netlink/socket.nim
+nim c -r src/nftables/chains.nim
+nim c -r src/nftables/marks.nim
+nim c -r src/nftables/ruleset.nim
+nim c -r src/ipc/protocol.nim
+nim c -r src/ipc/methods.nim
+nim c -r src/dnsmanager.nim
+
+# HTTPS tests
+nim c -r -d:https src/health/https.nim
+```
 
 ## Project Structure
 
 ```
 src/
-  main.rs          CLI entry point and daemon mode detection
-  daemon.rs        Event loop, state management, action execution
+  nopal.nim              CLI entry point and daemon mode detection (argv[0])
+  daemon.nim             Event loop, selector dispatch, component orchestration
+  linux_constants.nim    Netlink/socket struct definitions and constants
+  logging.nim            Log initialization (syslog + stderr)
+  errors.nim             Error types
+  timer.nim              Timer wheel for probe scheduling
+  dnsmanager.nim         DNS resolver file management
   config/
-    mod.rs         UCI config parser
-    schema.rs      Config type definitions and defaults
-    diff.rs        Config diff for hot reload
+    schema.nim           Config type definitions and defaults
+    parser.nim           UCI config parser (/etc/config/nopal)
+    diff.nim             Config diff for hot reload
   health/
-    mod.rs         Probe orchestration, ProbeTransport trait
-    icmp.rs        ICMP echo probe
-    dns.rs         UDP DNS probe
-    http.rs        HTTP probe
-    https.rs       HTTPS probe (feature-gated)
-    arp.rs         ARP probe
-    dampening.rs   RFC 2439 route dampening
+    engine.nim           Probe orchestration, slot management
+    icmp.nim             ICMP echo probe (raw socket)
+    dns.nim              UDP DNS probe
+    http.nim             HTTP/1.0 probe (TCP connect + HEAD)
+    https.nim            HTTPS probe (mbedTLS, compile-time feature gate)
+    arp.nim              ARP probe (AF_PACKET)
+    dampening.nim        RFC 2439 route dampening
   nftables/
-    chains.rs      Ruleset generation (chains, rules, maps)
-    ruleset.rs     nftables JSON builder
-    mod.rs         nft process invocation
+    chains.nim           Ruleset generation (chains, rules, maps)
+    ruleset.nim          nftables JSON builder
+    marks.nim            FNV-1a mark hashing with linear probing
+    engine.nim           nft process invocation (pipes JSON to nft -j -f -)
   netlink/
-    link.rs        Link up/down monitoring
-    route_manager.rs  Route and ip rule management
-    route_monitor.rs  Route/address change events
-    conntrack.rs   Conntrack flush via NETLINK_NETFILTER
+    socket.nim           Netlink socket abstraction
+    link.nim             Link up/down monitoring (RTNLGRP_LINK)
+    route.nim            Route and ip rule management
+    monitor.nim          Route/address change events
+    conntrack.nim        Conntrack flush via NETLINK_NETFILTER
   ipc/
-    protocol.rs    MessagePack-RPC wire types
-    methods.rs     IPC method dispatch
-    mod.rs         Unix socket server
+    protocol.nim         JSON wire types for IPC
+    methods.nim          IPC method dispatch (status, reload, etc.)
+    server.nim           Unix socket server (/var/run/nopal.sock)
   state/
-    mod.rs         Interface state machine
-    policy.rs      Policy resolution
-    transition.rs  State transition -> action mapping
-  dns.rs           DNS server file management
-  timer.rs         Timer wheel for probe scheduling
-  logging.rs       Log initialization
-  error.rs         Error types
+    tracker.nim          Interface state machine
+    policy.nim           Policy resolution (metric tiers, active members)
+    transition.nim       State transition -> kernel action mapping
+config.nims              Build configuration and cross-compilation profiles
+nopal.nimble             Package metadata
 openwrt/
+  Makefile               OpenWrt package Makefile
   files/
-    nopal.config   Sample UCI config with migration notes
-    nopal.init     procd init script
-    rpcd-nopal     rpcd exec plugin for ubus
+    nopal.config         Sample UCI config
+    nopal.init           procd init script
+    rpcd-nopal           rpcd exec plugin for ubus
+scripts/
+  build-target.sh        Musl sysroot + compiler-rt builder for Docker toolchain
+Dockerfile.toolchain     Cross-compilation toolchain image
+```
+
+## Architecture
+
+**Single binary, dual mode**: `nopal.nim` dispatches based on argv[0] -- runs
+as daemon (`nopald`) or CLI tool (`nopal`).
+
+**Event loop**: `daemon.nim` uses `std/selectors` (epoll) for async I/O.
+Token allocation: 0-3 reserved (signal pipe, IPC listener, link/route monitors),
+100+ for probe sockets, 1000+ for IPC clients.
+
+**GC**: `--mm:arc` (deterministic, minimal runtime overhead).
+
+**No external binaries**: All probes, netlink, nftables use in-process
+implementations. Probes use `SO_BINDTODEVICE` + `SO_MARK 0xDEAD` to bypass
+policy rules.
+
+**Atomic nftables**: Entire ruleset replaced in one JSON transaction via
+`nft -j -f -`, never rule-by-rule.
+
+**FNV-1a mark hashing**: Stable firewall mark assignment across config reorder,
+with linear probing for collisions. Slot count derived from `mark_mask`.
+
+**Hot reload on SIGHUP**: Config diff preserves interface state; only changed
+items are updated.
+
+**Cross-compilation**: Compiles to C via Nim, then cross-compiled with clang
+targeting musl sysroots. Supports aarch64, armv7hf, mips, and mipsel.
+
+**HTTPS**: Optional feature (`-d:https`) using
+[nim-mbedtls](https://github.com/coreyleavitt/nim-mbedtls). Dynamically links
+against system mbedTLS on OpenWrt for zero binary size cost.
+
+## Install
+
+Download `.ipk` or `.apk` packages from the
+[latest release](https://github.com/coreyleavitt/nopal/releases).
+
+```sh
+# OpenWrt (opkg)
+opkg install nopal_*.ipk
+
+# OpenWrt (apk, 24.10+)
+apk add --allow-untrusted nopal_*.apk
 ```
 
 ## License
