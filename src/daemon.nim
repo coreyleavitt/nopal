@@ -9,6 +9,7 @@ import std/[selectors, posix, monotimes, times, options, logging, os, strutils, 
 import ./config/schema
 import ./config/parser
 import ./config/diff
+import ./config/discover
 import ./state/tracker
 import ./state/policy
 import ./state/transition
@@ -133,9 +134,36 @@ proc checkHookScript(path: string): bool =
   path.len > 0 and fileExists(path)
 
 proc initDaemon*(configPath: string, signalFd: cint): Daemon =
-  ## Load config, create all subsystem components, register fds with
-  ## selector, assign marks, build trackers.
-  let config = loadConfig(configPath)
+  ## Load config, discover WANs, create all subsystem components,
+  ## register fds with selector, assign marks, build trackers.
+  var config = loadConfig(configPath)
+
+  # Discover WANs from OpenWrt firewall/network config
+  let discovered = discoverWanInterfaces()
+  if discovered.len > 0:
+    let enriched = buildDiscoveredConfig(
+      discovered, config.globals, config.interfaces,
+      config.members, config.policies, config.rules)
+    if config.interfaces.len == 0:
+      config.interfaces = enriched.interfaces
+      info fmt"auto-discovered {enriched.interfaces.len} WAN interface(s)"
+    else:
+      # Fill device for any interface missing it
+      for iface in config.interfaces.mitems:
+        if iface.device == "":
+          for d in discovered:
+            if d.name == iface.name:
+              iface.device = d.device
+              info fmt"resolved device for '{iface.name}' -> '{d.device}'"
+        applyGlobalsDefaults(iface, config.globals)
+    if config.members.len == 0:
+      config.members = enriched.members
+    if config.policies.len == 0:
+      config.policies = enriched.policies
+    if config.rules.len == 0:
+      config.rules = enriched.rules
+  elif config.interfaces.len == 0:
+    warn "no WAN interfaces discovered and none configured — daemon will have nothing to manage"
 
   info fmt"loaded config: {config.interfaces.len} interfaces, {config.policies.len} policies, {config.rules.len} rules"
 
