@@ -569,10 +569,12 @@ proc runCli(args: seq[string]) =
 
 when isMainModule:
   let args = commandLineParams()
-  let allArgs = @[getAppFilename()] & args
 
-  # Determine mode from program name (last path component)
-  let prog = extractFilename(getAppFilename())
+  # Use argv[0] for dispatch — paramStr(0) preserves the symlink name
+  # (unlike getAppFilename() which resolves symlinks on Linux).
+  let argv0 = paramStr(0)
+  let prog = extractFilename(argv0)
+  let allArgs = @[argv0] & args
 
   if prog == "nopald" or "--daemon" in args or "-d" in args:
     runDaemon(allArgs)
