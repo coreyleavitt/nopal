@@ -24,11 +24,16 @@ RUN zypper --non-interactive install \
     mbedtls-devel \
     && zypper clean --all
 
-# Install Nim (pinned version)
-RUN curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y --version 2.2.8
-ENV PATH="/root/.nimble/bin:${PATH}"
+# Install Nim directly (no choosenim — immune to HOME override in CI)
+ARG NIM_VERSION=2.2.8
+RUN cd /tmp \
+    && curl -LO "https://nim-lang.org/download/nim-${NIM_VERSION}-linux_x64.tar.xz" \
+    && tar xf "nim-${NIM_VERSION}-linux_x64.tar.xz" \
+    && mv "nim-${NIM_VERSION}" /opt/nim \
+    && rm "nim-${NIM_VERSION}-linux_x64.tar.xz"
+ENV PATH="/opt/nim/bin:/opt/nimble/bin:${PATH}" NIMBLE_DIR="/opt/nimble"
 
-# Install nim-mbedtls
+# Bootstrap nimble and install nim-mbedtls
 RUN nimble install -y https://github.com/coreyleavitt/nim-mbedtls
 
 # Build musl sysroots + compiler-rt builtins for all 4 targets
@@ -43,53 +48,8 @@ RUN cd /tmp \
     && tar xf "llvm-project-${LLVM_VERSION}.src.tar.xz"
 
 # Helper script to build musl sysroot + compiler-rt for one target
-RUN echo '#!/bin/bash\n\
-set -e\n\
-TARGET=$1\n\
-SYSROOT=$2\n\
-EXTRA_CONFIGURE=${3:-}\n\
-\n\
-echo "=== Building musl sysroot for $TARGET ===" \n\
-cd /tmp && mkdir -p "musl-build-$TARGET" && cd "musl-build-$TARGET"\n\
-CC="clang --target=$TARGET" AR=llvm-ar RANLIB=llvm-ranlib \\\n\
-  /tmp/musl-${MUSL_VERSION}/configure \\\n\
-    --prefix=$SYSROOT --target=$TARGET --disable-shared $EXTRA_CONFIGURE\n\
-make -j$(nproc) && make install\n\
-cd /tmp && rm -rf "musl-build-$TARGET"\n\
-\n\
-echo "=== Building compiler-rt builtins for $TARGET ==="\n\
-mkdir -p "/tmp/rt-build-$TARGET" && cd "/tmp/rt-build-$TARGET"\n\
-cmake "/tmp/llvm-project-${LLVM_VERSION}.src/compiler-rt" -G Ninja \\\n\
-  -DCMAKE_AR=$(which llvm-ar) \\\n\
-  -DCMAKE_NM=$(which llvm-nm) \\\n\
-  -DCMAKE_RANLIB=$(which llvm-ranlib) \\\n\
-  -DCMAKE_C_COMPILER=clang \\\n\
-  -DCMAKE_C_COMPILER_TARGET="$TARGET" \\\n\
-  -DCMAKE_C_FLAGS="--sysroot=$SYSROOT" \\\n\
-  -DCMAKE_ASM_COMPILER_TARGET="$TARGET" \\\n\
-  -DCMAKE_ASM_FLAGS="--sysroot=$SYSROOT" \\\n\
-  -DCMAKE_SYSROOT="$SYSROOT" \\\n\
-  -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \\\n\
-  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \\\n\
-  -DCOMPILER_RT_BUILD_BUILTINS=ON \\\n\
-  -DCOMPILER_RT_BUILD_CRT=ON \\\n\
-  -DCOMPILER_RT_BUILD_SANITIZERS=OFF \\\n\
-  -DCOMPILER_RT_BUILD_XRAY=OFF \\\n\
-  -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \\\n\
-  -DCOMPILER_RT_BUILD_PROFILE=OFF \\\n\
-  -DCOMPILER_RT_BUILD_MEMPROF=OFF \\\n\
-  -DCOMPILER_RT_BUILD_ORC=OFF \\\n\
-  -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \\\n\
-  -DCOMPILER_RT_INCLUDE_TESTS=OFF \\\n\
-  -DLLVM_CMAKE_DIR="/tmp/llvm-project-${LLVM_VERSION}.src/cmake/Modules"\n\
-ninja builtins crt\n\
-\n\
-CLANG_RT_DIR=$(clang --print-resource-dir)/lib/linux\n\
-mkdir -p "$CLANG_RT_DIR"\n\
-cp lib/linux/*.a "$CLANG_RT_DIR/" 2>/dev/null || true\n\
-cp lib/linux/*.o "$CLANG_RT_DIR/" 2>/dev/null || true\n\
-cd /tmp && rm -rf "rt-build-$TARGET"\n\
-echo "=== Done: $TARGET ==="' > /tmp/build-target.sh && chmod +x /tmp/build-target.sh
+COPY scripts/build-target.sh /tmp/build-target.sh
+RUN chmod +x /tmp/build-target.sh
 
 # Build all 4 targets
 RUN /tmp/build-target.sh aarch64-linux-musl /opt/musl/aarch64
