@@ -68,6 +68,8 @@ def nopal_status(iface=None):
     """Get daemon status as parsed JSON."""
     cmd = ["nopal", "status", "--json"]
     if iface:
+        if not is_valid_iface_name(iface):
+            raise RuntimeError(f"invalid interface name: {iface!r}")
         cmd.append(iface)
     r = run(cmd, check=True)
     try:
@@ -88,7 +90,10 @@ def get_pid():
 
 
 def get_rss_kb(pid):
-    """Read VmRSS from /proc directly (no shell piping). Returns int KB or None."""
+    """Read VmRSS from /proc directly (no shell piping). Returns int KB or None.
+    pid must be a digit-only string (validated by get_pid)."""
+    if not isinstance(pid, str) or not pid.isdigit():
+        return None
     try:
         with open(f"/proc/{pid}/status") as f:
             for line in f:
@@ -98,7 +103,7 @@ def get_rss_kb(pid):
                     if len(parts) >= 2 and parts[1].isdigit():
                         return int(parts[1])
                     return None
-    except (OSError, IOError):
+    except OSError:
         pass
     return None
 
@@ -160,30 +165,31 @@ def wait_for_state(iface, target_states, timeout=120, poll=2):
     return False, last_state
 
 
-def check_logs_for_errors(since_lines=None):
+def check_logs_for_errors(exclude_lines=None):
     """Check logread for nopal error/critical messages.
 
-    If since_lines is provided, only return errors not in that set.
-    Returns list of error lines.
+    exclude_lines: set of raw log line strings to ignore (e.g. from a prior
+    snapshot). Use get_log_snapshot() to capture a baseline before testing.
+    Returns list of new error lines not in the exclusion set.
     """
-    r = run("logread", check=False)
+    r = run(["logread", "-l", "500"], check=False)
     if r.returncode != 0:
         return []
-    if since_lines is None:
-        since_lines = set()
+    if exclude_lines is None:
+        exclude_lines = set()
     errors = []
     for line in r.stdout.splitlines():
         low = line.lower()
         if "nopal" in low and any(k in low for k in ["error", "crit", "panic", "segfault"]):
             stripped = line.strip()
-            if stripped not in since_lines:
+            if stripped not in exclude_lines:
                 errors.append(stripped)
     return errors
 
 
-def get_all_log_lines():
+def get_log_snapshot():
     """Snapshot current logread output for baseline comparison."""
-    r = run("logread", check=False)
+    r = run(["logread", "-l", "500"], check=False)
     if r.returncode != 0:
         return set()
     return set(r.stdout.splitlines())
@@ -231,7 +237,7 @@ def ensure_daemon():
         return False
     if not wait_for_socket(timeout=15):
         log("Timed out waiting for IPC socket")
-        return daemon_is_running()
+        return False
     return True
 
 
@@ -300,6 +306,9 @@ def phase2():
     # Make sure it's stopped first
     stop_daemon()
 
+    # Capture log baseline before starting (so we only check new errors)
+    log_baseline = get_log_snapshot()
+
     # Start
     log("Starting daemon...")
     r = run("/etc/init.d/nopal start", check=False)
@@ -334,8 +343,8 @@ def phase2():
         if rss:
             log(f"Memory: VmRSS {rss} kB")
 
-    # Check for error-level log messages
-    errors = check_logs_for_errors()
+    # Check for error-level log messages (only new ones since start)
+    errors = check_logs_for_errors(exclude_lines=log_baseline)
     test("no error-level log messages", len(errors) == 0,
          detail=f"{len(errors)} errors, first: {errors[0][:100]}" if errors else None)
 
@@ -377,18 +386,22 @@ def phase3():
         # Wait for interface to leave init if needed
         if state == "init":
             log(f"  Waiting for {name} to leave init state...")
-            reached, new_state = wait_for_state(name, ["probing", "online"], timeout=20)
+            reached, new_state = wait_for_state(
+                name, ["probing", "online", "degraded", "offline"], timeout=20)
             if not reached:
-                # Only report as "stuck in init" if the actual state is init,
-                # not if daemon died or interface disappeared
-                is_init = new_state == "init"
-                test(f"{name}: not stuck in init", not is_init,
+                # Fail regardless of reason — daemon_dead, not_found, error,
+                # or genuinely stuck in init are all failures
+                test(f"{name}: leaves init state", False,
                      detail=f"last state: {new_state}")
                 continue
             state = new_state
 
-        test(f"{name}: not stuck in init", state in ("probing", "online", "degraded", "offline"),
+        # Valid interface states (not init, not an error sentinel)
+        valid_states = ("probing", "online", "degraded", "offline")
+        test(f"{name}: in valid state", state in valid_states,
              detail=f"state={state}")
+        if state not in valid_states:
+            continue
 
         if state == "online":
             # Re-fetch to get current counters
@@ -427,6 +440,9 @@ def phase3():
                                 f"Loss: {i.get('loss_percent', '?')}%")
                 except RuntimeError:
                     pass
+        elif state == "degraded":
+            log(f"  {name} is degraded — quality thresholds exceeded but still in policy")
+            test(f"{name}: degraded (not offline)", True)
         elif state == "offline":
             test(f"{name}: expected online or probing", False, detail=f"state=offline")
 
@@ -574,19 +590,25 @@ def phase5():
     test("reload command succeeds", r.returncode == 0,
          detail=r.stderr.strip() if r.returncode != 0 else None)
 
-    # Wait for socket readiness (reload may briefly disrupt)
+    # Verify daemon is alive and IPC is responsive after reload
     if not wait_for_socket(timeout=10):
         log("Warning: IPC socket did not reappear after reload")
 
-    # Check daemon still running
     test("daemon still running after reload", daemon_is_running())
 
-    # Check states preserved
-    try:
-        after = nopal_status()
-    except RuntimeError as e:
-        test("fetch post-reload status", False, detail=str(e))
+    # Verify socket is actually accepting by querying status (with retry)
+    after = None
+    for attempt in range(3):
+        try:
+            after = nopal_status()
+            break
+        except RuntimeError:
+            if attempt < 2:
+                time.sleep(1)
+    if after is None:
+        test("fetch post-reload status", False, detail="3 attempts failed")
         return
+    test("IPC responsive after reload", True)
 
     after_states = {i["name"]: i["state"] for i in after["interfaces"]}
     log(f"After reload: {after_states}")
@@ -707,7 +729,7 @@ def phase_soak():
     log("Will also query status and reload periodically to exercise the daemon.\n")
 
     # Baseline log errors so we only report new ones
-    baseline_logs = get_all_log_lines()
+    baseline_logs = get_log_snapshot()
 
     samples = [(time.time(), initial_rss)]
     interval = 60
@@ -757,7 +779,7 @@ def phase_soak():
                     pid = new_pid
 
             # Check for NEW error logs only
-            new_errors = check_logs_for_errors(since_lines=baseline_logs)
+            new_errors = check_logs_for_errors(exclude_lines=baseline_logs)
             if new_errors:
                 log(f"  [{iteration}] {len(new_errors)} new error-level log messages")
                 for e in new_errors[:2]:
