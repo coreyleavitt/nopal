@@ -482,7 +482,7 @@ proc recordTimeout*(engine: var ProbeEngine, index: int): Option[ProbeResult] =
     lossPercent: lossPct,
   ))
 
-proc getFds*(engine: ProbeEngine): seq[tuple[slot: int, fd: cint]] =
+proc getFds*(engine: var ProbeEngine): seq[tuple[slot: int, fd: cint]] =
   ## Collect all valid file descriptors from all probes for selector
   ## registration. Skips any transport with uninitialized fd (< 0)
   ## and records the interface name in `invalidFdInterfaces`.
