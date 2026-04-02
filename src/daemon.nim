@@ -147,13 +147,13 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
   var ctMgr = newConntrackManager()
 
   # Register signal pipe with selector
-  selector.registerHandle(signalFd, {Read}, TokenSignal)
+  selector.registerHandle(signalFd.int, {Read}, TokenSignal)
 
   # Register link monitor
-  selector.registerHandle(linkMon.fd, {Read}, TokenLink)
+  selector.registerHandle(linkMon.fd.int, {Read}, TokenLink)
 
   # Register route monitor
-  selector.registerHandle(routeMon.fd, {Read}, TokenRoute)
+  selector.registerHandle(routeMon.fd.int, {Read}, TokenRoute)
 
   # Initialize IPC server (registers listener fd with selector)
   let ipcServer = initIpcServer(config.globals.ipcSocket, selector)
@@ -1011,7 +1011,7 @@ proc initializeInterfaces(d: var Daemon) =
 
   # Register probe socket fds with selector
   for (slot, fd) in d.probeEngine.getFds():
-    d.selector.registerHandle(fd, {Read}, ProbeTokenBase + slot)
+    d.selector.registerHandle(fd.int, {Read}, ProbeTokenBase + slot)
 
   # Set up routes and DNS for initial_state=online interfaces
   for index in onlineIndices:
@@ -1077,7 +1077,7 @@ proc handleReload(d: var Daemon) =
   # Deregister probe sockets from selector
   for (slot, fd) in d.probeEngine.getFds():
     try:
-      d.selector.unregister(fd)
+      d.selector.unregister(fd.int)
     except CatchableError:
       discard
 
@@ -1205,7 +1205,7 @@ proc handleReload(d: var Daemon) =
 
   # Register new probe sockets with selector
   for (slot, fd) in d.probeEngine.getFds():
-    d.selector.registerHandle(fd, {Read}, ProbeTokenBase + slot)
+    d.selector.registerHandle(fd.int, {Read}, ProbeTokenBase + slot)
 
   # Restore routes and DNS for Online and Degraded interfaces
   var restoreIndices: seq[int]
