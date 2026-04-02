@@ -1,108 +1,113 @@
 # nopal cross-compilation toolchain image
 #
-# Builds crosstool-ng musl toolchains for all 4 OpenWrt targets,
-# installs Nim, and provides everything needed to cross-compile nopal.
+# Contains: clang, lld, llvm-ar, Nim 2.2.8, nim-mbedtls,
+# musl sysroots + compiler-rt builtins for all 4 OpenWrt targets.
 #
-# Build:
+# Build (~10 min):
 #   docker build -f Dockerfile.toolchain -t ghcr.io/coreyleavitt/nopal-toolchain:latest .
 #
 # Push:
 #   echo $(gh auth token) | docker login ghcr.io -u coreyleavitt --password-stdin
 #   docker push ghcr.io/coreyleavitt/nopal-toolchain:latest
 #
-# Use:
-#   docker run --rm -v "$(pwd):/src" -w /src ghcr.io/coreyleavitt/nopal-toolchain:latest \
-#     nim c -d:release -d:aarch64 src/nopal.nim
+# Use in CI:
+#   container: ghcr.io/coreyleavitt/nopal-toolchain:latest
+#   run: nim c -d:release -d:aarch64 src/nopal.nim
 
 FROM opensuse/tumbleweed:latest
 
-# Build tools for crosstool-ng + Nim
+# Build tools
 RUN zypper --non-interactive install \
-    git \
-    gcc \
-    gcc-c++ \
-    make \
-    curl \
-    tar \
-    xz \
-    gzip \
-    bzip2 \
-    patch \
-    which \
-    gawk \
-    bison \
-    flex \
-    texinfo \
-    help2man \
-    unzip \
-    autoconf \
-    automake \
-    libtool \
-    python3 \
-    wget \
-    file \
-    rsync \
+    clang lld llvm \
+    cmake ninja \
+    git make curl tar xz gzip bzip2 which \
     mbedtls-devel \
     && zypper clean --all
 
-# Install crosstool-ng
-ARG CTNG_VERSION=1.26.0
-RUN cd /tmp \
-    && curl -LO "http://crosstool-ng.org/download/crosstool-ng/crosstool-ng-${CTNG_VERSION}.tar.xz" \
-    && tar xf "crosstool-ng-${CTNG_VERSION}.tar.xz" \
-    && cd "crosstool-ng-${CTNG_VERSION}" \
-    && ./configure --prefix=/usr/local \
-    && make -j$(nproc) \
-    && make install \
-    && cd / && rm -rf /tmp/crosstool-ng*
-
-# Build all 4 musl cross-toolchains
-# Each target takes ~15-20 min; total ~60-80 min
-WORKDIR /tmp/ct-ng-build
-
-# aarch64-unknown-linux-musl
-RUN mkdir -p aarch64 && cd aarch64 \
-    && ct-ng aarch64-unknown-linux-musl \
-    && ct-ng build CT_PREFIX=/opt/cross \
-    && cd /tmp/ct-ng-build && rm -rf aarch64
-
-# armv7-unknown-linux-musleabihf
-RUN mkdir -p armv7 && cd armv7 \
-    && ct-ng armv7-unknown-linux-musleabihf \
-    && ct-ng build CT_PREFIX=/opt/cross \
-    && cd /tmp/ct-ng-build && rm -rf armv7
-
-# mips-unknown-linux-musl
-RUN mkdir -p mips && cd mips \
-    && ct-ng mips-unknown-linux-musl \
-    && ct-ng build CT_PREFIX=/opt/cross \
-    && cd /tmp/ct-ng-build && rm -rf mips
-
-# mipsel-unknown-linux-musl
-RUN mkdir -p mipsel && cd mipsel \
-    && ct-ng mipsel-unknown-linux-musl \
-    && ct-ng build CT_PREFIX=/opt/cross \
-    && cd /tmp/ct-ng-build && rm -rf mipsel
-
-# Add all toolchains to PATH
-ENV PATH="/opt/cross/aarch64-unknown-linux-musl/bin:/opt/cross/armv7-unknown-linux-musleabihf/bin:/opt/cross/mips-unknown-linux-musl/bin:/opt/cross/mipsel-unknown-linux-musl/bin:${PATH}"
-
-# Clean up ct-ng build directory
-WORKDIR /
-RUN rm -rf /tmp/ct-ng-build
-
-# Install Nim via choosenim
-RUN curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y
+# Install Nim (pinned version)
+RUN curl https://nim-lang.org/choosenim/init.sh -sSf | bash -s -- -y --version 2.2.8
 ENV PATH="/root/.nimble/bin:${PATH}"
 
-# Install nim-mbedtls for -d:https builds
+# Install nim-mbedtls
 RUN nimble install -y https://github.com/coreyleavitt/nim-mbedtls
 
-# Verify toolchains are accessible
-RUN aarch64-unknown-linux-musl-gcc --version | head -1 \
-    && armv7-unknown-linux-musleabihf-gcc --version | head -1 \
-    && mips-unknown-linux-musl-gcc --version | head -1 \
-    && mipsel-unknown-linux-musl-gcc --version | head -1 \
-    && nim --version | head -1
+# Build musl sysroots + compiler-rt builtins for all 4 targets
+ARG MUSL_VERSION=1.2.5
+ARG LLVM_VERSION=19.1.7
+
+# Download sources once
+RUN cd /tmp \
+    && curl -LO "https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz" \
+    && curl -LO "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz" \
+    && tar xf "musl-${MUSL_VERSION}.tar.gz" \
+    && tar xf "llvm-project-${LLVM_VERSION}.src.tar.xz"
+
+# Helper script to build musl sysroot + compiler-rt for one target
+RUN echo '#!/bin/bash\n\
+set -e\n\
+TARGET=$1\n\
+SYSROOT=$2\n\
+EXTRA_CONFIGURE=${3:-}\n\
+\n\
+echo "=== Building musl sysroot for $TARGET ===" \n\
+cd /tmp && mkdir -p "musl-build-$TARGET" && cd "musl-build-$TARGET"\n\
+CC="clang --target=$TARGET" AR=llvm-ar RANLIB=llvm-ranlib \\\n\
+  /tmp/musl-${MUSL_VERSION}/configure \\\n\
+    --prefix=$SYSROOT --target=$TARGET --disable-shared $EXTRA_CONFIGURE\n\
+make -j$(nproc) && make install\n\
+cd /tmp && rm -rf "musl-build-$TARGET"\n\
+\n\
+echo "=== Building compiler-rt builtins for $TARGET ==="\n\
+mkdir -p "/tmp/rt-build-$TARGET" && cd "/tmp/rt-build-$TARGET"\n\
+cmake "/tmp/llvm-project-${LLVM_VERSION}.src/compiler-rt" -G Ninja \\\n\
+  -DCMAKE_AR=$(which llvm-ar) \\\n\
+  -DCMAKE_NM=$(which llvm-nm) \\\n\
+  -DCMAKE_RANLIB=$(which llvm-ranlib) \\\n\
+  -DCMAKE_C_COMPILER=clang \\\n\
+  -DCMAKE_C_COMPILER_TARGET="$TARGET" \\\n\
+  -DCMAKE_C_FLAGS="--sysroot=$SYSROOT" \\\n\
+  -DCMAKE_ASM_COMPILER_TARGET="$TARGET" \\\n\
+  -DCMAKE_ASM_FLAGS="--sysroot=$SYSROOT" \\\n\
+  -DCMAKE_SYSROOT="$SYSROOT" \\\n\
+  -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \\\n\
+  -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \\\n\
+  -DCOMPILER_RT_BUILD_BUILTINS=ON \\\n\
+  -DCOMPILER_RT_BUILD_CRT=ON \\\n\
+  -DCOMPILER_RT_BUILD_SANITIZERS=OFF \\\n\
+  -DCOMPILER_RT_BUILD_XRAY=OFF \\\n\
+  -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \\\n\
+  -DCOMPILER_RT_BUILD_PROFILE=OFF \\\n\
+  -DCOMPILER_RT_BUILD_MEMPROF=OFF \\\n\
+  -DCOMPILER_RT_BUILD_ORC=OFF \\\n\
+  -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \\\n\
+  -DCOMPILER_RT_INCLUDE_TESTS=OFF \\\n\
+  -DLLVM_CMAKE_DIR="/tmp/llvm-project-${LLVM_VERSION}.src/cmake/Modules"\n\
+ninja builtins crt\n\
+\n\
+CLANG_RT_DIR=$(clang --print-resource-dir)/lib/linux\n\
+mkdir -p "$CLANG_RT_DIR"\n\
+cp lib/linux/*.a "$CLANG_RT_DIR/" 2>/dev/null || true\n\
+cp lib/linux/*.o "$CLANG_RT_DIR/" 2>/dev/null || true\n\
+cd /tmp && rm -rf "rt-build-$TARGET"\n\
+echo "=== Done: $TARGET ==="' > /tmp/build-target.sh && chmod +x /tmp/build-target.sh
+
+# Build all 4 targets
+RUN /tmp/build-target.sh aarch64-linux-musl /opt/musl/aarch64
+RUN /tmp/build-target.sh arm-linux-musleabihf /opt/musl/armv7hf
+RUN /tmp/build-target.sh mips-linux-musl /opt/musl/mips
+RUN /tmp/build-target.sh mipsel-linux-musl /opt/musl/mipsel
+
+# Clean up source downloads (~1.5GB)
+RUN rm -rf /tmp/musl-* /tmp/llvm-project-* /tmp/build-target.sh
+
+# Verify everything is in place
+RUN clang --version | head -1 \
+    && nim --version | head -1 \
+    && ls /opt/musl/aarch64/lib/libc.a \
+    && ls /opt/musl/armv7hf/lib/libc.a \
+    && ls /opt/musl/mips/lib/libc.a \
+    && ls /opt/musl/mipsel/lib/libc.a \
+    && ls $(clang --print-resource-dir)/lib/linux/ \
+    && echo "All toolchains verified."
 
 WORKDIR /src
