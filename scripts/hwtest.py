@@ -229,10 +229,21 @@ def section(name):
 
 
 def ensure_daemon():
-    """Start daemon if not running, wait for socket. Returns True if ready."""
+    """Start daemon if not running, wait for IPC to be responsive. Returns True if ready."""
     if daemon_is_running() and os.path.exists(SOCKET_PATH):
-        return True
+        # Verify IPC is actually accepting
+        try:
+            nopal_status()
+            return True
+        except RuntimeError:
+            pass  # socket exists but not accepting — restart below
+
     log("Starting daemon...")
+    # Clean stale socket before starting
+    try:
+        os.unlink(SOCKET_PATH)
+    except OSError:
+        pass
     r = run("/etc/init.d/nopal start", check=False)
     if r.returncode != 0:
         log(f"init script failed: {r.stderr.strip()}")
@@ -240,15 +251,28 @@ def ensure_daemon():
     if not wait_for_socket(timeout=15):
         log("Timed out waiting for IPC socket")
         return False
-    return True
+    # Verify IPC is actually responsive (retry a few times)
+    for attempt in range(5):
+        try:
+            nopal_status()
+            return True
+        except RuntimeError:
+            time.sleep(1)
+    log("Daemon started but IPC not responding")
+    return False
 
 
 def stop_daemon():
-    """Stop daemon and wait for process exit."""
+    """Stop daemon, wait for process exit, clean up stale socket."""
     run("/etc/init.d/nopal stop", check=False)
     if not wait_for_exit(timeout=10):
         log("Warning: daemon still running after stop + 10s")
         return False
+    # Remove stale socket so ensure_daemon doesn't see it as "ready"
+    try:
+        os.unlink(SOCKET_PATH)
+    except OSError:
+        pass
     return True
 
 
@@ -658,6 +682,23 @@ def phase6():
     except RuntimeError as e:
         test("fetch status", False, detail=str(e))
         return
+
+    # Wait for at least one interface to come online before checking policies
+    interfaces = status.get("interfaces", [])
+    online = [i for i in interfaces if i["state"] == "online"]
+    if not online:
+        log("No interfaces online yet, waiting up to 60s for probes to succeed...")
+        for iface in interfaces:
+            name = iface["name"]
+            reached, _ = wait_for_state(name, "online", timeout=60)
+            if reached:
+                break
+        # Re-fetch status after waiting
+        try:
+            status = nopal_status()
+        except RuntimeError as e:
+            test("fetch status after wait", False, detail=str(e))
+            return
 
     # Policies
     policies = status.get("policies", [])
