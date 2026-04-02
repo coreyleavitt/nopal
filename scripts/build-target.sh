@@ -3,10 +3,11 @@ set -e
 TARGET=$1
 SYSROOT=$2
 EXTRA_CONFIGURE=${3:-}
+EXTRA_CFLAGS=${4:-}
 
 echo "=== Building musl sysroot for $TARGET ==="
 cd /tmp && mkdir -p "musl-build-$TARGET" && cd "musl-build-$TARGET"
-CC="clang --target=$TARGET" AR=llvm-ar RANLIB=llvm-ranlib \
+CC="clang --target=$TARGET $EXTRA_CFLAGS" AR=llvm-ar RANLIB=llvm-ranlib \
   /tmp/musl-${MUSL_VERSION}/configure \
     --prefix=$SYSROOT --target=$TARGET --disable-shared $EXTRA_CONFIGURE
 make -j$(nproc) && make install
@@ -20,9 +21,9 @@ cmake "/tmp/llvm-project-${LLVM_VERSION}.src/compiler-rt" -G Ninja \
   -DCMAKE_RANLIB=$(which llvm-ranlib) \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_C_COMPILER_TARGET="$TARGET" \
-  -DCMAKE_C_FLAGS="--sysroot=$SYSROOT" \
+  -DCMAKE_C_FLAGS="--sysroot=$SYSROOT $EXTRA_CFLAGS" \
   -DCMAKE_ASM_COMPILER_TARGET="$TARGET" \
-  -DCMAKE_ASM_FLAGS="--sysroot=$SYSROOT" \
+  -DCMAKE_ASM_FLAGS="--sysroot=$SYSROOT $EXTRA_CFLAGS" \
   -DCMAKE_SYSROOT="$SYSROOT" \
   -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
   -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
