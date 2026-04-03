@@ -3,7 +3,7 @@
 ## Ported from the Rust implementation in chains.rs. Builds all base chains,
 ## regular chains, expression helpers, and rule generation for policy routing.
 
-import std/[json, strutils, strformat, options, algorithm, sequtils]
+import std/[json, strutils, strformat, options, sequtils]
 import ./ruleset
 
 # ---------------------------------------------------------------------------
@@ -41,6 +41,123 @@ type
     policy*: string
     sticky*: Option[StickyInfo]
     log*: bool
+
+# ---------------------------------------------------------------------------
+# Pure decision types (no JSON dependency)
+# ---------------------------------------------------------------------------
+
+type
+  PortValue* {.requiresInit.} = object
+    ## Pure port representation for decision logic.
+    ## JSON translation handled separately.
+    case isRange*: bool
+    of true:
+      rangeStart*, rangeEnd*: uint16
+    of false:
+      port*: uint16
+
+  ProtoFamilyPair* = tuple[proto, familyOverride: string]
+  WeightSlot* = tuple[slot: uint32, interfaceName: string]
+  StickyKeySpec* = tuple[suffix, keyType: string]
+  Tier* = tuple[metric: uint32, members: seq[PolicyMember]]
+
+# ---------------------------------------------------------------------------
+# Pure decision functions (func + {.raises: [].})
+# ---------------------------------------------------------------------------
+
+func ipProtocol*(address: string): string {.raises: [].} =
+  ## Determine nftables protocol from address format.
+  if ':' in address: "ip6" else: "ip"
+
+func ipProtocolFor*(address, ruleFamily: string): string {.raises: [].} =
+  ## Determine protocol considering named sets and rule family.
+  if address.len > 0 and address[0] == '@':
+    if ruleFamily == "ipv6": "ip6" else: "ip"
+  else:
+    ipProtocol(address)
+
+func parsePortValue*(port: string): PortValue {.raises: [].} =
+  ## Parse a port string into a pure PortValue. Handles single ports and ranges.
+  let dashIdx = port.find('-')
+  if dashIdx >= 0:
+    let loPart = port[0 ..< dashIdx]
+    let hiPart = port[dashIdx + 1 .. ^1]
+    try:
+      let lo = parseInt(loPart)
+      let hi = parseInt(hiPart)
+      return PortValue(isRange: true, rangeStart: uint16(lo), rangeEnd: uint16(hi))
+    except ValueError:
+      discard
+  try:
+    let n = parseInt(port)
+    return PortValue(isRange: false, port: uint16(n))
+  except ValueError:
+    discard
+  # Fallback: treat as port 0
+  PortValue(isRange: false, port: 0)
+
+func expandProtoFamily*(proto, family: string, hasPorts: bool): seq[ProtoFamilyPair] {.raises: [].} =
+  ## Expand proto+family into concrete (proto, familyOverride) pairs.
+  ## E.g., icmp+any → [(icmp, ipv4), (icmpv6, ipv6)]
+  let isIcmp = proto == "icmp"
+  if isIcmp:
+    case family
+    of "ipv4": @[("icmp", "")]
+    of "ipv6": @[("icmpv6", "")]
+    else: @[("icmp", "ipv4"), ("icmpv6", "ipv6")]
+  elif proto == "all" and hasPorts:
+    @[("tcp", ""), ("udp", "")]
+  else:
+    @[(proto, "")]
+
+func computeWeightSlots*(members: openArray[PolicyMember]): seq[WeightSlot] {.raises: [].} =
+  ## Map member weights to numbered slots for numgen vmap.
+  ## E.g., weights [30, 50, 20] → 100 slots: 0-29→wan, 30-79→lte, 80-99→wifi
+  var slot: uint32 = 0
+  for member in members:
+    for _ in 0 ..< member.weight:
+      result.add((slot: slot, interfaceName: member.interfaceName))
+      slot += 1
+
+func determineStickyKeys*(mode, family: string): seq[StickyKeySpec] {.raises: [].} =
+  ## Determine map suffixes and key types for sticky sessions.
+  ## Returns one entry per address family to create maps for.
+  let keyBase = if mode == "src_dst": "_addr" else: "_addr"
+  case family
+  of "ipv4":
+    if mode == "src_dst":
+      @[("_v4", "ipv4_addr . ipv4_addr")]
+    else:
+      @[("_v4", "ipv4_addr")]
+  of "ipv6":
+    if mode == "src_dst":
+      @[("_v6", "ipv6_addr . ipv6_addr")]
+    else:
+      @[("_v6", "ipv6_addr")]
+  else:  # "any" — both families
+    if mode == "src_dst":
+      @[("_v4", "ipv4_addr . ipv4_addr"), ("_v6", "ipv6_addr . ipv6_addr")]
+    else:
+      @[("_v4", "ipv4_addr"), ("_v6", "ipv6_addr")]
+
+func groupByMetric*(members: openArray[PolicyMember]): seq[Tier] {.raises: [].} =
+  ## Group policy members by metric value, sorted ascending.
+  ## Lower metric = higher priority. Members at the same metric are load-balanced.
+  for member in members:
+    var found = false
+    for i in 0 ..< result.len:
+      if result[i].metric == member.metric:
+        result[i].members.add(member)
+        found = true
+        break
+    if not found:
+      result.add((metric: member.metric, members: @[member]))
+  # Manual insertion sort (small N, avoids sort's potential raises)
+  for i in 1 ..< result.len:
+    var j = i
+    while j > 0 and result[j].metric < result[j - 1].metric:
+      swap(result[j], result[j - 1])
+      dec j
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -126,14 +243,7 @@ proc goto(target: string): JsonNode =
 # IP/port helpers
 # ---------------------------------------------------------------------------
 
-proc ipProtocol(address: string): string =
-  if ':' in address: "ip6" else: "ip"
-
-proc ipProtocolFor(address, ruleFamily: string): string =
-  if address.startsWith('@'):
-    if ruleFamily == "ipv6": "ip6" else: "ip"
-  else:
-    ipProtocol(address)
+## ipProtocol and ipProtocolFor are now pure funcs defined above.
 
 proc ipRightValue(address: string): JsonNode =
   if address.startsWith('@'):
@@ -170,23 +280,14 @@ proc matchDaddrNamedSet(setName, family: string): JsonNode =
   let protocol = if family == "ipv6": "ip6" else: "ip"
   %*{"match": {"op": "==", "left": {"payload": {"protocol": protocol, "field": "daddr"}}, "right": "@" & setName}}
 
+proc portToJson(pv: PortValue): JsonNode =
+  if pv.isRange:
+    %*{"range": [int(pv.rangeStart), int(pv.rangeEnd)]}
+  else:
+    %*int(pv.port)
+
 proc parsePort(port: string): JsonNode =
-  let dashIdx = port.find('-')
-  if dashIdx >= 0:
-    let loPart = port[0 ..< dashIdx]
-    let hiPart = port[dashIdx + 1 .. ^1]
-    try:
-      let lo = parseInt(loPart)
-      let hi = parseInt(hiPart)
-      return %*{"range": [lo, hi]}
-    except ValueError:
-      discard
-  try:
-    let n = parseInt(port)
-    return %*n
-  except ValueError:
-    discard
-  return %*port
+  portToJson(parsePortValue(port))
 
 proc matchSrcPort(port, proto: string): JsonNode =
   %*{"match": {"op": "==", "left": {"payload": {"protocol": proto, "field": "sport"}}, "right": parsePort(port)}}
@@ -212,25 +313,7 @@ proc setMarkFromMap(key: JsonNode, mapName: string): JsonNode =
 proc updateMap(key: JsonNode, mapName: string): JsonNode =
   %*{"map": {"op": "update", "elem": key, "data": {"meta": {"key": "mark"}}, "map": {"@": mapName}}}
 
-# ---------------------------------------------------------------------------
-# Tier grouping helper
-# ---------------------------------------------------------------------------
-
-type Tier = tuple[metric: uint32, members: seq[PolicyMember]]
-
-proc groupByMetric(members: seq[PolicyMember]): seq[Tier] =
-  var tiers: seq[Tier] = @[]
-  for member in members:
-    var found = false
-    for i in 0 ..< tiers.len:
-      if tiers[i].metric == member.metric:
-        tiers[i].members.add(member)
-        found = true
-        break
-    if not found:
-      tiers.add((metric: member.metric, members: @[member]))
-  tiers.sort(proc(a, b: Tier): int = cmp(a.metric, b.metric))
-  tiers
+## groupByMetric is now a pure func defined above.
 
 # ---------------------------------------------------------------------------
 # Chain builders
@@ -291,20 +374,7 @@ proc buildPolicyRules(rs: var Ruleset, rules: openArray[RuleInfo]) =
   for i, rule in rules:
     let hasPorts = rule.srcPort.len > 0 or rule.destPort.len > 0
     let isIcmp = rule.proto == "icmp"
-
-    # Build list of (proto, familyOverride) pairs
-    type ProtoFamilyPair = tuple[proto: string, familyOverride: string]
-    var pairs: seq[ProtoFamilyPair]
-
-    if isIcmp:
-      case rule.family
-      of "ipv4": pairs = @[("icmp", "")]
-      of "ipv6": pairs = @[("icmpv6", "")]
-      else: pairs = @[("icmp", "ipv4"), ("icmpv6", "ipv6")]
-    elif rule.proto == "all" and hasPorts:
-      pairs = @[("tcp", ""), ("udp", "")]
-    else:
-      pairs = @[(rule.proto, "")]
+    let pairs = expandProtoFamily(rule.proto, rule.family, hasPorts)
 
     for pair in pairs:
       let (proto, familyOverride) = pair
@@ -382,15 +452,11 @@ proc buildPolicyChain(rs: var Ruleset, policy: PolicyInfo) =
       rs.addRule(chainName, @[goto(fmt"mark_{members[0].interfaceName}")])
     else:
       # Weighted round-robin via numgen vmap
-      var total: uint32 = 0
-      for m in members:
-        total += m.weight
+      let slots = computeWeightSlots(members)
+      let total = uint32(slots.len)
       var vmapEntries = newJArray()
-      var slot: uint32 = 0
-      for member in members:
-        for _ in 0 ..< member.weight:
-          vmapEntries.add(%*[slot, {"goto": {"target": "mark_" & member.interfaceName}}])
-          slot += 1
+      for ws in slots:
+        vmapEntries.add(%*[ws.slot, {"goto": {"target": "mark_" & ws.interfaceName}}])
       rs.addRule(chainName, @[
         %*{"vmap": {"key": {"numgen": {"mode": "inc", "mod": total, "offset": 0}}, "data": {"set": vmapEntries}}}
       ])
@@ -574,6 +640,118 @@ proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[Pol
 
 when isMainModule:
   import std/unittest
+
+  suite "pure decision functions":
+    test "computeWeightSlots equal weights":
+      let members = @[
+        PolicyMember(interfaceName: "wan", mark: 0, weight: 1, metric: 0),
+        PolicyMember(interfaceName: "lte", mark: 0, weight: 1, metric: 0),
+      ]
+      let slots = computeWeightSlots(members)
+      check slots.len == 2
+      check slots[0] == (slot: 0'u32, interfaceName: "wan")
+      check slots[1] == (slot: 1'u32, interfaceName: "lte")
+
+    test "computeWeightSlots unequal weights":
+      let members = @[
+        PolicyMember(interfaceName: "wan", mark: 0, weight: 3, metric: 0),
+        PolicyMember(interfaceName: "lte", mark: 0, weight: 2, metric: 0),
+      ]
+      let slots = computeWeightSlots(members)
+      check slots.len == 5
+      check slots[0].interfaceName == "wan"
+      check slots[2].interfaceName == "wan"
+      check slots[3].interfaceName == "lte"
+      check slots[4].interfaceName == "lte"
+
+    test "computeWeightSlots single member":
+      let members = @[PolicyMember(interfaceName: "wan", mark: 0, weight: 50, metric: 0)]
+      let slots = computeWeightSlots(members)
+      check slots.len == 50
+      for s in slots:
+        check s.interfaceName == "wan"
+
+    test "expandProtoFamily icmp any":
+      let pairs = expandProtoFamily("icmp", "any", false)
+      check pairs.len == 2
+      check pairs[0].proto == "icmp"
+      check pairs[0].familyOverride == "ipv4"
+      check pairs[1].proto == "icmpv6"
+      check pairs[1].familyOverride == "ipv6"
+
+    test "expandProtoFamily icmp ipv4":
+      let pairs = expandProtoFamily("icmp", "ipv4", false)
+      check pairs.len == 1
+      check pairs[0].proto == "icmp"
+
+    test "expandProtoFamily all with ports":
+      let pairs = expandProtoFamily("all", "any", true)
+      check pairs.len == 2
+      check pairs[0].proto == "tcp"
+      check pairs[1].proto == "udp"
+
+    test "expandProtoFamily all without ports":
+      let pairs = expandProtoFamily("all", "any", false)
+      check pairs.len == 1
+      check pairs[0].proto == "all"
+
+    test "expandProtoFamily tcp":
+      let pairs = expandProtoFamily("tcp", "ipv4", true)
+      check pairs.len == 1
+      check pairs[0].proto == "tcp"
+      check pairs[0].familyOverride == ""
+
+    test "parsePortValue single port":
+      let pv = parsePortValue("80")
+      check not pv.isRange
+      check pv.port == 80
+
+    test "parsePortValue range":
+      let pv = parsePortValue("1024-65535")
+      check pv.isRange
+      check pv.rangeStart == 1024
+      check pv.rangeEnd == 65535
+
+    test "groupByMetric single tier":
+      let members = @[
+        PolicyMember(interfaceName: "wan", mark: 0, weight: 1, metric: 10),
+        PolicyMember(interfaceName: "lte", mark: 0, weight: 1, metric: 10),
+      ]
+      let tiers = groupByMetric(members)
+      check tiers.len == 1
+      check tiers[0].metric == 10
+      check tiers[0].members.len == 2
+
+    test "groupByMetric multi tier sorted":
+      let members = @[
+        PolicyMember(interfaceName: "lte", mark: 0, weight: 1, metric: 20),
+        PolicyMember(interfaceName: "wan", mark: 0, weight: 1, metric: 10),
+      ]
+      let tiers = groupByMetric(members)
+      check tiers.len == 2
+      check tiers[0].metric == 10
+      check tiers[0].members[0].interfaceName == "wan"
+      check tiers[1].metric == 20
+
+    test "determineStickyKeys src_ip ipv4":
+      let keys = determineStickyKeys("src_ip", "ipv4")
+      check keys.len == 1
+      check keys[0].suffix == "_v4"
+      check keys[0].keyType == "ipv4_addr"
+
+    test "determineStickyKeys src_dst any":
+      let keys = determineStickyKeys("src_dst", "any")
+      check keys.len == 2
+      check keys[0].suffix == "_v4"
+      check "ipv4_addr" in keys[0].keyType
+      check keys[1].suffix == "_v6"
+      check "ipv6_addr" in keys[1].keyType
+
+    test "ipProtocol detects family":
+      check ipProtocol("192.168.1.1") == "ip"
+      check ipProtocol("::1") == "ip6"
+      check ipProtocol("10.0.0.0/8") == "ip"
+      check ipProtocol("fd00::/64") == "ip6"
 
   # Minimal Ruleset stub for testing (mirrors ruleset.nim interface)
   # If ruleset.nim is available, this block can be removed and the import used.
