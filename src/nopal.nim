@@ -300,7 +300,7 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
   let reloadPending = resp.data{"reload_pending"}
   if reloadPending != nil and reloadPending.kind == JObject:
     let remaining = reloadPending{"remaining_secs"}.getInt(0)
-    echo fmt"  RELOAD PENDING CONFIRMATION ({remaining}s remaining)"
+    echo fmt"  RELOAD PENDING — auto-rollback in {remaining}s (run 'nopal accept' to keep)"
   echo ""
 
   let interfaces = resp.data{"interfaces"}
@@ -373,58 +373,36 @@ proc cliConnected(socketPath: string, jsonMode: bool) =
 proc cliReload(socketPath: string, args: seq[string]) =
   # Parse reload subcommand flags
   var confirmTimeout = 0
-  var doAccept = false
-  var doCancel = false
 
   var i = 0
   while i < args.len:
     case args[i]
-    of "--confirm":
+    of "--rollback":
       if i + 1 < args.len:
         try:
           confirmTimeout = parseInt(args[i + 1])
           if confirmTimeout <= 0:
-            stderr.writeLine "error: --confirm requires a positive number of seconds"
+            stderr.writeLine "error: --rollback requires a positive number of seconds"
             quit(1)
         except ValueError:
           stderr.writeLine fmt"error: invalid timeout value '{args[i + 1]}'"
           quit(1)
         inc i
       else:
-        stderr.writeLine "error: --confirm requires a timeout in seconds"
+        stderr.writeLine "error: --rollback requires a timeout in seconds"
         quit(1)
-    of "--accept":
-      doAccept = true
-    of "--cancel":
-      doCancel = true
     else:
       stderr.writeLine fmt"error: unknown reload flag '{args[i]}'"
       quit(1)
     inc i
 
-  if doAccept:
-    let req = IpcRequest(id: 1, rpcMethod: "config.accept")
-    let resp = sendIpcRequest(socketPath, req)
-    if resp.success:
-      echo "reload confirmed — new configuration accepted"
-    else:
-      stderr.writeLine fmt"accept failed: {resp.error}"
-      quit(1)
-  elif doCancel:
-    let req = IpcRequest(id: 1, rpcMethod: "config.cancel")
-    let resp = sendIpcRequest(socketPath, req)
-    if resp.success:
-      echo "reload cancelled — configuration rolled back"
-    else:
-      stderr.writeLine fmt"cancel failed: {resp.error}"
-      quit(1)
-  elif confirmTimeout > 0:
+  if confirmTimeout > 0:
     let params = %*{"confirm_timeout": confirmTimeout}
     let req = IpcRequest(id: 1, rpcMethod: "config.reload", params: params)
     let resp = sendIpcRequest(socketPath, req)
     if resp.success:
-      echo fmt"configuration reloaded with {confirmTimeout}s confirmation timeout"
-      echo "run 'nopal reload --accept' to confirm, or wait for auto-rollback"
+      echo fmt"configuration reloaded — auto-rollback in {confirmTimeout}s"
+      echo "run 'nopal accept' to keep, or wait for rollback"
     else:
       stderr.writeLine fmt"reload failed: {resp.error}"
       quit(1)
@@ -436,6 +414,24 @@ proc cliReload(socketPath: string, args: seq[string]) =
     else:
       stderr.writeLine fmt"reload failed: {resp.error}"
       quit(1)
+
+proc cliAccept(socketPath: string) =
+  let req = IpcRequest(id: 1, rpcMethod: "config.accept")
+  let resp = sendIpcRequest(socketPath, req)
+  if resp.success:
+    echo "reload accepted — new configuration kept"
+  else:
+    stderr.writeLine fmt"accept failed: {resp.error}"
+    quit(1)
+
+proc cliCancel(socketPath: string) =
+  let req = IpcRequest(id: 1, rpcMethod: "config.cancel")
+  let resp = sendIpcRequest(socketPath, req)
+  if resp.success:
+    echo "reload cancelled — configuration rolled back"
+  else:
+    stderr.writeLine fmt"cancel failed: {resp.error}"
+    quit(1)
 
 proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
   ## Run a command with traffic routed through a specific interface.
@@ -547,9 +543,9 @@ proc printUsage() =
   echo "  nopal use <iface> <cmd...>   Run command via specific WAN"
   echo "  nopal rules                  Show active nftables rules"
   echo "  nopal reload                 Reload configuration"
-  echo "  nopal reload --confirm <s>   Reload with auto-rollback after <s> seconds"
-  echo "  nopal reload --accept        Confirm pending reload"
-  echo "  nopal reload --cancel        Cancel pending reload and rollback"
+  echo "  nopal reload --rollback <s>  Reload with auto-rollback after <s> seconds"
+  echo "  nopal accept                 Keep pending reload (cancel rollback timer)"
+  echo "  nopal cancel                 Rollback pending reload now"
   echo "  nopal version                Show version"
   echo "  nopal help                   Show this help"
   echo ""
@@ -617,6 +613,10 @@ proc runCli(args: seq[string]) =
       cliInternal()
     of "reload":
       cliReload(socketPath, positional[1..^1])
+    of "accept":
+      cliAccept(socketPath)
+    of "cancel":
+      cliCancel(socketPath)
     of "help":
       printUsage()
     of "version":

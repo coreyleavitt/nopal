@@ -743,7 +743,7 @@ proc handleSignals(d: var Daemon) =
         d.running = false
       of 'R':
         if d.reloadState.pending:
-          warn "SIGHUP ignored: reload pending confirmation"
+          warn "SIGHUP ignored: reload pending — accept or cancel first"
         else:
           info "received reload signal"
           d.handleReload()
@@ -1167,15 +1167,15 @@ proc performRollback(d: var Daemon) =
   info "configuration rollback complete"
 
 proc handleReloadTimeout(d: var Daemon) =
-  ## Timer callback: confirmation timeout expired, auto-rollback.
+  ## Timer callback: rollback timeout expired, auto-rollback.
   if not d.reloadState.pending: return
-  warn "reload confirmation timeout — rolling back"
+  warn "reload rollback timeout — reverting configuration"
   d.performRollback()
 
 proc handleReloadCommand(d: var Daemon, req: IpcRequest): IpcResponse =
   ## IPC command: reload configuration. Supports optional confirm_timeout param.
   if d.reloadState.pending:
-    return errorResponse(req.id, "reload pending confirmation — accept or cancel first")
+    return errorResponse(req.id, "reload pending — run 'nopal accept' or 'nopal cancel' first")
 
   # Check for confirm_timeout param
   let confirmTimeout = if req.params != nil and req.params.hasKey("confirm_timeout"):
@@ -1206,8 +1206,8 @@ proc handleReloadCommand(d: var Daemon, req: IpcRequest): IpcResponse =
       index: 0,
     ))
 
-    info fmt"configuration reloaded with {confirmTimeout}s confirmation timeout"
-    let data = %*{"status": "pending_confirmation", "timeout_secs": confirmTimeout}
+    info fmt"configuration reloaded with {confirmTimeout}s rollback timeout"
+    let data = %*{"status": "pending_rollback", "rollback_secs": confirmTimeout}
     return successResponse(req.id, data)
   else:
     # Immediate reload (existing behavior)
