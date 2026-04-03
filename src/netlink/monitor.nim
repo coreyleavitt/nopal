@@ -46,6 +46,10 @@ proc newRouteMonitor*(): RouteMonitor =
     recvBuf: newSeq[byte](RecvBufSize),
   )
 
+proc close*(rm: var RouteMonitor) {.raises: [].} =
+  ## Close the netlink socket.
+  rm.sock.close()
+
 proc fd*(m: RouteMonitor): cint =
   ## Return the raw fd for selector/poll registration.
   m.sock.fd
