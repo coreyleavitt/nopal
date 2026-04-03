@@ -42,6 +42,10 @@ nim c -r src/nftables/ruleset.nim
 nim c -r src/ipc/protocol.nim
 nim c -r src/ipc/methods.nim
 nim c -r src/dnsmanager.nim
+nim c -r src/timer.nim
+nim c -r src/netlink/route.nim
+nim c -r src/ipc/server.nim
+nim c -r src/config/discover.nim
 
 # HTTPS tests
 nim c -r -d:https src/health/https.nim

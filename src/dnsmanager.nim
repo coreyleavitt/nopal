@@ -41,7 +41,7 @@ proc setServers*(dm: var DnsManager, iface: string, servers: openArray[string]) 
     if clean.len > 0 and '\n' notin clean and '\r' notin clean:
       dm.entries.add(DnsEntry(server: clean, interfaceName: cleanIface))
 
-proc activeServers*(dm: DnsManager): seq[tuple[server, iface: string]] =
+func activeServers*(dm: DnsManager): seq[tuple[server, iface: string]] {.raises: [].} =
   ## Return all active DNS servers with their interface names.
   for e in dm.entries:
     result.add((server: e.server, iface: e.interfaceName))

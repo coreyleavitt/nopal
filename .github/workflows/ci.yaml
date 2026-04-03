@@ -53,6 +53,7 @@ jobs:
           nim c -r src/ipc/methods.nim
           nim c -r src/ipc/server.nim
           nim c -r src/dnsmanager.nim
+          nim c -r src/timer.nim
           nim c -r tests/test_dispatch.nim
 
       - name: Run HTTPS tests

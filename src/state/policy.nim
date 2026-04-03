@@ -4,7 +4,6 @@
 ## sorts tiers by metric (lowest = highest priority). The active tier is
 ## the first one with at least one online member.
 
-import std/[algorithm]
 import ./tracker
 import ../config/schema
 
@@ -23,8 +22,8 @@ type
     tiers*: seq[Tier]
     lastResort*: LastResort
 
-proc resolvePolicy*(policy: PolicyConfig, members: openArray[MemberConfig],
-                    trackers: openArray[InterfaceTracker]): ResolvedPolicy =
+func resolvePolicy*(policy: PolicyConfig, members: openArray[MemberConfig],
+                    trackers: openArray[InterfaceTracker]): ResolvedPolicy {.raises: [].} =
   ## Resolve a policy config against current interface states.
   var active: seq[tuple[metric: uint32, member: ActiveMember]]
 
@@ -52,8 +51,12 @@ proc resolvePolicy*(policy: PolicyConfig, members: openArray[MemberConfig],
         active.add((memberCfg.metric, am))
         break
 
-  # Sort by metric (lowest first)
-  active.sort(proc(a, b: auto): int = cmp(a.metric, b.metric))
+  # Sort by metric (lowest first) — manual insertion sort for {.raises: [].}
+  for i in 1 ..< active.len:
+    var j = i
+    while j > 0 and active[j].metric < active[j - 1].metric:
+      swap(active[j], active[j - 1])
+      dec j
 
   # Group into tiers
   var tiers: seq[Tier]
