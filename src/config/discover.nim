@@ -4,7 +4,7 @@
 ## then reads /etc/config/network to resolve device names for each
 ## interface in those zones. Skips DHCPv6 interfaces.
 
-import std/[strutils, strformat, logging, os]
+import std/[strformat, logging, os]
 import ./parser
 import ./schema
 
