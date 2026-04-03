@@ -346,7 +346,7 @@ func formatIpBytes*(ip: array[16, byte], isV6: bool): string {.raises: [].} =
       let hi = ip[i * 2]
       let lo = ip[i * 2 + 1]
       let val = (uint16(hi) shl 8) or uint16(lo)
-      parts[i] = val.toHex(1).toLowerAscii().strip(chars = {'0'}, trailing = false)
+      parts[i] = val.toHex(4).toLowerAscii().strip(chars = {'0'}, trailing = false)
       if parts[i].len == 0: parts[i] = "0"
     result = parts[0]
     for i in 1 ..< 8:
@@ -1247,4 +1247,40 @@ when isMainModule:
     let t5 = ProbeTransport(kind: tkHttps, httpsFamily: 2,
                              httpsDevice: "", httpsPort: 443)
     check dispatchGetFds(t5).len == 0
+
+  test "formatIpBytes IPv4":
+    var ip: array[16, byte]
+    ip[0] = 8; ip[1] = 8; ip[2] = 8; ip[3] = 8
+    check formatIpBytes(ip, false) == "8.8.8.8"
+
+  test "formatIpBytes IPv4 zeros":
+    var ip: array[16, byte]
+    check formatIpBytes(ip, false) == "0.0.0.0"
+
+  test "formatIpBytes IPv4 255":
+    var ip: array[16, byte]
+    ip[0] = 192; ip[1] = 168; ip[2] = 1; ip[3] = 1
+    check formatIpBytes(ip, false) == "192.168.1.1"
+
+  test "formatIpBytes IPv6 loopback":
+    var ip: array[16, byte]
+    ip[15] = 1
+    check formatIpBytes(ip, true) == "0:0:0:0:0:0:0:1"
+
+  test "formatIpBytes IPv6 2001:db8":
+    var ip: array[16, byte]
+    ip[0] = 0x20; ip[1] = 0x01; ip[2] = 0x0d; ip[3] = 0xb8
+    let result = formatIpBytes(ip, true)
+    check result.startsWith("2001:db8:")
+
+  test "getTargetStatuses found":
+    var engine = initProbeEngine()
+    addTestInterface(engine, 42, "test", 2, 1)
+    let targets = engine.getTargetStatuses(42)
+    check targets.len == 2
+
+  test "getTargetStatuses not found":
+    var engine = initProbeEngine()
+    let targets = engine.getTargetStatuses(999)
+    check targets.len == 0
 
