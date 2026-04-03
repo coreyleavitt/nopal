@@ -1,22 +1,18 @@
-## Interface state machine and tracker.
+## Interface tracker: mutable shell around the pure state machine.
 ##
-## Manages the lifecycle of each WAN interface through five states:
-##   Init -> Probing -> Online <-> Degraded -> Offline
+## Owns the mutable InterfaceTracker state. Provides snapshot() to create
+## immutable input for the pure decide() function, and apply() to write
+## decisions back.
 ##
-## Both Online and Degraded participate in routing. Degraded means
-## reachable but with poor quality, not unreachable.
+## Architecture: tracker.nim (mutable shell) wraps machine.nim (pure core)
 
-import std/[monotimes, options, logging, strformat]
+import std/[monotimes, options]
+import ./machine
 import ../health/dampening
 
-type
-  InterfaceState* = enum
-    isInit      ## Waiting for netifd to report interface up
-    isProbing   ## Link up, probes running, not yet confirmed
-    isOnline    ## Healthy, participating in policies
-    isDegraded  ## Failing probes or quality exceeded, still in policies
-    isOffline   ## Down, removed from policies
+export machine
 
+type
   InterfaceTracker* = object
     name*: string
     index*: int
@@ -35,14 +31,6 @@ type
     lossPercent*: uint32
     onlineSince*: Option[MonoTime]
     offlineSince*: Option[MonoTime]
-
-func `$`*(s: InterfaceState): string =
-  case s
-  of isInit: "init"
-  of isProbing: "probing"
-  of isOnline: "online"
-  of isDegraded: "degraded"
-  of isOffline: "offline"
 
 proc newTracker*(name: string, index: int, mark: uint32, tableId: uint32,
                  device: string, upCount, downCount: uint32): InterfaceTracker =
@@ -72,129 +60,55 @@ func isActive*(t: InterfaceTracker): bool =
   ## Returns true if enabled and (Online or Degraded).
   t.enabled and (t.state == isOnline or t.state == isDegraded)
 
-proc probeSuccess*(t: var InterfaceTracker, qualityOk: bool): Option[InterfaceState] =
-  ## Record a successful probe. Returns new state if a transition occurred.
-  t.failCount = 0
-  t.successCount += 1
-
-  case t.state
-  of isProbing:
-    if t.successCount >= t.upCount:
-      # Check dampening
-      if t.dampening.isSome:
-        var damp = t.dampening.get
-        damp.decay()
-        t.dampening = some(damp)
-        if damp.isSuppressed:
-          info fmt"{t.name}: probing -> online blocked by dampening"
-          return none[InterfaceState]()
-
-      if qualityOk:
-        t.state = isOnline
-        t.onlineSince = some(getMonoTime())
-        t.offlineSince = none[MonoTime]()
-        info fmt"{t.name}: probing -> online ({t.successCount} successes)"
-        return some(isOnline)
-      else:
-        t.state = isDegraded
-        warn fmt"{t.name}: probing -> degraded (quality threshold)"
-        return some(isDegraded)
-    return none[InterfaceState]()
-
-  of isDegraded:
-    if not qualityOk:
-      return none[InterfaceState]()
-    # Check dampening
-    if t.dampening.isSome:
-      var damp = t.dampening.get
-      damp.decay()
-      t.dampening = some(damp)
-      if damp.isSuppressed:
-        info fmt"{t.name}: degraded -> online blocked by dampening"
-        return none[InterfaceState]()
-    t.state = isOnline
-    info fmt"{t.name}: degraded -> online (recovered)"
-    return some(isOnline)
-
-  of isOnline:
-    if not qualityOk:
-      t.state = isDegraded
-      warn fmt"{t.name}: online -> degraded (quality threshold)"
-      return some(isDegraded)
-    return none[InterfaceState]()
-
+proc snapshot*(t: InterfaceTracker, now: MonoTime): TrackerSnapshot =
+  ## Create an immutable snapshot for the pure state machine.
+  ## Computes dampening elapsed time from lastUpdate to now.
+  let dampSnap = if t.dampening.isSome:
+    some(t.dampening.get.toDampeningSnapshot(now))
   else:
-    return none[InterfaceState]()
+    none[DampeningSnapshot]()
 
-proc applyDampeningFailure(t: var InterfaceTracker) =
-  if t.dampening.isSome:
+  TrackerSnapshot(
+    state: t.state,
+    successCount: t.successCount,
+    failCount: t.failCount,
+    upCount: t.upCount,
+    downCount: t.downCount,
+    dampening: dampSnap,
+  )
+
+proc apply*(t: var InterfaceTracker, d: StateDecision, now: MonoTime) =
+  ## Write the pure function's decision back to mutable state.
+  t.successCount = d.newSuccessCount
+  t.failCount = d.newFailCount
+
+  # Update dampening
+  if d.newDampening.isSome and t.dampening.isSome:
     var damp = t.dampening.get
-    let suppressed = damp.applyFailure()
+    damp.applySnapshot(d.newDampening.get, now)
     t.dampening = some(damp)
-    if suppressed:
-      warn fmt"{t.name}: dampening suppressed (penalty: {damp.penalty})"
 
-proc probeFailure*(t: var InterfaceTracker): Option[InterfaceState] =
-  ## Record a failed probe. Returns new state if a transition occurred.
-  t.successCount = 0
-  t.failCount += 1
+  if d.transitioned:
+    let oldState = t.state
+    t.state = d.newState
 
-  case t.state
-  of isOnline:
-    t.state = isDegraded
-    warn fmt"{t.name}: online -> degraded (probe failure)"
-    return some(isDegraded)
-
-  of isDegraded:
-    if t.failCount >= t.downCount:
-      t.applyDampeningFailure()
-      t.state = isOffline
-      t.offlineSince = some(getMonoTime())
+    # Update timestamps on state transitions
+    case d.newState
+    of isOnline:
+      if oldState != isDegraded:  # Degraded→Online doesn't reset onlineSince
+        t.onlineSince = some(now)
+      t.offlineSince = none[MonoTime]()
+    of isDegraded:
+      if oldState == isProbing:  # First time joining policy
+        t.onlineSince = some(now)
+      t.offlineSince = none[MonoTime]()
+    of isOffline:
+      t.offlineSince = some(now)
       t.onlineSince = none[MonoTime]()
-      warn fmt"{t.name}: degraded -> offline ({t.failCount} failures)"
-      return some(isOffline)
-    return none[InterfaceState]()
-
-  of isProbing:
-    if t.failCount >= t.downCount:
-      t.applyDampeningFailure()
-      t.state = isOffline
-      t.offlineSince = some(getMonoTime())
-      t.onlineSince = none[MonoTime]()
-      warn fmt"{t.name}: probing -> offline ({t.failCount} failures)"
-      return some(isOffline)
-    return none[InterfaceState]()
-
-  else:
-    return none[InterfaceState]()
-
-proc linkUp*(t: var InterfaceTracker): Option[InterfaceState] =
-  ## Interface came up via netifd. Returns new state if a transition occurred.
-  case t.state
-  of isInit, isOffline:
-    t.successCount = 0
-    t.failCount = 0
-    t.state = isProbing
-    t.offlineSince = none[MonoTime]()
-    info fmt"{t.name}: {t.state} -> probing (link up)"
-    return some(isProbing)
-  else:
-    return none[InterfaceState]()
-
-proc linkDown*(t: var InterfaceTracker): Option[InterfaceState] =
-  ## Interface went down via netifd. Returns new state if a transition occurred.
-  case t.state
-  of isOffline, isInit:
-    return none[InterfaceState]()
-  else:
-    let prev = t.state
-    t.successCount = 0
-    t.failCount = 0
-    t.state = isOffline
-    t.offlineSince = some(getMonoTime())
-    t.onlineSince = none[MonoTime]()
-    warn fmt"{t.name}: {prev} -> offline (link down)"
-    return some(isOffline)
+    of isProbing:
+      t.offlineSince = none[MonoTime]()
+    of isInit:
+      discard
 
 when isMainModule:
   import std/unittest
@@ -207,190 +121,111 @@ when isMainModule:
     t.setDampening(300, 1000, 500, 250)
     t
 
-  suite "interface state machine":
-    test "init to probing on link up":
+  suite "tracker snapshot/apply round-trip":
+    test "snapshot captures current state":
       var t = makeTracker()
-      check t.state == isInit
-      let s = t.linkUp()
-      check s.isSome
-      check s.get == isProbing
-      check t.state == isProbing
+      t.state = isProbing
+      t.successCount = 5
+      t.failCount = 2
+      let now = getMonoTime()
+      let snap = t.snapshot(now)
+      check snap.state == isProbing
+      check snap.successCount == 5
+      check snap.failCount == 2
+      check snap.upCount == 3
+      check snap.downCount == 5
+      check snap.dampening.isNone
 
-    test "probing to online after up_count":
+    test "snapshot with dampening":
+      var t = makeDampenedTracker()
+      t.dampening.get.penalty = 500.0
+      let now = getMonoTime()
+      let snap = t.snapshot(now)
+      check snap.dampening.isSome
+      check snap.dampening.get.penalty == 500.0
+
+    test "apply writes counters":
       var t = makeTracker()
-      discard t.linkUp()
-      check t.probeSuccess(true).isNone
-      check t.probeSuccess(true).isNone
-      let s = t.probeSuccess(true)
-      check s.isSome
-      check s.get == isOnline
+      let d = StateDecision(
+        newSuccessCount: 10,
+        newFailCount: 3,
+        newDampening: none[DampeningSnapshot](),
+        transitioned: false,
+      )
+      t.apply(d, getMonoTime())
+      check t.successCount == 10
+      check t.failCount == 3
+
+    test "apply writes state on transition":
+      var t = makeTracker()
+      t.state = isProbing
+      let d = StateDecision(
+        newSuccessCount: 3,
+        newFailCount: 0,
+        newDampening: none[DampeningSnapshot](),
+        transitioned: true,
+        newState: isOnline,
+        effects: {efAddRoutes, efRegenerateNftables},
+      )
+      let now = getMonoTime()
+      t.apply(d, now)
       check t.state == isOnline
+      check t.onlineSince.isSome
 
-    test "online to degraded to offline":
+    test "apply sets offlineSince on offline":
       var t = makeTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      check t.state == isOnline
-
-      # First failure: degrade
-      let s1 = t.probeFailure()
-      check s1.isSome
-      check s1.get == isDegraded
-
-      # Next 3 failures: stay degraded (need 5 total)
-      for i in 0 ..< 3:
-        check t.probeFailure().isNone
-
-      # 5th failure: offline
-      let s2 = t.probeFailure()
-      check s2.isSome
-      check s2.get == isOffline
-
-    test "degraded recovers on success":
-      var t = makeTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      discard t.probeFailure()  # -> degraded
-      let s = t.probeSuccess(true)
-      check s.isSome
-      check s.get == isOnline
-
-    test "offline to probing on link up":
-      var t = makeTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      discard t.probeFailure()
-      for i in 0 ..< 4: discard t.probeFailure()  # -> offline
+      t.state = isDegraded
+      let d = StateDecision(
+        newSuccessCount: 0,
+        newFailCount: 5,
+        newDampening: none[DampeningSnapshot](),
+        transitioned: true,
+        newState: isOffline,
+        effects: {efRemoveRoutes},
+      )
+      let now = getMonoTime()
+      t.apply(d, now)
       check t.state == isOffline
+      check t.offlineSince.isSome
+      check t.onlineSince.isNone
 
-      let s = t.linkUp()
-      check s.isSome
-      check s.get == isProbing
-
-    test "link down from online":
+    test "full decide round-trip: probing to online":
       var t = makeTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      let s = t.linkDown()
-      check s.isSome
-      check s.get == isOffline
+      t.state = isProbing
+      t.successCount = 2
+      let now = getMonoTime()
+      let snap = t.snapshot(now)
+      let event = StateEvent(kind: sekProbeResult, success: true, qualityOk: true)
+      let d = decide(snap, event)
+      check d.transitioned
+      check d.newState == isOnline
+      t.apply(d, now)
+      check t.state == isOnline
+      check t.successCount == 3
+
+    test "full decide round-trip: link down from online":
+      var t = makeTracker()
+      t.state = isOnline
+      t.successCount = 10
+      let now = getMonoTime()
+      let snap = t.snapshot(now)
+      let d = decide(snap, StateEvent(kind: sekLinkDown))
+      check d.transitioned
+      check d.newState == isOffline
+      t.apply(d, now)
+      check t.state == isOffline
       check t.successCount == 0
       check t.failCount == 0
 
-    test "dampening blocks online after flap":
-      var t = makeDampenedTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      check t.state == isOnline
-
-      # Go offline (3 failures)
-      discard t.probeFailure()  # -> degraded
-      discard t.probeFailure()
-      let s = t.probeFailure()
-      check s.isSome
-      check s.get == isOffline
-
-      # Dampening should be suppressed
-      check t.dampening.isSome
-      check t.dampening.get.isSuppressed
-
-      # Link back up, start probing
-      discard t.linkUp()
-      check t.state == isProbing
-
-      # Probes succeed but dampening blocks Online
-      for i in 0 ..< 10:
-        check t.probeSuccess(true).isNone
-      check t.state == isProbing
-
-    test "dampening allows online after decay":
-      var t = makeDampenedTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-
-      # Go offline -> dampening suppressed
-      discard t.probeFailure()
-      discard t.probeFailure()
-      discard t.probeFailure()
-      check t.state == isOffline
-      check t.dampening.get.isSuppressed
-
-      # Simulate decay: manually set penalty below reuse
-      var damp = t.dampening.get
-      damp.penalty = 100.0
-      damp.suppressed = false
-      t.dampening = some(damp)
-
-      # Link up, probe
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      check t.state == isOnline
-
-    test "no dampening does not block":
+    test "isActive check":
       var t = makeTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-
-      # Go offline
-      discard t.probeFailure()
-      for i in 0 ..< 4: discard t.probeFailure()
-      check t.state == isOffline
-
-      # Come back: no dampening, immediate online after up_count
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      check t.state == isOnline
-
-    test "quality degrades online to degraded":
-      var t = makeTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      check t.state == isOnline
-
-      let s = t.probeSuccess(false)
-      check s.isSome
-      check s.get == isDegraded
-
-    test "quality recovery degraded to online":
-      var t = makeTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      discard t.probeSuccess(false)  # -> degraded
-      check t.state == isDegraded
-
-      let s = t.probeSuccess(true)
-      check s.isSome
-      check s.get == isOnline
-
-    test "quality stays degraded while bad":
-      var t = makeTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      discard t.probeSuccess(false)  # -> degraded
-
-      check t.probeSuccess(false).isNone
-      check t.state == isDegraded
-
-    test "probing to degraded on bad quality":
-      var t = makeTracker()
-      discard t.linkUp()
-      discard t.probeSuccess(true)
-      discard t.probeSuccess(true)
-      let s = t.probeSuccess(false)
-      check s.isSome
-      check s.get == isDegraded
-
-    test "quality degraded then probe failure goes offline":
-      var t = makeTracker()
-      discard t.linkUp()
-      for i in 0 ..< 3: discard t.probeSuccess(true)
-      discard t.probeSuccess(false)  # -> degraded via quality
-      check t.state == isDegraded
-
-      # Now actual probe failures accumulate
-      for i in 0 ..< 4:
-        check t.probeFailure().isNone
-      # 5th failure: offline (down_count=5)
-      let s = t.probeFailure()
-      check s.isSome
-      check s.get == isOffline
+      check not t.isActive
+      t.state = isOnline
+      check t.isActive
+      t.state = isDegraded
+      check t.isActive
+      t.state = isOffline
+      check not t.isActive
+      t.state = isOnline
+      t.enabled = false
+      check not t.isActive
