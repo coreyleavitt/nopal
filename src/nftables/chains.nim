@@ -5,6 +5,7 @@
 
 import std/[json, strutils, strformat, options, sequtils]
 import ./ruleset
+import ../config/schema
 
 # ---------------------------------------------------------------------------
 # Local input types (decoupled from config schema)
@@ -31,12 +32,14 @@ type
     lastResort*: LastResort
 
   StickyInfo* = object
-    mode*: string   # "flow", "src_ip", "src_dst"
+    mode*: StickyMode
     timeout*: uint32
 
   RuleInfo* = object
     srcIp*, destIp*: seq[string]
-    srcPort*, destPort*, proto*, family*: string
+    srcPort*, destPort*: string
+    proto*: Protocol
+    family*: RuleFamily
     srcIface*, ipset*: string
     policy*: string
     sticky*: Option[StickyInfo]
@@ -56,7 +59,7 @@ type
     of false:
       port*: uint16
 
-  ProtoFamilyPair* = tuple[proto, familyOverride: string]
+  ProtoFamilyPair* = tuple[proto: Protocol, familyOverride: Option[RuleFamily]]
   WeightSlot* = tuple[slot: uint32, interfaceName: string]
   StickyKeySpec* = tuple[suffix, keyType: string]
   Tier* = tuple[metric: uint32, members: seq[PolicyMember]]
@@ -69,10 +72,10 @@ func ipProtocol*(address: string): string {.raises: [].} =
   ## Determine nftables protocol from address format.
   if ':' in address: "ip6" else: "ip"
 
-func ipProtocolFor*(address, ruleFamily: string): string {.raises: [].} =
+func ipProtocolFor*(address: string, ruleFamily: RuleFamily): string {.raises: [].} =
   ## Determine protocol considering named sets and rule family.
   if address.len > 0 and address[0] == '@':
-    if ruleFamily == "ipv6": "ip6" else: "ip"
+    if ruleFamily == rfIpv6: "ip6" else: "ip"
   else:
     ipProtocol(address)
 
@@ -96,19 +99,18 @@ func parsePortValue*(port: string): PortValue {.raises: [].} =
   # Fallback: treat as port 0
   PortValue(isRange: false, port: 0)
 
-func expandProtoFamily*(proto, family: string, hasPorts: bool): seq[ProtoFamilyPair] {.raises: [].} =
+func expandProtoFamily*(proto: Protocol, family: RuleFamily, hasPorts: bool): seq[ProtoFamilyPair] {.raises: [].} =
   ## Expand proto+family into concrete (proto, familyOverride) pairs.
   ## E.g., icmp+any → [(icmp, ipv4), (icmpv6, ipv6)]
-  let isIcmp = proto == "icmp"
-  if isIcmp:
+  if proto.isIcmp:
     case family
-    of "ipv4": @[("icmp", "")]
-    of "ipv6": @[("icmpv6", "")]
-    else: @[("icmp", "ipv4"), ("icmpv6", "ipv6")]
-  elif proto == "all" and hasPorts:
-    @[("tcp", ""), ("udp", "")]
+    of rfIpv4: @[(namedProto(npIcmp), none[RuleFamily]())]
+    of rfIpv6: @[(namedProto(npIcmpv6), none[RuleFamily]())]
+    of rfAny: @[(namedProto(npIcmp), some(rfIpv4)), (namedProto(npIcmpv6), some(rfIpv6))]
+  elif proto.isAll and hasPorts:
+    @[(namedProto(npTcp), none[RuleFamily]()), (namedProto(npUdp), none[RuleFamily]())]
   else:
-    @[(proto, "")]
+    @[(proto, none[RuleFamily]())]
 
 func computeWeightSlots*(members: openArray[PolicyMember]): seq[WeightSlot] {.raises: [].} =
   ## Map member weights to numbered slots for numgen vmap.
@@ -119,26 +121,20 @@ func computeWeightSlots*(members: openArray[PolicyMember]): seq[WeightSlot] {.ra
       result.add((slot: slot, interfaceName: member.interfaceName))
       slot += 1
 
-func determineStickyKeys*(mode, family: string): seq[StickyKeySpec] {.raises: [].} =
+func determineStickyKeys*(mode: StickyMode, family: RuleFamily): seq[StickyKeySpec] {.raises: [].} =
   ## Determine map suffixes and key types for sticky sessions.
   ## Returns one entry per address family to create maps for.
-  let keyBase = if mode == "src_dst": "_addr" else: "_addr"
+  let isSrcDst = mode == smSrcDst
   case family
-  of "ipv4":
-    if mode == "src_dst":
-      @[("_v4", "ipv4_addr . ipv4_addr")]
-    else:
-      @[("_v4", "ipv4_addr")]
-  of "ipv6":
-    if mode == "src_dst":
-      @[("_v6", "ipv6_addr . ipv6_addr")]
-    else:
-      @[("_v6", "ipv6_addr")]
-  else:  # "any" — both families
-    if mode == "src_dst":
-      @[("_v4", "ipv4_addr . ipv4_addr"), ("_v6", "ipv6_addr . ipv6_addr")]
-    else:
-      @[("_v4", "ipv4_addr"), ("_v6", "ipv6_addr")]
+  of rfIpv4:
+    if isSrcDst: @[("_v4", "ipv4_addr . ipv4_addr")]
+    else: @[("_v4", "ipv4_addr")]
+  of rfIpv6:
+    if isSrcDst: @[("_v6", "ipv6_addr . ipv6_addr")]
+    else: @[("_v6", "ipv6_addr")]
+  of rfAny:
+    if isSrcDst: @[("_v4", "ipv4_addr . ipv4_addr"), ("_v6", "ipv6_addr . ipv6_addr")]
+    else: @[("_v4", "ipv4_addr"), ("_v6", "ipv6_addr")]
 
 func groupByMetric*(members: openArray[PolicyMember]): seq[Tier] {.raises: [].} =
   ## Group policy members by metric value, sorted ascending.
@@ -263,7 +259,7 @@ proc prefixValue(cidr: string): JsonNode =
       discard
   return %*cidr
 
-proc matchIpList(addrs: seq[string], field, ruleFamily: string): JsonNode =
+proc matchIpList(addrs: seq[string], field: string, ruleFamily: RuleFamily): JsonNode =
   assert addrs.len > 0, "matchIpList called with empty address list"
   let proto = ipProtocolFor(addrs[0], ruleFamily)
   let right =
@@ -276,8 +272,8 @@ proc matchIpList(addrs: seq[string], field, ruleFamily: string): JsonNode =
 proc matchDaddrSet(protocol: string, s: seq[JsonNode]): JsonNode =
   %*{"match": {"op": "==", "left": {"payload": {"protocol": protocol, "field": "daddr"}}, "right": {"set": s}}}
 
-proc matchDaddrNamedSet(setName, family: string): JsonNode =
-  let protocol = if family == "ipv6": "ip6" else: "ip"
+proc matchDaddrNamedSet(setName: string, family: RuleFamily): JsonNode =
+  let protocol = if family == rfIpv6: "ip6" else: "ip"
   %*{"match": {"op": "==", "left": {"payload": {"protocol": protocol, "field": "daddr"}}, "right": "@" & setName}}
 
 proc portToJson(pv: PortValue): JsonNode =
@@ -299,9 +295,9 @@ proc matchDstPort(port, proto: string): JsonNode =
 # Sticky map helpers
 # ---------------------------------------------------------------------------
 
-proc stickyKeyExpr(proto, mode: string): JsonNode =
+proc stickyKeyExpr(proto: string, mode: StickyMode): JsonNode =
   let saddr = %*{"payload": {"protocol": proto, "field": "saddr"}}
-  if mode == "src_dst":
+  if mode == smSrcDst:
     let daddr = %*{"payload": {"protocol": proto, "field": "daddr"}}
     %*{"concat": [saddr, daddr]}
   else:
@@ -336,8 +332,8 @@ proc addConnectedBypass(rs: var Ruleset, chain: string, connected: openArray[str
     rs.addRule(chain, @[matchDaddrSet("ip6", s), nftAccept()])
 
   # Dynamic bypass: user-populated named sets
-  rs.addRule(chain, @[matchDaddrNamedSet("bypass_v4", "ipv4"), nftAccept()])
-  rs.addRule(chain, @[matchDaddrNamedSet("bypass_v6", "ipv6"), nftAccept()])
+  rs.addRule(chain, @[matchDaddrNamedSet("bypass_v4", rfIpv4), nftAccept()])
+  rs.addRule(chain, @[matchDaddrNamedSet("bypass_v6", rfIpv6), nftAccept()])
 
 proc buildPrerouting(rs: var Ruleset, interfaces: openArray[InterfaceInfo], markMask: uint32) =
   # Exception: skip probe packets
@@ -373,7 +369,7 @@ proc buildPostrouting(rs: var Ruleset, interfaces: openArray[InterfaceInfo]) =
 proc buildPolicyRules(rs: var Ruleset, rules: openArray[RuleInfo]) =
   for i, rule in rules:
     let hasPorts = rule.srcPort.len > 0 or rule.destPort.len > 0
-    let isIcmp = rule.proto == "icmp"
+    let isIcmp = rule.proto.isIcmp
     let pairs = expandProtoFamily(rule.proto, rule.family, hasPorts)
 
     for pair in pairs:
@@ -381,19 +377,19 @@ proc buildPolicyRules(rs: var Ruleset, rules: openArray[RuleInfo]) =
       var expr: seq[JsonNode] = @[]
 
       # Address family filter
-      let family = if familyOverride.len > 0: familyOverride else: rule.family
+      let family = if familyOverride.isSome: familyOverride.get else: rule.family
       case family
-      of "ipv4": expr.add(matchNfprotoIpv4())
-      of "ipv6": expr.add(matchNfprotoIpv6())
-      else: discard  # "any" -- no family filter
+      of rfIpv4: expr.add(matchNfprotoIpv4())
+      of rfIpv6: expr.add(matchNfprotoIpv6())
+      of rfAny: discard  # no family filter
 
       # Inbound interface match
       if rule.srcIface.len > 0:
         expr.add(matchIifname(rule.srcIface))
 
       # Protocol match
-      if proto != "all":
-        expr.add(matchProtocol(proto))
+      if not proto.isAll:
+        expr.add(matchProtocol($proto))
 
       # Source IP(s)
       if rule.srcIp.len > 0:
@@ -409,11 +405,11 @@ proc buildPolicyRules(rs: var Ruleset, rules: openArray[RuleInfo]) =
 
       # Source port (skip for ICMP)
       if not isIcmp and rule.srcPort.len > 0:
-        expr.add(matchSrcPort(rule.srcPort, proto))
+        expr.add(matchSrcPort(rule.srcPort, $proto))
 
       # Destination port (skip for ICMP)
       if not isIcmp and rule.destPort.len > 0:
-        expr.add(matchDstPort(rule.destPort, proto))
+        expr.add(matchDstPort(rule.destPort, $proto))
 
       # Log matching packets if enabled
       if rule.log:
@@ -423,7 +419,7 @@ proc buildPolicyRules(rs: var Ruleset, rules: openArray[RuleInfo]) =
       if rule.policy == "default":
         expr.add(nftAccept())
       else:
-        let needsStickyChain = rule.sticky.isSome and rule.sticky.get.mode != "flow"
+        let needsStickyChain = rule.sticky.isSome and rule.sticky.get.mode != smFlow
         if needsStickyChain:
           expr.add(jump(fmt"sticky_r{i}"))
         else:
@@ -469,21 +465,21 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
                              sticky: StickyInfo, markMask: uint32, policy: PolicyInfo) =
   let families =
     case rule.family
-    of "ipv4": @["ipv4"]
-    of "ipv6": @["ipv6"]
-    else: @["ipv4", "ipv6"]
+    of rfIpv4: @[rfIpv4]
+    of rfIpv6: @[rfIpv6]
+    of rfAny: @[rfIpv4, rfIpv6]
 
   # Create map(s) for this rule
   for fam in families:
     let suffix =
       if families.len > 1:
-        if fam == "ipv4": "_v4" else: "_v6"
+        if fam == rfIpv4: "_v4" else: "_v6"
       else:
         ""
     let mapName = fmt"sticky_r{ruleIndex}{suffix}"
-    let addrType = if fam == "ipv4": "ipv4_addr" else: "ipv6_addr"
+    let addrType = if fam == rfIpv4: "ipv4_addr" else: "ipv6_addr"
     let keyType =
-      if sticky.mode == "src_dst":
+      if sticky.mode == smSrcDst:
         %*[addrType, addrType]
       else:
         %*addrType
@@ -497,16 +493,16 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
   for fam in families:
     let suffix =
       if families.len > 1:
-        if fam == "ipv4": "_v4" else: "_v6"
+        if fam == rfIpv4: "_v4" else: "_v6"
       else:
         ""
     let mapName = fmt"sticky_r{ruleIndex}{suffix}"
-    let proto = if fam == "ipv4": "ip" else: "ip6"
+    let proto = if fam == rfIpv4: "ip" else: "ip6"
     let lookupKey = stickyKeyExpr(proto, sticky.mode)
 
     var lookupExpr: seq[JsonNode] = @[]
     if families.len > 1:
-      if fam == "ipv4":
+      if fam == rfIpv4:
         lookupExpr.add(matchNfprotoIpv4())
       else:
         lookupExpr.add(matchNfprotoIpv6())
@@ -550,16 +546,16 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
   for fam in families:
     let suffix =
       if families.len > 1:
-        if fam == "ipv4": "_v4" else: "_v6"
+        if fam == rfIpv4: "_v4" else: "_v6"
       else:
         ""
     let mapName = fmt"sticky_r{ruleIndex}{suffix}"
-    let proto = if fam == "ipv4": "ip" else: "ip6"
+    let proto = if fam == rfIpv4: "ip" else: "ip6"
     let updateKey = stickyKeyExpr(proto, sticky.mode)
 
     var updateExpr: seq[JsonNode] = @[]
     if families.len > 1:
-      if fam == "ipv4":
+      if fam == rfIpv4:
         updateExpr.add(matchNfprotoIpv4())
       else:
         updateExpr.add(matchNfprotoIpv6())
@@ -615,7 +611,7 @@ proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[Pol
   for i, rule in rules:
     if rule.sticky.isSome:
       let sticky = rule.sticky.get
-      if sticky.mode != "flow":
+      if sticky.mode != smFlow:
         for policy in policies:
           if policy.name == rule.policy:
             buildStickyMapAndChain(rs, i, rule, sticky, markMask, policy)
@@ -640,6 +636,13 @@ proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[Pol
 
 when isMainModule:
   import std/unittest
+
+  # Helper to construct seq[RuleInfo] without triggering {.requiresInit.} errors
+  # from Protocol. Nim's @[...] uses setLen which needs a default value.
+  proc ruleSeq(rules: varargs[RuleInfo]): seq[RuleInfo] =
+    {.cast(uncheckedAssign).}:
+      result = newSeqOfCap[RuleInfo](rules.len)
+      for r in rules: result.add(r)
 
   suite "pure decision functions":
     test "computeWeightSlots equal weights":
@@ -672,34 +675,34 @@ when isMainModule:
         check s.interfaceName == "wan"
 
     test "expandProtoFamily icmp any":
-      let pairs = expandProtoFamily("icmp", "any", false)
+      let pairs = expandProtoFamily(namedProto(npIcmp), rfAny, false)
       check pairs.len == 2
-      check pairs[0].proto == "icmp"
-      check pairs[0].familyOverride == "ipv4"
-      check pairs[1].proto == "icmpv6"
-      check pairs[1].familyOverride == "ipv6"
+      check $pairs[0].proto == "icmp"
+      check pairs[0].familyOverride == some(rfIpv4)
+      check $pairs[1].proto == "icmpv6"
+      check pairs[1].familyOverride == some(rfIpv6)
 
     test "expandProtoFamily icmp ipv4":
-      let pairs = expandProtoFamily("icmp", "ipv4", false)
+      let pairs = expandProtoFamily(namedProto(npIcmp), rfIpv4, false)
       check pairs.len == 1
-      check pairs[0].proto == "icmp"
+      check $pairs[0].proto == "icmp"
 
     test "expandProtoFamily all with ports":
-      let pairs = expandProtoFamily("all", "any", true)
+      let pairs = expandProtoFamily(namedProto(npAll), rfAny, true)
       check pairs.len == 2
-      check pairs[0].proto == "tcp"
-      check pairs[1].proto == "udp"
+      check $pairs[0].proto == "tcp"
+      check $pairs[1].proto == "udp"
 
     test "expandProtoFamily all without ports":
-      let pairs = expandProtoFamily("all", "any", false)
+      let pairs = expandProtoFamily(namedProto(npAll), rfAny, false)
       check pairs.len == 1
-      check pairs[0].proto == "all"
+      check $pairs[0].proto == "all"
 
     test "expandProtoFamily tcp":
-      let pairs = expandProtoFamily("tcp", "ipv4", true)
+      let pairs = expandProtoFamily(namedProto(npTcp), rfIpv4, true)
       check pairs.len == 1
-      check pairs[0].proto == "tcp"
-      check pairs[0].familyOverride == ""
+      check $pairs[0].proto == "tcp"
+      check pairs[0].familyOverride == none(RuleFamily)
 
     test "parsePortValue single port":
       let pv = parsePortValue("80")
@@ -734,13 +737,13 @@ when isMainModule:
       check tiers[1].metric == 20
 
     test "determineStickyKeys src_ip ipv4":
-      let keys = determineStickyKeys("src_ip", "ipv4")
+      let keys = determineStickyKeys(smSrcIp, rfIpv4)
       check keys.len == 1
       check keys[0].suffix == "_v4"
       check keys[0].keyType == "ipv4_addr"
 
     test "determineStickyKeys src_dst any":
-      let keys = determineStickyKeys("src_dst", "any")
+      let keys = determineStickyKeys(smSrcDst, rfAny)
       check keys.len == 2
       check keys[0].suffix == "_v4"
       check "ipv4_addr" in keys[0].keyType
@@ -769,11 +772,11 @@ when isMainModule:
       ],
       lastResort: Default,
     )]
-    let rules = @[RuleInfo(
+    let rules = ruleSeq(RuleInfo(
       srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-      proto: "all", family: "any", srcIface: "", ipset: "",
+      proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
       policy: "balanced", sticky: none(StickyInfo), log: false,
-    )]
+    ))
     (interfaces, policies, rules)
 
   proc getRulesForChain(parsed: JsonNode, chain: string): seq[JsonNode] =
@@ -850,11 +853,11 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-        proto: "all", family: "any", srcIface: "", ipset: "",
+        proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
         policy: "failover", sticky: none(StickyInfo), log: false,
-      )]
+      ))
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let failoverRules = getRulesForChain(parsed, "policy_failover")
@@ -883,11 +886,11 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @[], destIp: @[], srcPort: "", destPort: "80",
-        proto: "all", family: "any", srcIface: "", ipset: "",
+        proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
         policy: "balanced", sticky: none(StickyInfo), log: false,
-      )]
+      ))
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let policyRules = getRulesForChain(parsed, "policy_rules")
@@ -913,11 +916,11 @@ when isMainModule:
         ],
         lastResort: Default,
       )]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-        proto: "all", family: "any", srcIface: "", ipset: "",
+        proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
         policy: "failover", sticky: none(StickyInfo), log: false,
-      )]
+      ))
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let failoverRules = getRulesForChain(parsed, "policy_failover")
@@ -930,11 +933,11 @@ when isMainModule:
 
     test "empty policy with last_resort unreachable":
       let policies = @[PolicyInfo(name: "blocked", members: @[], lastResort: Unreachable)]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-        proto: "all", family: "any", srcIface: "", ipset: "",
+        proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
         policy: "blocked", sticky: none(StickyInfo), log: false,
-      )]
+      ))
       let rs = buildRuleset(@[], policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let chainRules = getRulesForChain(parsed, "policy_blocked")
@@ -968,13 +971,13 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-        proto: "all", family: "ipv4", srcIface: "", ipset: "",
+        proto: namedProto(npAll), family: rfIpv4, srcIface: "", ipset: "",
         policy: "balanced",
-        sticky: some(StickyInfo(mode: "src_ip", timeout: 600)),
+        sticky: some(StickyInfo(mode: smSrcIp, timeout: 600)),
         log: false,
-      )]
+      ))
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
 
@@ -1009,13 +1012,13 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-        proto: "all", family: "any", srcIface: "", ipset: "",
+        proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
         policy: "balanced",
-        sticky: some(StickyInfo(mode: "flow", timeout: 600)),
+        sticky: some(StickyInfo(mode: smFlow, timeout: 600)),
         log: false,
-      )]
+      ))
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
 
@@ -1053,20 +1056,20 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[
+      let rules = ruleSeq(
         # Rule using "default" policy -- should accept, not jump
         RuleInfo(
           srcIp: @["10.0.0.0/8"], destIp: @[], srcPort: "", destPort: "",
-          proto: "all", family: "ipv4", srcIface: "", ipset: "",
+          proto: namedProto(npAll), family: rfIpv4, srcIface: "", ipset: "",
           policy: "default", sticky: none(StickyInfo), log: false,
         ),
         # Normal rule -- should jump to policy chain
         RuleInfo(
           srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-          proto: "all", family: "any", srcIface: "", ipset: "",
+          proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
           policy: "balanced", sticky: none(StickyInfo), log: false,
         ),
-      ]
+      )
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let policyRules = getRulesForChain(parsed, "policy_rules")
@@ -1089,12 +1092,12 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @["192.168.1.0/24"], destIp: @["10.0.0.0/8"],
         srcPort: "1024-65535", destPort: "443",
-        proto: "tcp", family: "ipv4", srcIface: "", ipset: "",
+        proto: namedProto(npTcp), family: rfIpv4, srcIface: "", ipset: "",
         policy: "direct", sticky: none(StickyInfo), log: false,
-      )]
+      ))
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let policyRules = getRulesForChain(parsed, "policy_rules")
@@ -1123,13 +1126,13 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-        proto: "all", family: "any", srcIface: "", ipset: "",
+        proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
         policy: "balanced",
-        sticky: some(StickyInfo(mode: "src_ip", timeout: 300)),
+        sticky: some(StickyInfo(mode: smSrcIp, timeout: 300)),
         log: false,
-      )]
+      ))
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
 
@@ -1163,20 +1166,20 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[
+      let rules = ruleSeq(
         # IPv4 named set on src_ip
         RuleInfo(
           srcIp: @["@vpn_clients"], destIp: @[], srcPort: "", destPort: "",
-          proto: "all", family: "ipv4", srcIface: "", ipset: "",
+          proto: namedProto(npAll), family: rfIpv4, srcIface: "", ipset: "",
           policy: "direct", sticky: none(StickyInfo), log: false,
         ),
         # IPv6 named set on dest_ip
         RuleInfo(
           srcIp: @[], destIp: @["@blocked_v6"], srcPort: "", destPort: "",
-          proto: "all", family: "ipv6", srcIface: "", ipset: "",
+          proto: namedProto(npAll), family: rfIpv6, srcIface: "", ipset: "",
           policy: "direct", sticky: none(StickyInfo), log: false,
         ),
-      ]
+      )
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let policyRules = getRulesForChain(parsed, "policy_rules")
@@ -1212,11 +1215,11 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @["10.0.0.0/8"], destIp: @[], srcPort: "", destPort: "",
-        proto: "all", family: "ipv4", srcIface: "", ipset: "",
+        proto: namedProto(npAll), family: rfIpv4, srcIface: "", ipset: "",
         policy: "balanced", sticky: none(StickyInfo), log: false,
-      )]
+      ))
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let policyRules = getRulesForChain(parsed, "policy_rules")
@@ -1233,12 +1236,12 @@ when isMainModule:
         members: @[PolicyMember(interfaceName: "wan", mark: 0x0100'u32, weight: 1, metric: 0)],
         lastResort: Default,
       )]
-      let rules = @[RuleInfo(
+      let rules = ruleSeq(RuleInfo(
         srcIp: @["2001:db8::/32"], destIp: @["10.0.0.0/8"],
         srcPort: "", destPort: "",
-        proto: "all", family: "any", srcIface: "", ipset: "",
+        proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
         policy: "direct", sticky: none(StickyInfo), log: false,
-      )]
+      ))
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let policyRules = getRulesForChain(parsed, "policy_rules")
@@ -1268,20 +1271,20 @@ when isMainModule:
 
     test "per_rule_logging":
       let (interfaces, policies, _) = twoInterfaceSetup()
-      let rules = @[
+      let rules = ruleSeq(
         # Rule with logging enabled
         RuleInfo(
           srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-          proto: "all", family: "any", srcIface: "", ipset: "",
+          proto: namedProto(npAll), family: rfAny, srcIface: "", ipset: "",
           policy: "balanced", sticky: none(StickyInfo), log: true,
         ),
         # Rule without logging
         RuleInfo(
           srcIp: @[], destIp: @[], srcPort: "", destPort: "",
-          proto: "tcp", family: "any", srcIface: "", ipset: "",
+          proto: namedProto(npTcp), family: rfAny, srcIface: "", ipset: "",
           policy: "balanced", sticky: none(StickyInfo), log: false,
         ),
-      ]
+      )
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
       let policyRules = getRulesForChain(parsed, "policy_rules")

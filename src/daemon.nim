@@ -110,20 +110,18 @@ proc buildRulesFromConfig(config: NopalConfig): seq[RuleInfo] =
   ## Build the RuleInfo vec from config. Called at init and reload.
   let ipv6Enabled = config.globals.ipv6Enabled
   for r in config.rules:
+    # Compute effective family (may differ from configured when ipv6 disabled)
     let family = case r.family
-      of rfIpv4: "ipv4"
+      of rfIpv4: rfIpv4
       of rfIpv6:
         if not ipv6Enabled: continue
-        "ipv6"
+        rfIpv6
       of rfAny:
-        if ipv6Enabled: "any" else: "ipv4"
+        if ipv6Enabled: rfAny else: rfIpv4
 
     let sticky = if r.sticky:
       some(StickyInfo(
-        mode: case r.stickyMode
-          of smFlow: "flow"
-          of smSrcIp: "src_ip"
-          of smSrcDst: "src_dst",
+        mode: r.stickyMode,
         timeout: r.stickyTimeout,
       ))
     else:
