@@ -44,6 +44,20 @@ const
   TokenSignal* = 2
   TokenRoute* = 3
   ProbeTokenBase* = 100
+  MaxInterfaces* = 256
+
+type
+  TrackerIndex* = array[MaxInterfaces, int16]  ## config index → seq position, -1 = absent
+
+func initTrackerIndex*(): TrackerIndex {.raises: [].} =
+  for i in 0 ..< MaxInterfaces:
+    result[i] = -1
+
+func buildTrackerIndex*(trackers: openArray[InterfaceTracker]): TrackerIndex {.raises: [].} =
+  result = initTrackerIndex()
+  for i, t in trackers:
+    if t.index >= 0 and t.index < MaxInterfaces:
+      result[t.index] = int16(i)
 
 # =========================================================================
 # Daemon type
@@ -74,6 +88,7 @@ type
 
     # State
     trackers*: seq[InterfaceTracker]
+    trackerIndex: TrackerIndex  ## config index → trackers seq position
     startTime: MonoTime
     running: bool
     connectedNetworks: seq[string]
@@ -252,6 +267,7 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
     statusFiles: initStatusFileManager(),
     signalFd: signalFd,
     trackers: trackers,
+    trackerIndex: buildTrackerIndex(trackers),
     startTime: getMonoTime(),
     running: true,
     connectedNetworks: @[],
@@ -280,10 +296,10 @@ proc probeIntervalFor(d: Daemon, index: int): uint32 =
 
   let c = cfg.get
   var state = isInit
-  for t in d.trackers:
-    if t.index == index:
-      state = t.state
-      break
+  if index >= 0 and index < MaxInterfaces:
+    let ti = int(d.trackerIndex[index])
+    if ti >= 0:
+      state = d.trackers[ti].state
 
   case state
   of isOffline:
@@ -412,16 +428,12 @@ proc regenerateNftables(d: var Daemon) =
 
 proc addRoutes(d: var Daemon, index: int) =
   ## Add ip rules and copy default routes for an interface.
-  var t: InterfaceTracker
-  var found = false
-  for tr in d.trackers:
-    if tr.index == index:
-      t = tr
-      found = true
-      break
-  if not found:
+  if index < 0 or index >= MaxInterfaces: return
+  let ti = int(d.trackerIndex[index])
+  if ti < 0:
     error fmt"addRoutes: no tracker for index {index}"
     return
+  let t = d.trackers[ti]
 
   let cfg = d.configForIndex(index)
   let family = if cfg.isSome: cfg.get.family else: afIpv4
@@ -445,16 +457,12 @@ proc addRoutes(d: var Daemon, index: int) =
 
 proc removeRoutes(d: var Daemon, index: int) =
   ## Delete ip rules and flush routing table for an interface.
-  var t: InterfaceTracker
-  var found = false
-  for tr in d.trackers:
-    if tr.index == index:
-      t = tr
-      found = true
-      break
-  if not found:
+  if index < 0 or index >= MaxInterfaces: return
+  let ti = int(d.trackerIndex[index])
+  if ti < 0:
     error fmt"removeRoutes: no tracker for index {index}"
     return
+  let t = d.trackers[ti]
 
   let cfg = d.configForIndex(index)
   let family = if cfg.isSome: cfg.get.family else: afIpv4
@@ -676,21 +684,16 @@ proc handleStateEvent(d: var Daemon, trackerIdx: int, event: StateEvent,
   d.executeEffects(trackerIdx, decision, oldState, linkEvent)
 
 proc handleDampenDecay(d: var Daemon, index: int) =
-  var trackerIdx = -1
-  for i in 0 ..< d.trackers.len:
-    if d.trackers[i].index == index:
-      trackerIdx = i
-      break
+  if index < 0 or index >= MaxInterfaces: return
+  let trackerIdx = int(d.trackerIndex[index])
   if trackerIdx < 0: return
   d.handleStateEvent(trackerIdx, StateEvent(kind: sekDampenDecay))
 
 proc processProbeResult(d: var Daemon, probeResult: ProbeResult) =
   ## Update tracker state from a probe result via the pure state machine.
-  var trackerIdx = -1
-  for i in 0 ..< d.trackers.len:
-    if d.trackers[i].index == probeResult.interfaceIndex:
-      trackerIdx = i
-      break
+  let index = probeResult.interfaceIndex
+  if index < 0 or index >= MaxInterfaces: return
+  let trackerIdx = int(d.trackerIndex[index])
   if trackerIdx < 0: return
 
   # Update quality metrics for status reporting
@@ -1064,6 +1067,7 @@ proc reloadReinitSubsystems(ctx: ReloadContext, d: var Daemon) =
   d.cachedRules = buildRulesFromConfig(d.config)
   d.hookRunner.updateScript(d.config.globals.hookScript)
   d.trackers = ctx.newTrackers
+  d.trackerIndex = buildTrackerIndex(d.trackers)
 
   var names: seq[string]
   for t in d.trackers: names.add(t.name)
