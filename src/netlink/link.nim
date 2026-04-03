@@ -28,6 +28,10 @@ proc newLinkMonitor*(): LinkMonitor =
     recvBuf: newSeq[byte](RecvBufSize),
   )
 
+proc close*(lm: var LinkMonitor) {.raises: [].} =
+  ## Close the netlink socket.
+  lm.sock.close()
+
 proc fd*(m: LinkMonitor): cint =
   ## Return the raw fd for selector/poll registration.
   m.sock.fd

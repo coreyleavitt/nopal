@@ -243,7 +243,7 @@ proc sendAndAck*(s: NetlinkSocket, data: openArray[byte],
     # Not an error message — might be a multicast notification, skip
   nlAckErr(nakTimeout)
 
-proc close*(s: var NetlinkSocket) =
+proc close*(s: var NetlinkSocket) {.raises: [].} =
   if s.fd >= 0:
     discard posix.close(s.fd)
     s.fd = -1

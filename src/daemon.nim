@@ -1158,11 +1158,25 @@ proc handleReloadCommand(d: var Daemon, req: IpcRequest): IpcResponse =
 # =========================================================================
 
 proc shutdown(d: var Daemon) =
-  ## Clean up nftables, routes, and status files.
+  ## Clean shutdown: close all resources in reverse-initialization order.
   info "nopal daemon shutting down"
 
+  # 1. Clean up nftables ruleset
   discard nftEngine.cleanup()
 
+  # 2. Stop IPC server (stop accepting new requests/clients)
+  d.ipcServer.close()
+
+  # 3. Deregister probe FDs from selector, then close all probe sockets
+  for (slot, fd) in d.probeEngine.getFds():
+    try: d.selector.unregister(fd.int)
+    except CatchableError: discard
+  d.probeEngine.closeAll()
+
+  # 4. Close conntrack netlink socket (if opened)
+  d.conntrackMgr.close()
+
+  # 5. Remove routes/rules (uses routeManager — must be before routeManager.close)
   const AF_INET = uint8(2)
   const AF_INET6 = uint8(10)
 
@@ -1187,14 +1201,22 @@ proc shutdown(d: var Daemon) =
     if not r.ok and r.error.osError != int32(ENOENT) and r.error.osError != int32(ESRCH):
       warn fmt"shutdown: failed to flush table {t.tableId} for {t.name}: {r.error}"
 
+  # 6. Close route manager netlink socket
+  d.routeManager.close()
+
+  # 7. Close link and route monitors
+  d.linkMonitor.close()
+  d.routeMonitor.close()
+
+  # 8. Clean up status files
   d.statusFiles.cleanup()
 
-  # Close the signal pipe read end
+  # 9. Close signal pipe read end
   if d.signalFd >= 0:
     discard posix.close(d.signalFd)
     d.signalFd = -1
 
-  # Close selector
+  # 10. Close selector (must be last — owns FD registrations)
   try:
     d.selector.close()
   except CatchableError: discard

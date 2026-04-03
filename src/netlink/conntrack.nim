@@ -33,6 +33,12 @@ proc ensureOpen(m: var ConntrackManager) =
     m.sock = openNetlink(NETLINK_NETFILTER, 0)
     m.opened = true
 
+proc close*(m: var ConntrackManager) {.raises: [].} =
+  ## Close the netlink socket if opened.
+  if m.opened:
+    m.sock.close()
+    m.opened = false
+
 proc flushByMark*(m: var ConntrackManager, mark, mask: uint32): NlResult[void] =
   ## Flush conntrack entries where (ct_mark & mask) == (mark & mask).
   ## Opens the netlink socket on first call.

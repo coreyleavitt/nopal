@@ -307,7 +307,7 @@ proc dispatchGetFds*(transport: ProbeTransport): seq[cint] =
       fds.add(dispatchGetFds(sub))
     fds
 
-proc dispatchClose*(transport: var ProbeTransport) =
+proc dispatchClose*(transport: var ProbeTransport) {.raises: [].} =
   ## Close file descriptors held by the transport.
   case transport.kind
   of tkIcmp:
@@ -326,6 +326,12 @@ proc dispatchClose*(transport: var ProbeTransport) =
   of tkComposite:
     for sub in transport.subs.mitems:
       dispatchClose(sub)
+
+proc closeAll*(engine: var ProbeEngine) {.raises: [].} =
+  ## Close all probe transport sockets. Called at daemon shutdown.
+  for probe in engine.probes.mitems:
+    dispatchClose(probe.transport)
+  engine.probes.setLen(0)
 
 # ===================================================================
 # ProbeEngine API
