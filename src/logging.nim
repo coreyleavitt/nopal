@@ -4,7 +4,6 @@
 ## matching OpenWrt's logd expectations.
 
 import std/logging
-import std/strutils
 import std/posix
 
 const
@@ -26,7 +25,7 @@ proc close*(h: SyslogHandler) =
     discard posix.close(h.fd)
     h.fd = -1
 
-proc levelToSyslog(level: Level): cint =
+func levelToSyslog(level: Level): cint {.raises: [].} =
   case level
   of lvlAll, lvlDebug: LOG_DEBUG
   of lvlInfo: LOG_INFO
