@@ -6,7 +6,7 @@ import std/times
 
 type
   TimerKind* = enum
-    tkProbe, tkProbeTimeout, tkDampenDecay, tkIpcTimeout
+    tkProbe, tkProbeTimeout, tkDampenDecay, tkIpcTimeout, tkReloadConfirm
 
   TimerEntry* = object
     deadline*: MonoTime

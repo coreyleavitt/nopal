@@ -18,6 +18,8 @@ type
     imInterfaceStatus
     imConnected
     imConfigReload
+    imConfigAccept
+    imConfigCancel
     imSubscribe
 
   ## Read-only view of daemon state for query handlers.
@@ -26,6 +28,7 @@ type
     config*: ptr NopalConfig
     startTime*: MonoTime
     connectedNetworks*: ptr seq[string]
+    reloadPending*: Option[ReloadPendingInfo]
 
 func parseIpcMethod*(s: string): Option[IpcMethod] {.raises: [].} =
   ## Parse an RPC method name to the IpcMethod enum.
@@ -35,6 +38,8 @@ func parseIpcMethod*(s: string): Option[IpcMethod] {.raises: [].} =
   of "interface.status": some(imInterfaceStatus)
   of "connected": some(imConnected)
   of "config.reload": some(imConfigReload)
+  of "config.accept": some(imConfigAccept)
+  of "config.cancel": some(imConfigCancel)
   of "subscribe": some(imSubscribe)
   else: none[IpcMethod]()
 
@@ -88,6 +93,7 @@ proc handleStatusQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises
     uptimeSecs: uptime,
     interfaces: ifaces,
     policies: pols,
+    reloadPending: view.reloadPending,
   )
   successResponse(req.id, status.toJson())
 

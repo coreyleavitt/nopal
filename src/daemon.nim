@@ -4,7 +4,7 @@
 ## selector-based event loop, dispatches probe/link/route/IPC events,
 ## and coalesces deferred nftables/DNS updates.
 
-import std/[selectors, posix, monotimes, times, options, logging, os, strutils, strformat]
+import std/[selectors, posix, monotimes, times, options, logging, os, strutils, strformat, json]
 
 import ./errors
 import ./config/schema
@@ -60,6 +60,23 @@ func buildTrackerIndex*(trackers: openArray[InterfaceTracker]): TrackerIndex {.r
       result[t.index] = int16(i)
 
 # =========================================================================
+# Reload confirmation state
+# =========================================================================
+
+type
+  PendingReload = object
+    oldConfig: NopalConfig
+    oldTrackers: seq[InterfaceTracker]
+    oldTrackerIndex: TrackerIndex
+    oldCachedRules: seq[RuleInfo]
+    deadline: MonoTime
+
+  ReloadState = object
+    case pending*: bool
+    of true: context*: PendingReload
+    of false: discard
+
+# =========================================================================
 # Daemon type
 # =========================================================================
 
@@ -89,6 +106,7 @@ type
     # State
     trackers*: seq[InterfaceTracker]
     trackerIndex: TrackerIndex  ## config index → trackers seq position
+    reloadState: ReloadState     ## confirmation protocol state
     startTime: MonoTime
     running: bool
     connectedNetworks: seq[string]
@@ -266,6 +284,7 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
     signalFd: signalFd,
     trackers: trackers,
     trackerIndex: buildTrackerIndex(trackers),
+    reloadState: ReloadState(pending: false),
     startTime: getMonoTime(),
     running: true,
     connectedNetworks: @[],
@@ -723,8 +742,11 @@ proc handleSignals(d: var Daemon) =
         info "received shutdown signal"
         d.running = false
       of 'R':
-        info "received reload signal"
-        d.handleReload()
+        if d.reloadState.pending:
+          warn "SIGHUP ignored: reload pending confirmation"
+        else:
+          info "received reload signal"
+          d.handleReload()
       else:
         discard
 
@@ -1118,13 +1140,100 @@ proc handleReload(d: var Daemon) =
 
   info fmt"configuration reloaded: {d.config.interfaces.len} interfaces, {d.config.policies.len} policies, {d.config.rules.len} rules"
 
+proc performRollback(d: var Daemon) =
+  ## Restore the saved config snapshot from a pending reload confirmation.
+  ## Uses the same phase object reload pattern but with saved old config.
+  if not d.reloadState.pending: return
+
+  let saved = d.reloadState.context
+  info "rolling back configuration to pre-reload state"
+
+  # Cancel the confirmation timer
+  d.timers.cancelByIndex(0, {tkReloadConfirm})
+
+  # Teardown current state
+  for t in d.trackers:
+    if t.state == isOnline or t.state == isDegraded:
+      d.removeRoutes(t.index)
+
+  var ctx = ReloadContext(newConfig: saved.oldConfig)
+  reloadTeardown(ctx, d.probeEngine, d.selector, d.dnsManager,
+                 d.trackers, d.timers)
+  reloadBuildTrackers(ctx, saved.oldConfig)
+  d.cachedRules = saved.oldCachedRules
+  reloadReinitSubsystems(ctx, d)
+
+  d.reloadState = ReloadState(pending: false)
+  info "configuration rollback complete"
+
+proc handleReloadTimeout(d: var Daemon) =
+  ## Timer callback: confirmation timeout expired, auto-rollback.
+  if not d.reloadState.pending: return
+  warn "reload confirmation timeout — rolling back"
+  d.performRollback()
+
 proc handleReloadCommand(d: var Daemon, req: IpcRequest): IpcResponse =
-  ## IPC command: reload configuration synchronously, return real result.
-  try:
-    d.handleReload()
-    successResponse(req.id)
-  except CatchableError as e:
-    errorResponse(req.id, "reload failed: " & e.msg)
+  ## IPC command: reload configuration. Supports optional confirm_timeout param.
+  if d.reloadState.pending:
+    return errorResponse(req.id, "reload pending confirmation — accept or cancel first")
+
+  # Check for confirm_timeout param
+  let confirmTimeout = if req.params != nil and req.params.hasKey("confirm_timeout"):
+    let t = req.params{"confirm_timeout"}.getInt(0)
+    if t > 0: t else: 0
+  else:
+    0
+
+  if confirmTimeout > 0:
+    # Confirmed reload: save snapshot, apply, start timer
+    let snapshot = PendingReload(
+      oldConfig: d.config,
+      oldTrackers: d.trackers,
+      oldTrackerIndex: d.trackerIndex,
+      oldCachedRules: d.cachedRules,
+      deadline: getMonoTime() + initDuration(seconds = confirmTimeout),
+    )
+
+    try:
+      d.handleReload()
+    except CatchableError as e:
+      return errorResponse(req.id, "reload failed: " & e.msg)
+
+    d.reloadState = ReloadState(pending: true, context: snapshot)
+    d.timers.push(TimerEntry(
+      deadline: snapshot.deadline,
+      kind: tkReloadConfirm,
+      index: 0,
+    ))
+
+    info fmt"configuration reloaded with {confirmTimeout}s confirmation timeout"
+    let data = %*{"status": "pending_confirmation", "timeout_secs": confirmTimeout}
+    return successResponse(req.id, data)
+  else:
+    # Immediate reload (existing behavior)
+    try:
+      d.handleReload()
+      successResponse(req.id)
+    except CatchableError as e:
+      errorResponse(req.id, "reload failed: " & e.msg)
+
+proc handleAcceptCommand(d: var Daemon, req: IpcRequest): IpcResponse =
+  ## IPC command: confirm a pending reload — discard snapshot, cancel timer.
+  if not d.reloadState.pending:
+    return errorResponse(req.id, "no pending reload to accept")
+
+  d.timers.cancelByIndex(0, {tkReloadConfirm})
+  d.reloadState = ReloadState(pending: false)
+  info "reload confirmed — new configuration accepted"
+  successResponse(req.id)
+
+proc handleCancelCommand(d: var Daemon, req: IpcRequest): IpcResponse =
+  ## IPC command: cancel a pending reload — rollback to saved config.
+  if not d.reloadState.pending:
+    return errorResponse(req.id, "no pending reload to cancel")
+
+  d.performRollback()
+  successResponse(req.id)
 
 # =========================================================================
 # Shutdown
@@ -1255,11 +1364,17 @@ proc run*(d: var Daemon) =
           let resp = if ipcMethod.isNone:
             errorResponse(req.id, "unknown method '" & req.rpcMethod & "'")
           else:
+            let pendingInfo = if d.reloadState.pending:
+              let remaining = int((d.reloadState.context.deadline - getMonoTime()).inSeconds)
+              some(ReloadPendingInfo(remainingSecs: max(0, remaining)))
+            else:
+              none[ReloadPendingInfo]()
             let view = DaemonView(
               trackers: addr d.trackers,
               config: unsafeAddr d.config,
               startTime: d.startTime,
               connectedNetworks: addr d.connectedNetworks,
+              reloadPending: pendingInfo,
             )
             case ipcMethod.get
             of imStatus:
@@ -1270,6 +1385,10 @@ proc run*(d: var Daemon) =
               handleConnectedQuery(view, req)
             of imConfigReload:
               d.handleReloadCommand(req)
+            of imConfigAccept:
+              d.handleAcceptCommand(req)
+            of imConfigCancel:
+              d.handleCancelCommand(req)
             of imSubscribe:
               successResponse(req.id)
           d.ipcServer.sendResponse(clientId, resp, d.selector)
@@ -1287,6 +1406,8 @@ proc run*(d: var Daemon) =
         d.handleDampenDecay(entry.index)
       of tkIpcTimeout:
         d.ipcServer.removeClient(entry.index, d.selector)
+      of tkReloadConfirm:
+        d.handleReloadTimeout()
 
     # Deferred nftables regeneration: coalesce multiple transitions
     if d.nftablesDirty:

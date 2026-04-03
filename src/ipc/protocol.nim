@@ -39,11 +39,15 @@ type
     activeMembers*: seq[string]
     activeTier*: int     ## -1 if empty
 
+  ReloadPendingInfo* = object
+    remainingSecs*: int
+
   DaemonStatus* = object
     version*: string
     uptimeSecs*: int64
     interfaces*: seq[InterfaceStatusData]
     policies*: seq[PolicyStatusData]
+    reloadPending*: Option[ReloadPendingInfo]
 
   EventData* = object
     event*: string       ## "interface.state_change"
@@ -125,8 +129,11 @@ proc toJson*(d: DaemonStatus): JsonNode =
   for i in d.interfaces: ifaces.add(i.toJson())
   var pols = newJArray()
   for p in d.policies: pols.add(p.toJson())
-  %*{"version": d.version, "uptime_secs": d.uptimeSecs,
-     "interfaces": ifaces, "policies": pols}
+  var j = %*{"version": d.version, "uptime_secs": d.uptimeSecs,
+              "interfaces": ifaces, "policies": pols}
+  if d.reloadPending.isSome:
+    j["reload_pending"] = %*{"remaining_secs": d.reloadPending.get.remainingSecs}
+  j
 
 proc toJson*(e: EventData): JsonNode =
   %*{"event": e.event, "interface": e.interfaceName, "state": e.state}

@@ -296,6 +296,11 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
   let uptime = formatUptime(resp.data{"uptime_secs"}.getBiggestInt(0))
   let version = resp.data{"version"}.getStr(Version)
   echo fmt"nopal v{version} -- uptime {uptime}"
+
+  let reloadPending = resp.data{"reload_pending"}
+  if reloadPending != nil and reloadPending.kind == JObject:
+    let remaining = reloadPending{"remaining_secs"}.getInt(0)
+    echo fmt"  RELOAD PENDING CONFIRMATION ({remaining}s remaining)"
   echo ""
 
   let interfaces = resp.data{"interfaces"}
@@ -365,14 +370,72 @@ proc cliConnected(socketPath: string, jsonMode: bool) =
     for net in networks:
       echo fmt"  {net.getStr()}"
 
-proc cliReload(socketPath: string) =
-  let req = IpcRequest(id: 1, rpcMethod: "config.reload")
-  let resp = sendIpcRequest(socketPath, req)
-  if resp.success:
-    echo "configuration reloaded"
+proc cliReload(socketPath: string, args: seq[string]) =
+  # Parse reload subcommand flags
+  var confirmTimeout = 0
+  var doAccept = false
+  var doCancel = false
+
+  var i = 0
+  while i < args.len:
+    case args[i]
+    of "--confirm":
+      if i + 1 < args.len:
+        try:
+          confirmTimeout = parseInt(args[i + 1])
+          if confirmTimeout <= 0:
+            stderr.writeLine "error: --confirm requires a positive number of seconds"
+            quit(1)
+        except ValueError:
+          stderr.writeLine fmt"error: invalid timeout value '{args[i + 1]}'"
+          quit(1)
+        inc i
+      else:
+        stderr.writeLine "error: --confirm requires a timeout in seconds"
+        quit(1)
+    of "--accept":
+      doAccept = true
+    of "--cancel":
+      doCancel = true
+    else:
+      stderr.writeLine fmt"error: unknown reload flag '{args[i]}'"
+      quit(1)
+    inc i
+
+  if doAccept:
+    let req = IpcRequest(id: 1, rpcMethod: "config.accept")
+    let resp = sendIpcRequest(socketPath, req)
+    if resp.success:
+      echo "reload confirmed — new configuration accepted"
+    else:
+      stderr.writeLine fmt"accept failed: {resp.error}"
+      quit(1)
+  elif doCancel:
+    let req = IpcRequest(id: 1, rpcMethod: "config.cancel")
+    let resp = sendIpcRequest(socketPath, req)
+    if resp.success:
+      echo "reload cancelled — configuration rolled back"
+    else:
+      stderr.writeLine fmt"cancel failed: {resp.error}"
+      quit(1)
+  elif confirmTimeout > 0:
+    let params = %*{"confirm_timeout": confirmTimeout}
+    let req = IpcRequest(id: 1, rpcMethod: "config.reload", params: params)
+    let resp = sendIpcRequest(socketPath, req)
+    if resp.success:
+      echo fmt"configuration reloaded with {confirmTimeout}s confirmation timeout"
+      echo "run 'nopal reload --accept' to confirm, or wait for auto-rollback"
+    else:
+      stderr.writeLine fmt"reload failed: {resp.error}"
+      quit(1)
   else:
-    stderr.writeLine fmt"reload failed: {resp.error}"
-    quit(1)
+    let req = IpcRequest(id: 1, rpcMethod: "config.reload")
+    let resp = sendIpcRequest(socketPath, req)
+    if resp.success:
+      echo "configuration reloaded"
+    else:
+      stderr.writeLine fmt"reload failed: {resp.error}"
+      quit(1)
 
 proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
   ## Run a command with traffic routed through a specific interface.
@@ -484,6 +547,9 @@ proc printUsage() =
   echo "  nopal use <iface> <cmd...>   Run command via specific WAN"
   echo "  nopal rules                  Show active nftables rules"
   echo "  nopal reload                 Reload configuration"
+  echo "  nopal reload --confirm <s>   Reload with auto-rollback after <s> seconds"
+  echo "  nopal reload --accept        Confirm pending reload"
+  echo "  nopal reload --cancel        Cancel pending reload and rollback"
   echo "  nopal version                Show version"
   echo "  nopal help                   Show this help"
   echo ""
@@ -550,7 +616,7 @@ proc runCli(args: seq[string]) =
     of "internal":
       cliInternal()
     of "reload":
-      cliReload(socketPath)
+      cliReload(socketPath, positional[1..^1])
     of "help":
       printUsage()
     of "version":
