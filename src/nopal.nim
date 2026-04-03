@@ -8,10 +8,11 @@ import std/[posix, os, strutils, strformat, json, endians, net, nativesockets]
 import daemon
 import ipc/protocol
 import logging
+import version
 import std/[osproc, algorithm]
 
 const
-  Version = "0.1.0-alpha.5"
+  Version = NimblePkgVersion
   DefaultConfig = "/etc/config/nopal"
   DefaultSocket = "/var/run/nopal.sock"
 

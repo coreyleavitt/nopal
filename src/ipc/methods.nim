@@ -10,6 +10,7 @@ import std/[json, options, monotimes, times]
 import ./protocol
 import ../state/tracker
 import ../state/policy
+import ../version
 import ../config/schema
 
 type
@@ -97,7 +98,7 @@ proc handleStatusQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises
     ))
 
   let status = DaemonStatus(
-    version: "0.1.0-alpha.5",
+    version: NimblePkgVersion,
     uptimeSecs: uptime,
     interfaces: ifaces,
     policies: pols,

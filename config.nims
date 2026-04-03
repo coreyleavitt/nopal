@@ -1,4 +1,11 @@
-import std/os
+import std/[os, strutils]
+
+# Auto-extract version from nimble file (single source of truth)
+for line in staticRead("nopal.nimble").splitLines:
+  if line.strip.startsWith("version"):
+    let v = line.split("=")[1].strip.strip(chars = {'"'})
+    switch("define", "NimblePkgVersion=" & v)
+    break
 
 # Common flags
 switch("mm", "arc")
