@@ -8,6 +8,7 @@ import std/[posix, os, strutils, strformat, json, endians, net, nativesockets]
 import daemon
 import ipc/protocol
 import logging
+import std/logging as stdlog
 import version
 import std/[osproc, algorithm]
 
@@ -84,9 +85,15 @@ proc runDaemon(args: seq[string]) =
   sa.sa_handler = SIG_IGN
   discard sigaction(SIGPIPE, sa, nil)
 
-  stderr.writeLine fmt"nopal v{Version} starting"
+  stdlog.info fmt"nopal v{Version} starting"
 
-  var d = initDaemon(configPath, pipeFds[0])
+  var d: Daemon
+  try:
+    d = initDaemon(configPath, pipeFds[0])
+  except CatchableError as e:
+    stderr.writeLine fmt"error: {e.msg}"
+    stderr.writeLine fmt"check config file: {configPath}"
+    quit(1)
   d.run()
 
 # ---------------------------------------------------------------------------
@@ -596,7 +603,7 @@ proc cliRules() =
   ## Dump the nopal nftables ruleset.
   let exitCode = execShellCmd("nft list chain inet nopal policy_rules")
   if exitCode != 0:
-    echo "nopal nftables rules not loaded (daemon not running?)"
+    echo "no nopal nftables rules found — rules are removed when the daemon stops"
 
 proc printUsage() =
   echo fmt"nopal {Version} -- Multi-WAN manager for OpenWrt"
@@ -693,7 +700,7 @@ proc runCli(args: seq[string]) =
       printUsage()
       quit(1)
   except IOError as e:
-    stderr.writeLine fmt"failed to connect to nopal daemon: {e.msg}"
+    stderr.writeLine fmt"error: daemon not reachable ({e.msg})"
     stderr.writeLine "is nopald running?"
     quit(1)
 
