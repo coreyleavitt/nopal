@@ -2,9 +2,11 @@
 ##
 ## Sends IPCTNL_MSG_CT_DELETE messages to flush conntrack entries matching
 ## a specific fwmark/mask. Socket is lazily opened on first use.
+## Returns NlResult — callers decide error policy.
 
 import std/[posix, endians]
 import ../linux_constants
+import ../errors
 import ./socket
 
 const
@@ -26,13 +28,15 @@ proc newConntrackManager*(): ConntrackManager =
 
 proc ensureOpen(m: var ConntrackManager) =
   ## Lazily open the NETLINK_NETFILTER socket on first use.
+  ## Raises OSError if the socket cannot be opened (precondition violation).
   if not m.opened:
     m.sock = openNetlink(NETLINK_NETFILTER, 0)
     m.opened = true
 
-proc flushByMark*(m: var ConntrackManager, mark, mask: uint32) =
+proc flushByMark*(m: var ConntrackManager, mark, mask: uint32): NlResult[void] =
   ## Flush conntrack entries where (ct_mark & mask) == (mark & mask).
   ## Opens the netlink socket on first call.
+  ## OSError may propagate from ensureOpen (precondition violation).
   m.ensureOpen()
 
   # Message type: (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_DELETE
@@ -60,4 +64,16 @@ proc flushByMark*(m: var ConntrackManager, mark, mask: uint32) =
   b.addAttr(CTA_MARK_MASK.uint16, maskBytes)
 
   let msg = b.finish()
-  discard m.sock.sendAndAck(msg, m.recvBuf)
+  let ack = m.sock.sendAndAck(msg, m.recvBuf)
+  if ack.ok:
+    nlOk()
+  else:
+    nlErr[void](NlError(
+      kind: case ack.kind
+        of nakSendFailed: nekSendFailed
+        of nakRecvFailed: nekRecvFailed
+        of nakTimeout: nekTimeout
+        of nakKernelError: nekKernelError,
+      osError: ack.osError,
+      operation: "flushByMark",
+      detail: "mark=0x" & $mark & ", mask=0x" & $mask))

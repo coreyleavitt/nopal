@@ -6,6 +6,7 @@
 
 import std/[selectors, posix, monotimes, times, options, logging, os, strutils, strformat]
 
+import ./errors
 import ./config/schema
 import ./config/parser
 import ./config/diff
@@ -433,18 +434,16 @@ proc addRoutes(d: var Daemon, index: int) =
   const AF_INET6 = uint8(10)
 
   if family == afIpv4 or family == afBoth:
-    try:
-      d.routeManager.addRule(t.mark, d.config.globals.markMask,
-                             t.tableId, 100 + index.uint32, AF_INET)
-    except CatchableError as e:
-      warn fmt"failed to add IPv4 ip rule for {t.name}: {e.msg}"
+    let r = d.routeManager.addRule(t.mark, d.config.globals.markMask,
+                                   t.tableId, 100 + index.uint32, AF_INET)
+    if not r.ok:
+      warn fmt"failed to add IPv4 ip rule for {t.name}: {r.error}"
 
   if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
-    try:
-      d.routeManager.addRule(t.mark, d.config.globals.markMask,
-                             t.tableId, 100 + index.uint32, AF_INET6)
-    except CatchableError as e:
-      warn fmt"failed to add IPv6 ip rule for {t.name}: {e.msg}"
+    let r = d.routeManager.addRule(t.mark, d.config.globals.markMask,
+                                   t.tableId, 100 + index.uint32, AF_INET6)
+    if not r.ok:
+      warn fmt"failed to add IPv6 ip rule for {t.name}: {r.error}"
 
   info fmt"added routes for {t.name} (mark=0x{t.mark.toHex(4)}, table={t.tableId})"
 
@@ -468,23 +467,20 @@ proc removeRoutes(d: var Daemon, index: int) =
   const AF_INET6 = uint8(10)
 
   if family == afIpv4 or family == afBoth:
-    try:
-      d.routeManager.delRule(t.mark, d.config.globals.markMask,
-                             t.tableId, 100 + index.uint32, AF_INET)
-    except CatchableError as e:
-      warn fmt"failed to delete IPv4 ip rule for {t.name}: {e.msg}"
+    let r = d.routeManager.delRule(t.mark, d.config.globals.markMask,
+                                   t.tableId, 100 + index.uint32, AF_INET)
+    if not r.ok:
+      warn fmt"failed to delete IPv4 ip rule for {t.name}: {r.error}"
 
   if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
-    try:
-      d.routeManager.delRule(t.mark, d.config.globals.markMask,
-                             t.tableId, 100 + index.uint32, AF_INET6)
-    except CatchableError as e:
-      warn fmt"failed to delete IPv6 ip rule for {t.name}: {e.msg}"
+    let r = d.routeManager.delRule(t.mark, d.config.globals.markMask,
+                                   t.tableId, 100 + index.uint32, AF_INET6)
+    if not r.ok:
+      warn fmt"failed to delete IPv6 ip rule for {t.name}: {r.error}"
 
-  try:
-    d.routeManager.flushTableBoth(t.tableId)
-  except CatchableError as e:
-    warn fmt"failed to flush table {t.tableId} for {t.name}: {e.msg}"
+  let r = d.routeManager.flushTableBoth(t.tableId)
+  if not r.ok:
+    warn fmt"failed to flush table {t.tableId} for {t.name}: {r.error}"
 
   info fmt"removed routes for {t.name}"
 
@@ -513,15 +509,13 @@ proc removeDns(d: var Daemon, index: int) =
 proc flushConntrack(d: var Daemon, mark, mask: uint32) =
   case d.config.globals.conntrackFlush
   of cfmSelective:
-    try:
-      d.conntrackMgr.flushByMark(mark, mask)
-    except CatchableError as e:
-      error fmt"conntrack flush failed: {e.msg}"
+    let r = d.conntrackMgr.flushByMark(mark, mask)
+    if not r.ok:
+      error fmt"conntrack flush failed: {r.error}"
   of cfmFull:
-    try:
-      d.conntrackMgr.flushByMark(0, 0)  # mask=0 means match all entries
-    except CatchableError as e:
-      error fmt"conntrack flush all failed: {e.msg}"
+    let r = d.conntrackMgr.flushByMark(0, 0)  # mask=0 means match all entries
+    if not r.ok:
+      error fmt"conntrack flush all failed: {r.error}"
   of cfmNone:
     discard
 
@@ -1288,20 +1282,20 @@ proc shutdown(d: var Daemon) =
     let priority = 100 + t.index.uint32
 
     if family == afIpv4 or family == afBoth:
-      try:
-        d.routeManager.delRule(t.mark, d.config.globals.markMask,
-                               t.tableId, priority, AF_INET)
-      except CatchableError: discard
+      let r = d.routeManager.delRule(t.mark, d.config.globals.markMask,
+                                     t.tableId, priority, AF_INET)
+      if not r.ok and r.error.osError != int32(ENOENT) and r.error.osError != int32(ESRCH):
+        warn fmt"shutdown: failed to delete IPv4 ip rule for {t.name}: {r.error}"
 
     if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
-      try:
-        d.routeManager.delRule(t.mark, d.config.globals.markMask,
-                               t.tableId, priority, AF_INET6)
-      except CatchableError: discard
+      let r = d.routeManager.delRule(t.mark, d.config.globals.markMask,
+                                     t.tableId, priority, AF_INET6)
+      if not r.ok and r.error.osError != int32(ENOENT) and r.error.osError != int32(ESRCH):
+        warn fmt"shutdown: failed to delete IPv6 ip rule for {t.name}: {r.error}"
 
-    try:
-      d.routeManager.flushTableBoth(t.tableId)
-    except CatchableError: discard
+    let r = d.routeManager.flushTableBoth(t.tableId)
+    if not r.ok and r.error.osError != int32(ENOENT) and r.error.osError != int32(ESRCH):
+      warn fmt"shutdown: failed to flush table {t.tableId} for {t.name}: {r.error}"
 
   d.cleanupStatusFiles()
 
