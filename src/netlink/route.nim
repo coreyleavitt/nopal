@@ -408,3 +408,106 @@ proc getAddresses*(m: var RouteManager, ifindex: uint32,
 
       res
   )
+
+when isMainModule:
+  import std/unittest
+
+  suite "toNlResult mapping":
+    test "ok maps to success":
+      let r = toNlResult(nlAckOk(), "test", "detail")
+      check r.ok
+
+    test "sendFailed maps with osError":
+      let r = toNlResult(nlAckErr(nakSendFailed, 13), "addRoute", "table 100")
+      check not r.ok
+      check r.error.kind == nekSendFailed
+      check r.error.osError == 13
+      check r.error.operation == "addRoute"
+      check r.error.detail == "table 100"
+
+    test "recvFailed maps correctly":
+      let r = toNlResult(nlAckErr(nakRecvFailed, 104), "delRoute", "table 200")
+      check not r.ok
+      check r.error.kind == nekRecvFailed
+      check r.error.osError == 104
+
+    test "timeout maps with zero osError":
+      let r = toNlResult(nlAckErr(nakTimeout), "addRule", "mark 0x100")
+      check not r.ok
+      check r.error.kind == nekTimeout
+      check r.error.osError == 0
+
+    test "kernelError maps with errno":
+      let r = toNlResult(nlAckErr(nakKernelError, 17), "addRoute", "table 100")
+      check not r.ok
+      check r.error.kind == nekKernelError
+      check r.error.osError == 17
+
+  suite "DumpMsg attribute extraction":
+    test "extract RTA_TABLE from RtMsg payload":
+      var payload: seq[byte]
+      let rtm = RtMsg(
+        rtmFamily: AF_INET, rtmDstLen: 0, rtmSrcLen: 0, rtmTos: 0,
+        rtmTable: 0, rtmProtocol: RTPROT_STATIC, rtmScope: RT_SCOPE_UNIVERSE,
+        rtmType: RTN_UNICAST, rtmFlags: 0,
+      )
+      writeStruct(payload, rtm)
+
+      let attrHdr = NlAttr(nlaLen: uint16(sizeof(NlAttr) + 4), nlaType: RTA_TABLE.uint16)
+      writeStruct(payload, attrHdr)
+      var tableVal = 142'u32
+      let pos = payload.len
+      payload.setLen(pos + 4)
+      copyMem(addr payload[pos], addr tableVal, 4)
+
+      let msg = DumpMsg(
+        hdr: NlMsgHdr(nlmsgLen: 0, nlmsgType: RTM_NEWROUTE.uint16,
+                      nlmsgFlags: 0, nlmsgSeq: 0, nlmsgPid: 0),
+        payload: payload,
+      )
+
+      let rtmMsg = readStruct[RtMsg](msg.payload, 0)
+      var routeTable = uint32(rtmMsg.rtmTable)
+      let attrStart = nlmsgAlign(sizeof(RtMsg))
+      for (attrType, s) in nlAttrs(msg.payload, attrStart):
+        if attrType == RTA_TABLE.uint16:
+          routeTable = attrU32(msg.payload, s)
+          break
+      check routeTable == 142
+
+    test "extract IFA_ADDRESS from IfAddrMsg payload":
+      var payload: seq[byte]
+      let ifa = IfAddrMsg(
+        ifaFamily: AF_INET, ifaPrefixLen: 24, ifaFlags: 0, ifaScope: 0, ifaIndex: 5,
+      )
+      writeStruct(payload, ifa)
+
+      let addrBytes = [192'u8, 168, 1, 1]
+      let attrHdr = NlAttr(nlaLen: uint16(sizeof(NlAttr) + 4), nlaType: IFA_ADDRESS.uint16)
+      writeStruct(payload, attrHdr)
+      for b in addrBytes:
+        payload.add(b)
+
+      let msg = DumpMsg(
+        hdr: NlMsgHdr(nlmsgLen: 0, nlmsgType: RTM_NEWADDR.uint16,
+                      nlmsgFlags: 0, nlmsgSeq: 0, nlmsgPid: 0),
+        payload: payload,
+      )
+
+      let ifaMsg = readStruct[IfAddrMsg](msg.payload, 0)
+      check ifaMsg.ifaIndex == 5
+      check ifaMsg.ifaPrefixLen == 24
+
+      let attrStart = nlmsgAlign(sizeof(IfAddrMsg))
+      var foundAddr = false
+      for (attrType, s) in nlAttrs(msg.payload, attrStart):
+        if attrType == IFA_ADDRESS.uint16:
+          let addrLen = s.b - s.a + 1
+          check addrLen >= 4
+          check msg.payload[s.a] == 192
+          check msg.payload[s.a + 1] == 168
+          check msg.payload[s.a + 2] == 1
+          check msg.payload[s.a + 3] == 1
+          foundAddr = true
+          break
+      check foundAddr
