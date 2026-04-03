@@ -196,35 +196,46 @@ proc formatUptime(secs: int64): string =
   else:
     result = fmt"{mins}m"
 
+proc formatInterfaceUptime(iface: JsonNode): string =
+  let uptimeSecs = iface{"uptime_secs"}.getBiggestInt(-1)
+  if uptimeSecs < 0: return "-"
+  let h = uptimeSecs div 3600
+  let m = (uptimeSecs mod 3600) div 60
+  let s = uptimeSecs mod 60
+  if h > 0: fmt"{h}h{m}m"
+  elif m > 0: fmt"{m}m{s}s"
+  else: fmt"{s}s"
+
 proc printInterfaceTable(interfaces: JsonNode) =
   echo "  " & alignLeft("INTERFACE", 12) & " " &
        alignLeft("DEVICE", 10) & " " &
        alignLeft("STATE", 10) & " " &
-       alignLeft("ENABLED", 8) & " " &
-       align("RTT", 7) & " " &
+       align("RTT", 8) & " " &
        align("LOSS", 6) & " " &
-       align("SCORE", 6)
+       align("OK", 6) & " " &
+       align("FAIL", 6) & " " &
+       align("UPTIME", 8)
 
   for iface in interfaces:
     let name = iface{"name"}.getStr("-")
     let device = iface{"device"}.getStr("-")
     let state = iface{"state"}.getStr("-")
-    let enabled = if iface{"enabled"}.getBool(false): "yes" else: "no"
     let rttVal = iface{"avg_rtt_ms"}
-    let rtt = if rttVal != nil and rttVal.kind != JNull: fmt"{rttVal.getFloat()}ms" else: "-"
+    let rtt = if rttVal != nil and rttVal.kind != JNull: fmt"{rttVal.getFloat():.1f}ms" else: "-"
     let lossVal = iface{"loss_percent"}.getInt(0)
     let loss = fmt"{lossVal}%"
-    let successes = iface{"success_count"}.getInt(0)
-    let failures = iface{"fail_count"}.getInt(0)
-    let score = fmt"{successes}/{successes + failures}"
+    let ok = $iface{"success_count"}.getInt(0)
+    let fail = $iface{"fail_count"}.getInt(0)
+    let uptime = formatInterfaceUptime(iface)
 
     echo "  " & alignLeft(name, 12) & " " &
          alignLeft(device, 10) & " " &
          alignLeft(state, 10) & " " &
-         alignLeft(enabled, 8) & " " &
-         align(rtt, 7) & " " &
+         align(rtt, 8) & " " &
          align(loss, 6) & " " &
-         align(score, 6)
+         align(ok, 6) & " " &
+         align(fail, 6) & " " &
+         align(uptime, 8)
 
 proc printInterfaceDetail(iface: JsonNode) =
   let name = iface{"name"}.getStr("-")
@@ -233,14 +244,16 @@ proc printInterfaceDetail(iface: JsonNode) =
   let enabled = if iface{"enabled"}.getBool(false): "yes" else: "no"
   let mark = iface{"mark"}.getInt(0).toHex(4).toLowerAscii()
   let tableId = iface{"table_id"}.getInt(0)
+  let uptime = formatInterfaceUptime(iface)
   echo fmt"Interface: {name}"
   echo fmt"  Device:    {device}"
   echo fmt"  State:     {state}"
   echo fmt"  Enabled:   {enabled}"
   echo fmt"  Mark:      0x{mark}"
   echo fmt"  Table:     {tableId}"
+  echo fmt"  Uptime:    {uptime}"
   let rttVal = iface{"avg_rtt_ms"}
-  let rtt = if rttVal != nil and rttVal.kind != JNull: fmt"{rttVal.getFloat()}ms" else: "-"
+  let rtt = if rttVal != nil and rttVal.kind != JNull: fmt"{rttVal.getFloat():.1f}ms" else: "-"
   let lossVal = iface{"loss_percent"}.getInt(0)
   let okCount = iface{"success_count"}.getInt(0)
   let failCount = iface{"fail_count"}.getInt(0)
