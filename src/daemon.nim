@@ -11,11 +11,10 @@ import ./config/schema
 import ./config/parser
 import ./config/diff
 import ./config/discover
+import ./state/machine
 import ./state/tracker
 import ./state/policy
-import ./state/transition
 import ./health/engine
-import ./health/dampening
 import ./health/icmp
 import ./health/dns
 import ./health/http
@@ -704,37 +703,54 @@ proc cleanupStatusFiles(d: Daemon) =
 # Action execution
 # =========================================================================
 
-proc executeActions(d: var Daemon, result: TransitionResult) =
-  ## Execute the actions determined by a state transition.
-  for action in result.actions:
-    case action
-    of taRegenerateNftables:
+proc scheduleDampenDecay(d: var Daemon, index: int) # forward declaration
+
+proc executeEffects(d: var Daemon, trackerIdx: int, decision: StateDecision,
+                    oldState: InterfaceState, linkEvent: bool = false) =
+  ## Execute the effects determined by the pure state machine decision.
+  if not decision.transitioned: return
+  let index = d.trackers[trackerIdx].index
+  let newState = decision.newState
+  for effect in decision.effects:
+    case effect
+    of efRegenerateNftables:
       d.nftablesDirty = true
-    of taAddRoutes:
-      d.addRoutes(result.index)
-    of taRemoveRoutes:
-      d.removeRoutes(result.index)
-    of taUpdateDns:
-      d.updateDns(result.index)
-    of taRemoveDns:
-      d.removeDns(result.index)
-    of taBroadcastEvent:
-      var name = ""
-      for t in d.trackers:
-        if t.index == result.index:
-          name = t.name
-          break
+    of efAddRoutes:
+      d.addRoutes(index)
+    of efRemoveRoutes:
+      d.removeRoutes(index)
+    of efUpdateDns:
+      d.updateDns(index)
+    of efRemoveDns:
+      d.removeDns(index)
+    of efBroadcastEvent:
+      let name = d.trackers[trackerIdx].name
       if name.len > 0:
         let eventData = EventData(
           event: "interface.state_change",
           interfaceName: name,
-          state: $result.newState,
+          state: $newState,
         )
         let eventResp = successResponse(0, eventData.toJson())
         d.ipcServer.broadcastEvent(eventResp, d.selector)
-        d.runHook(name, result.newState)
-    of taWriteStatus:
-      d.writeStatusFile(result.index, result.newState)
+        d.runHook(name, newState)
+    of efWriteStatus:
+      d.writeStatusFile(index, newState)
+    of efCancelProbeTimers:
+      d.timers.cancelByIndex(index, {tkProbe, tkProbeTimeout})
+    of efResetProbeCounters:
+      d.probeEngine.resetCounters(index)
+    of efScheduleFirstProbe:
+      d.timers.push(TimerEntry(
+        deadline: getMonoTime() + initDuration(seconds = 1),
+        kind: tkProbe,
+        index: index,
+      ))
+    of efFlushConntrack:
+      d.maybeFlushConntrack(index, d.trackers[trackerIdx].mark,
+                            oldState, newState, linkEvent)
+    of efScheduleDampenDecay:
+      d.scheduleDampenDecay(index)
 
 # =========================================================================
 # Dampening decay
@@ -753,6 +769,41 @@ proc scheduleDampenDecay(d: var Daemon, index: int) =
     index: index,
   ))
 
+proc handleStateEvent(d: var Daemon, trackerIdx: int, event: StateEvent,
+                      linkEvent: bool = false) =
+  ## Unified state machine pipeline:
+  ## snapshot → decide → apply → log → execute effects
+  let now = getMonoTime()
+  let snap = d.trackers[trackerIdx].snapshot(now)
+  let oldState = snap.state
+  let decision = decide(snap, event)
+
+  # Apply state changes
+  d.trackers[trackerIdx].apply(decision, now)
+
+  # Log transition
+  if decision.transitioned:
+    let name = d.trackers[trackerIdx].name
+    info fmt"{name}: {oldState} -> {decision.newState}"
+
+    # Log dampening state changes
+    if decision.newDampening.isSome:
+      let damp = decision.newDampening.get
+      if damp.suppressed:
+        debug fmt"{name}: dampening suppressed (penalty={damp.penalty:.1f})"
+      elif snap.dampening.isSome and snap.dampening.get.suppressed:
+        info fmt"{name}: dampening reuse threshold reached, unsuppressed"
+  elif decision.newDampening.isSome and snap.dampening.isSome:
+    # No transition but dampening decayed — still suppressed
+    let damp = decision.newDampening.get
+    if damp.suppressed:
+      debug fmt"{d.trackers[trackerIdx].name}: dampening penalty decayed to {damp.penalty:.1f}"
+      # Reschedule decay timer for still-suppressed interfaces
+      d.scheduleDampenDecay(d.trackers[trackerIdx].index)
+
+  # Execute effects
+  d.executeEffects(trackerIdx, decision, oldState, linkEvent)
+
 proc handleDampenDecay(d: var Daemon, index: int) =
   var trackerIdx = -1
   for i in 0 ..< d.trackers.len:
@@ -760,41 +811,10 @@ proc handleDampenDecay(d: var Daemon, index: int) =
       trackerIdx = i
       break
   if trackerIdx < 0: return
-
-  if d.trackers[trackerIdx].dampening.isNone: return
-
-  var damp = d.trackers[trackerIdx].dampening.get
-  damp.decay()
-  d.trackers[trackerIdx].dampening = some(damp)
-
-  if damp.isSuppressed:
-    debug fmt"{d.trackers[trackerIdx].name}: dampening penalty decayed to {damp.penalty} (reuse: {damp.reuse})"
-    d.scheduleDampenDecay(index)
-  else:
-    info fmt"{d.trackers[trackerIdx].name}: dampening reuse threshold reached, unsuppressed"
-
-    # If interface is Offline with link still up, restart probing
-    if d.trackers[trackerIdx].state == isOffline:
-      let name = d.trackers[trackerIdx].name
-      let mark = d.trackers[trackerIdx].mark
-      let newStateOpt = d.trackers[trackerIdx].linkUp()
-      if newStateOpt.isSome:
-        info fmt"{name}: restarting probing after dampening decay"
-        d.probeEngine.resetCounters(index)
-        let tr = actionsForTransition(name, index, mark, isOffline, newStateOpt.get)
-        d.executeActions(tr)
-        d.timers.push(TimerEntry(
-          deadline: getMonoTime() + initDuration(seconds = 1),
-          kind: tkProbe,
-          index: index,
-        ))
-
-# =========================================================================
-# Process probe result
-# =========================================================================
+  d.handleStateEvent(trackerIdx, StateEvent(kind: sekDampenDecay))
 
 proc processProbeResult(d: var Daemon, probeResult: ProbeResult) =
-  ## Update tracker state from a probe result, execute transition actions.
+  ## Update tracker state from a probe result via the pure state machine.
   var trackerIdx = -1
   for i in 0 ..< d.trackers.len:
     if d.trackers[i].index == probeResult.interfaceIndex:
@@ -806,28 +826,12 @@ proc processProbeResult(d: var Daemon, probeResult: ProbeResult) =
   d.trackers[trackerIdx].avgRttMs = probeResult.avgRttMs
   d.trackers[trackerIdx].lossPercent = probeResult.lossPercent
 
-  let oldState = d.trackers[trackerIdx].state
-  let newStateOpt = if probeResult.success:
-    d.trackers[trackerIdx].probeSuccess(probeResult.qualityOk)
-  else:
-    d.trackers[trackerIdx].probeFailure()
-
-  if newStateOpt.isSome:
-    let newState = newStateOpt.get
-    let name = d.trackers[trackerIdx].name
-    let index = d.trackers[trackerIdx].index
-    let mark = d.trackers[trackerIdx].mark
-
-    # Schedule dampening decay timer when transitioning to Offline while suppressed
-    if newState == isOffline:
-      if d.trackers[trackerIdx].dampening.isSome:
-        let damp = d.trackers[trackerIdx].dampening.get
-        if damp.isSuppressed:
-          d.scheduleDampenDecay(index)
-
-    let tr = actionsForTransition(name, index, mark, oldState, newState)
-    d.executeActions(tr)
-    d.maybeFlushConntrack(index, mark, oldState, newState, false)
+  let event = StateEvent(
+    kind: sekProbeResult,
+    success: probeResult.success,
+    qualityOk: probeResult.qualityOk,
+  )
+  d.handleStateEvent(trackerIdx, event)
 
 # =========================================================================
 # Event handlers
@@ -856,63 +860,23 @@ proc handleLinkEvents(d: var Daemon) =
   d.linkMonitor.processEvents(d.linkEventBuf)
 
   for event in d.linkEventBuf:
-    if event.up:
-      # Link up
-      var trackerIdx = -1
-      for i in 0 ..< d.trackers.len:
-        if d.trackers[i].device == event.ifname:
-          trackerIdx = i
-          break
-      if trackerIdx < 0: continue
+    var trackerIdx = -1
+    for i in 0 ..< d.trackers.len:
+      if d.trackers[i].device == event.ifname:
+        trackerIdx = i
+        break
+    if trackerIdx < 0: continue
 
-      # Update cached ifindex
+    # Update cached ifindex on link up
+    if event.up:
       d.trackers[trackerIdx].ifindex = event.ifindex
 
-      let oldState = d.trackers[trackerIdx].state
-      let newStateOpt = d.trackers[trackerIdx].linkUp()
-      if newStateOpt.isSome:
-        let name = d.trackers[trackerIdx].name
-        let index = d.trackers[trackerIdx].index
-        let mark = d.trackers[trackerIdx].mark
-        let currentState = d.trackers[trackerIdx].state
-
-        d.timers.cancelByIndex(index, {tkProbe, tkProbeTimeout})
-
-        # Reset quality window and hysteresis
-        d.probeEngine.resetCounters(index)
-
-        let tr = actionsForTransition(name, index, mark, oldState, newStateOpt.get)
-        d.executeActions(tr)
-        d.maybeFlushConntrack(index, mark, oldState, newStateOpt.get, true)
-
-        # Schedule first probe if entering Probing state
-        if currentState == isProbing:
-          d.timers.push(TimerEntry(
-            deadline: getMonoTime() + initDuration(seconds = 1),
-            kind: tkProbe,
-            index: index,
-          ))
+    let stateEvent = if event.up:
+      StateEvent(kind: sekLinkUp)
     else:
-      # Link down
-      var trackerIdx = -1
-      for i in 0 ..< d.trackers.len:
-        if d.trackers[i].device == event.ifname:
-          trackerIdx = i
-          break
-      if trackerIdx < 0: continue
+      StateEvent(kind: sekLinkDown)
 
-      let oldState = d.trackers[trackerIdx].state
-      let newStateOpt = d.trackers[trackerIdx].linkDown()
-      if newStateOpt.isSome:
-        let name = d.trackers[trackerIdx].name
-        let index = d.trackers[trackerIdx].index
-        let mark = d.trackers[trackerIdx].mark
-
-        d.timers.cancelByIndex(index, {tkProbe, tkProbeTimeout})
-
-        let tr = actionsForTransition(name, index, mark, oldState, newStateOpt.get)
-        d.executeActions(tr)
-        d.maybeFlushConntrack(index, mark, oldState, newStateOpt.get, true)
+    d.handleStateEvent(trackerIdx, stateEvent, linkEvent = true)
 
 proc handleRouteEvents(d: var Daemon) =
   ## Process route and address change events from netlink monitor.
@@ -1008,7 +972,10 @@ proc initializeInterfaces(d: var Daemon) =
       onlineIndices.add(index)
       info fmt"{d.trackers[ti].name}: initial_state=online, active immediately"
     else:
-      discard d.trackers[ti].linkUp()
+      # Assume link is up, start probing
+      d.trackers[ti].state = isProbing
+      d.trackers[ti].successCount = 0
+      d.trackers[ti].failCount = 0
 
     # Set up probe targets
     let ipv6Ok = d.config.globals.ipv6Enabled
@@ -1193,13 +1160,17 @@ proc handleReload(d: var Daemon) =
         of isOffline:
           t.state = isOffline
         of isInit:
-          discard t.linkUp()
+          t.state = isProbing
+          t.successCount = 0
+          t.failCount = 0
         restoredState = true
         break
 
     if not restoredState:
       # New interface: assume link is up, start probing
-      discard t.linkUp()
+      t.state = isProbing
+      t.successCount = 0
+      t.failCount = 0
 
     newTrackers.add(t)
 
