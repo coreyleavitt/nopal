@@ -183,7 +183,7 @@ proc buildDiscoveredConfig*(
                      else: "balanced"
     result.rules.add(RuleConfig(
       name: "default_rule",
-      proto: "all",
+      proto: namedProto(npAll),
       family: rfAny,
       sticky: true,
       stickyTimeout: 600,
