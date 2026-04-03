@@ -4,7 +4,6 @@
 ## so the daemon can apply targeted updates instead of a full
 ## teardown/rebuild on every reload.
 
-import std/strformat
 import ./schema
 
 type
@@ -85,7 +84,7 @@ proc diff*(old, new: NopalConfig): ConfigDiff =
   )
 
 when isMainModule:
-  import std/unittest
+  import std/[unittest, strformat]
 
   proc minimalConfig(): NopalConfig =
     NopalConfig(globals: defaultGlobals())

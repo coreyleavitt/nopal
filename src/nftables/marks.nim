@@ -12,7 +12,7 @@ const
   FnvPrime = 16777619'u32
   TableBase = 100'u32
 
-func fnv1a(name: string): uint32 =
+func fnv1a(name: string): uint32 {.inline, raises: [].} =
   result = FnvOffsetBasis
   for b in name:
     result = result xor uint32(b)

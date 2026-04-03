@@ -4,7 +4,7 @@
 ## then reads /etc/config/network to resolve device names for each
 ## interface in those zones. Skips DHCPv6 interfaces.
 
-import std/[strutils, strformat, logging, os]
+import std/[strformat, logging, os]
 import ./parser
 import ./schema
 
@@ -183,7 +183,7 @@ proc buildDiscoveredConfig*(
                      else: "balanced"
     result.rules.add(RuleConfig(
       name: "default_rule",
-      proto: "all",
+      proto: namedProto(npAll),
       family: rfAny,
       sticky: true,
       stickyTimeout: 600,

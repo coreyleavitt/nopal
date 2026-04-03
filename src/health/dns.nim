@@ -8,7 +8,7 @@
 ## SO_BINDTODEVICE and marked with SO_MARK = 0xDEAD for nftables
 ## exemption.
 
-import std/[posix, os, strformat]
+import std/[posix, os]
 import ../linux_constants
 
 const DNS_PORT = 53'u16
@@ -161,74 +161,36 @@ proc recvDnsReply*(fd: cint, buf: var array[512, byte]): tuple[ok: bool, txid: u
   result = (ok: true, txid: txid)
 
 when isMainModule:
-  # Tests for encodeDnsQuery
+  import std/[unittest, strformat]
 
-  block testGoogleCom:
-    ## "google.com" produces correct label sequence.
-    var buf: array[512, byte]
-    let n = encodeDnsQuery("google.com", buf)
+  suite "DNS query encoding":
+    test "google.com produces correct label sequence":
+      var buf: array[512, byte]
+      let n = encodeDnsQuery("google.com", buf)
+      check buf[0] == 0 and buf[1] == 0       # txid
+      check buf[2] == 0x01 and buf[3] == 0x00  # flags
+      check buf[4] == 0x00 and buf[5] == 0x01  # qdcount
+      check buf[12] == 6                        # "google" length
+      check buf[13] == uint8('g')
+      check buf[19] == 3                        # "com" length
+      check buf[23] == 0x00                     # root terminator
+      check buf[24] == 0x00 and buf[25] == 0x01 # type A
+      check buf[26] == 0x00 and buf[27] == 0x01 # class IN
+      check n == 28
 
-    # Header: txid=0, flags=0x0100, qdcount=1
-    doAssert buf[0] == 0 and buf[1] == 0, "txid should be 0"
-    doAssert buf[2] == 0x01 and buf[3] == 0x00, "flags should be 0x0100"
-    doAssert buf[4] == 0x00 and buf[5] == 0x01, "qdcount should be 1"
+    test "root query produces minimal encoding":
+      var buf: array[512, byte]
+      let n = encodeDnsQuery(".", buf)
+      check buf[12] == 0x00                     # root label
+      check buf[13] == 0x00 and buf[14] == 0x01 # type A
+      check buf[15] == 0x00 and buf[16] == 0x01 # class IN
+      check n == 17
 
-    # Question starts at byte 12
-    # "google" label: length 6
-    doAssert buf[12] == 6, "google label length"
-    doAssert buf[13] == uint8('g')
-    doAssert buf[14] == uint8('o')
-    doAssert buf[15] == uint8('o')
-    doAssert buf[16] == uint8('g')
-    doAssert buf[17] == uint8('l')
-    doAssert buf[18] == uint8('e')
-
-    # "com" label: length 3
-    doAssert buf[19] == 3, "com label length"
-    doAssert buf[20] == uint8('c')
-    doAssert buf[21] == uint8('o')
-    doAssert buf[22] == uint8('m')
-
-    # Root terminator
-    doAssert buf[23] == 0x00, "root terminator"
-
-    # Type A
-    doAssert buf[24] == 0x00 and buf[25] == 0x01, "type A"
-
-    # Class IN
-    doAssert buf[26] == 0x00 and buf[27] == 0x01, "class IN"
-
-    # Total: 12 header + 1+6 + 1+3 + 1 + 2+2 = 28
-    doAssert n == 28, "total length for google.com should be 28"
-
-  block testRootQuery:
-    ## Root query "." produces single null byte after header.
-    var buf: array[512, byte]
-    let n = encodeDnsQuery(".", buf)
-
-    # Root label (single null byte)
-    doAssert buf[12] == 0x00, "root label should be null"
-
-    # Type A
-    doAssert buf[13] == 0x00 and buf[14] == 0x01, "type A"
-
-    # Class IN
-    doAssert buf[15] == 0x00 and buf[16] == 0x01, "class IN"
-
-    # Total: 12 + 1 + 2 + 2 = 17
-    doAssert n == 17, "total length for root query should be 17"
-
-  block testTrailingDot:
-    ## Name with trailing dot "example.com." works correctly.
-    var buf1: array[512, byte]
-    var buf2: array[512, byte]
-    let n1 = encodeDnsQuery("example.com.", buf1)
-    let n2 = encodeDnsQuery("example.com", buf2)
-
-    # Trailing dot should be stripped, producing identical output
-    doAssert n1 == n2, "trailing dot should not change length"
-    for i in 12 ..< n1:
-      doAssert buf1[i] == buf2[i],
-        fmt"trailing dot: byte {i} differs"
-
-  echo "All encodeDnsQuery tests passed."
+    test "trailing dot stripped":
+      var buf1: array[512, byte]
+      var buf2: array[512, byte]
+      let n1 = encodeDnsQuery("example.com.", buf1)
+      let n2 = encodeDnsQuery("example.com", buf2)
+      check n1 == n2
+      for i in 12 ..< n1:
+        check buf1[i] == buf2[i]

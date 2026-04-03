@@ -307,7 +307,7 @@ proc dispatchGetFds*(transport: ProbeTransport): seq[cint] =
       fds.add(dispatchGetFds(sub))
     fds
 
-proc dispatchClose*(transport: var ProbeTransport) =
+proc dispatchClose*(transport: var ProbeTransport) {.raises: [].} =
   ## Close file descriptors held by the transport.
   case transport.kind
   of tkIcmp:
@@ -326,6 +326,12 @@ proc dispatchClose*(transport: var ProbeTransport) =
   of tkComposite:
     for sub in transport.subs.mitems:
       dispatchClose(sub)
+
+proc closeAll*(engine: var ProbeEngine) {.raises: [].} =
+  ## Close all probe transport sockets. Called at daemon shutdown.
+  for probe in engine.probes.mitems:
+    dispatchClose(probe.transport)
+  engine.probes.setLen(0)
 
 # ===================================================================
 # ProbeEngine API
@@ -639,80 +645,59 @@ when isMainModule:
         p.lastRtt = some(rttMs)
         return
 
-  # ===================================================================
-  # Tests
-  # ===================================================================
-
-  var passed = 0
-  var failed = 0
-
-  template test(name: string, body: untyped) =
-    block:
-      try:
-        body
-        inc passed
-        echo "  PASS: ", name
-      except AssertionDefect:
-        inc failed
-        echo "  FAIL: ", name, " - ", getCurrentExceptionMsg()
-      except CatchableError:
-        inc failed
-        echo "  FAIL: ", name, " - ", getCurrentExceptionMsg()
-
-  echo "=== QualityWindow tests ==="
+  import std/unittest
 
   test "empty window returns zero loss and no avg":
     var w = initQualityWindow(6)
-    assert w.len == 0
-    assert w.avgRtt.isNone
-    assert w.lossPercent == 0
+    check w.len == 0
+    check w.avgRtt.isNone
+    check w.lossPercent == 0
 
   test "push and read single success":
     var w = initQualityWindow(6)
     w.push(some(42'u32))
-    assert w.len == 1
-    assert w.avgRtt == some(42'u32)
-    assert w.lossPercent == 0
+    check w.len == 1
+    check w.avgRtt == some(42'u32)
+    check w.lossPercent == 0
 
   test "push and read single loss":
     var w = initQualityWindow(6)
     w.push(none(uint32))
-    assert w.len == 1
-    assert w.avgRtt.isNone
-    assert w.lossPercent == 100
+    check w.len == 1
+    check w.avgRtt.isNone
+    check w.lossPercent == 100
 
   test "mixed success and loss":
     var w = initQualityWindow(6)
     w.push(some(100'u32))
     w.push(none(uint32))
     w.push(some(200'u32))
-    assert w.len == 3
-    assert w.avgRtt == some(150'u32)  # (100+200)/2
-    assert w.lossPercent == 33        # 1/3 = 33%
+    check w.len == 3
+    check w.avgRtt == some(150'u32)  # (100+200)/2
+    check w.lossPercent == 33        # 1/3 = 33%
 
   test "wraps around at capacity 6":
     var w = initQualityWindow(6)
     for i in 1 .. 6:
       w.push(some(i.uint32 * 10))
-    assert w.len == 6
+    check w.len == 6
     # [10, 20, 30, 40, 50, 60] -> avg = 35
-    assert w.avgRtt == some(35'u32)
+    check w.avgRtt == some(35'u32)
     # Push a 7th — oldest (10) drops off
     w.push(some(70'u32))
-    assert w.len == 6
+    check w.len == 6
     # [70, 20, 30, 40, 50, 60] -> avg = (20+30+40+50+60+70)/6 = 270/6 = 45
-    assert w.avgRtt == some(45'u32)
+    check w.avgRtt == some(45'u32)
 
   test "clear resets window":
     var w = initQualityWindow(6)
     w.push(some(50'u32))
     w.push(some(60'u32))
     w.clear()
-    assert w.len == 0
-    assert w.avgRtt.isNone
+    check w.len == 0
+    check w.avgRtt.isNone
 
   echo ""
-  echo "=== ProbeEngine tests ==="
 
   test "single_target_cycle_success":
     var engine = initProbeEngine()
@@ -720,8 +705,8 @@ when isMainModule:
     engine.simulateSend(0)
     engine.simulateResponse(0)
     let r = engine.recordTimeout(0)
-    assert r.isSome
-    assert r.get.success
+    check r.isSome
+    check r.get.success
 
   test "single_target_cycle_failure":
     var engine = initProbeEngine()
@@ -729,8 +714,8 @@ when isMainModule:
     engine.simulateSend(0)
     # No response — timeout fires with pending still true
     let r = engine.recordTimeout(0)
-    assert r.isSome
-    assert not r.get.success
+    check r.isSome
+    check not r.get.success
 
   test "multi_target_reliability_met":
     # 3 targets, reliability=2: cycle succeeds if >= 2 targets respond
@@ -740,18 +725,18 @@ when isMainModule:
     # Target 0: success
     engine.simulateSend(0)
     engine.simulateResponse(0)
-    assert engine.recordTimeout(0).isNone  # mid-cycle
+    check engine.recordTimeout(0).isNone  # mid-cycle
 
     # Target 1: success
     engine.simulateSend(0)
     engine.simulateResponse(0)
-    assert engine.recordTimeout(0).isNone  # mid-cycle
+    check engine.recordTimeout(0).isNone  # mid-cycle
 
     # Target 2: timeout
     engine.simulateSend(0)
     let r = engine.recordTimeout(0)
-    assert r.isSome
-    assert r.get.success  # 2/3 >= reliability(2)
+    check r.isSome
+    check r.get.success  # 2/3 >= reliability(2)
 
   test "multi_target_reliability_not_met":
     # 3 targets, reliability=2: cycle fails if < 2 targets respond
@@ -761,17 +746,17 @@ when isMainModule:
     # Target 0: success
     engine.simulateSend(0)
     engine.simulateResponse(0)
-    assert engine.recordTimeout(0).isNone
+    check engine.recordTimeout(0).isNone
 
     # Target 1: timeout
     engine.simulateSend(0)
-    assert engine.recordTimeout(0).isNone
+    check engine.recordTimeout(0).isNone
 
     # Target 2: timeout
     engine.simulateSend(0)
     let r = engine.recordTimeout(0)
-    assert r.isSome
-    assert not r.get.success  # 1/3 < reliability(2)
+    check r.isSome
+    check not r.get.success  # 1/3 < reliability(2)
 
   test "reset_counters_clears_cycle_state":
     var engine = initProbeEngine()
@@ -788,17 +773,17 @@ when isMainModule:
     # Should start a fresh cycle from position 0
     engine.simulateSend(0)
     engine.simulateResponse(0)
-    assert engine.recordTimeout(0).isNone  # mid-cycle at pos 1
+    check engine.recordTimeout(0).isNone  # mid-cycle at pos 1
 
     engine.simulateSend(0)
     engine.simulateResponse(0)
-    assert engine.recordTimeout(0).isNone  # mid-cycle at pos 2
+    check engine.recordTimeout(0).isNone  # mid-cycle at pos 2
 
     engine.simulateSend(0)
     engine.simulateResponse(0)
     let r = engine.recordTimeout(0)
-    assert r.isSome
-    assert r.get.success  # 3/3 >= 2
+    check r.isSome
+    check r.get.success  # 3/3 >= 2
 
   test "quality_ok_without_thresholds":
     # No quality thresholds configured -> qualityOk always true
@@ -808,9 +793,9 @@ when isMainModule:
     engine.simulateSend(0)
     engine.simulateResponse(0)
     let r = engine.recordTimeout(0)
-    assert r.isSome
-    assert r.get.qualityOk
-    assert r.get.success
+    check r.isSome
+    check r.get.qualityOk
+    check r.get.success
 
   test "latency_threshold_triggers_degradation":
     # latencyThreshold=100ms, window=6 (fixed). Fill with 150ms -> avg > 100
@@ -823,12 +808,12 @@ when isMainModule:
       engine.simulateResponseWithRtt(0, 150)
       let r = engine.recordTimeout(0)
       if i < 5:
-        assert r.isSome
-        assert r.get.qualityOk  # window not full yet
+        check r.isSome
+        check r.get.qualityOk  # window not full yet
       else:
-        assert r.isSome
-        assert not r.get.qualityOk  # avg 150 > 100
-        assert r.get.avgRttMs == some(150'u32)
+        check r.isSome
+        check not r.get.qualityOk  # avg 150 > 100
+        check r.get.avgRttMs == some(150'u32)
 
   test "recovery_latency_hysteresis":
     # latencyThreshold=100ms, recoveryLatency=50ms, window=6
@@ -843,7 +828,7 @@ when isMainModule:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 150)
       discard engine.recordTimeout(0)
-    assert engine.probes[0].qualityDegraded
+    check engine.probes[0].qualityDegraded
 
     # Replace with 75ms: below failure (100) but above recovery (50)
     for i in 0 ..< 6:
@@ -851,14 +836,14 @@ when isMainModule:
       engine.simulateResponseWithRtt(0, 75)
       discard engine.recordTimeout(0)
     # Still degraded because 75 >= 50
-    assert engine.probes[0].qualityDegraded
+    check engine.probes[0].qualityDegraded
 
     # Replace with 40ms: below recovery (50) -> recovered
     for i in 0 ..< 6:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 40)
       discard engine.recordTimeout(0)
-    assert not engine.probes[0].qualityDegraded
+    check not engine.probes[0].qualityDegraded
 
   test "loss_threshold_triggers_degradation":
     # lossThreshold=30%, window=6: > 30% loss triggers degradation
@@ -873,15 +858,14 @@ when isMainModule:
       # else: no response (timeout)
       let r = engine.recordTimeout(0)
       if i < 5:
-        assert r.isSome
-        assert r.get.qualityOk  # window not full
+        check r.isSome
+        check r.get.qualityOk  # window not full
       else:
-        assert r.isSome
-        assert not r.get.qualityOk
-        assert r.get.lossPercent == 50
+        check r.isSome
+        check not r.get.qualityOk
+        check r.get.lossPercent == 50
 
   echo ""
-  echo "=== Additional ProbeEngine tests ==="
 
   # --- HIGH priority ---
 
@@ -893,29 +877,29 @@ when isMainModule:
     # Cycle 1: both targets succeed -> success (2 >= 1)
     engine.simulateSend(0)
     engine.simulateResponse(0)
-    doAssert engine.recordTimeout(0).isNone  # mid-cycle
+    check engine.recordTimeout(0).isNone  # mid-cycle
     engine.simulateSend(0)
     engine.simulateResponse(0)
     let r1 = engine.recordTimeout(0)
-    doAssert r1.isSome
-    doAssert r1.get.success
+    check r1.isSome
+    check r1.get.success
 
     # Cycle 2: both targets fail -> failure (0 < 1)
     engine.simulateSend(0)
-    doAssert engine.recordTimeout(0).isNone  # mid-cycle
+    check engine.recordTimeout(0).isNone  # mid-cycle
     engine.simulateSend(0)
     let r2 = engine.recordTimeout(0)
-    doAssert r2.isSome
-    doAssert not r2.get.success
+    check r2.isSome
+    check not r2.get.success
 
     # Cycle 3: first target succeeds, second fails -> success (1 >= 1)
     engine.simulateSend(0)
     engine.simulateResponse(0)
-    doAssert engine.recordTimeout(0).isNone  # mid-cycle
+    check engine.recordTimeout(0).isNone  # mid-cycle
     engine.simulateSend(0)
     let r3 = engine.recordTimeout(0)
-    doAssert r3.isSome
-    doAssert r3.get.success
+    check r3.isSome
+    check r3.get.success
 
   test "reliability_capped_to_target_count":
     # reliability=5 with only 2 targets -> capped to 2
@@ -925,13 +909,13 @@ when isMainModule:
     # Both targets succeed -> cycle succeeds (2/2 >= capped reliability 2)
     engine.simulateSend(0)
     engine.simulateResponse(0)
-    doAssert engine.recordTimeout(0).isNone  # mid-cycle
+    check engine.recordTimeout(0).isNone  # mid-cycle
 
     engine.simulateSend(0)
     engine.simulateResponse(0)
     let r = engine.recordTimeout(0)
-    doAssert r.isSome
-    doAssert r.get.success
+    check r.isSome
+    check r.get.success
 
   test "latency_threshold_not_evaluated_until_window_full":
     # latencyThreshold=50ms, window=6 (test helper default).
@@ -944,12 +928,12 @@ when isMainModule:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 200)
       let r = engine.recordTimeout(0)
-      doAssert r.isSome
+      check r.isSome
       if i < 5:
-        doAssert r.get.qualityOk  # window not full yet
+        check r.get.qualityOk  # window not full yet
       else:
-        doAssert not r.get.qualityOk  # avg 200 > 50
-        doAssert r.get.avgRttMs == some(200'u32)
+        check not r.get.qualityOk  # avg 200 > 50
+        check r.get.avgRttMs == some(200'u32)
 
   # --- MEDIUM priority ---
 
@@ -964,14 +948,14 @@ when isMainModule:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 150)
       discard engine.recordTimeout(0)
-    doAssert engine.probes[0].qualityDegraded
+    check engine.probes[0].qualityDegraded
 
     # Replace entire window with 20ms -> avg=20 < 100 -> recovered
     for i in 0 ..< 6:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 20)
       discard engine.recordTimeout(0)
-    doAssert not engine.probes[0].qualityDegraded
+    check not engine.probes[0].qualityDegraded
 
   test "loss_threshold_below_is_ok":
     # lossThreshold=50%, window=6. 3 successes + 2 losses + 1 success = 33% < 50%.
@@ -992,9 +976,9 @@ when isMainModule:
       let r = engine.recordTimeout(0)
       if i == 1:
         # Window is now full (6 entries): 4 success, 2 loss = 33% < 50%
-        doAssert r.isSome
-        doAssert r.get.qualityOk
-        doAssert r.get.lossPercent == 33
+        check r.isSome
+        check r.get.qualityOk
+        check r.get.lossPercent == 33
 
   test "quality_window_slides":
     # Push entries into a full window, verify old entries drop off.
@@ -1008,7 +992,7 @@ when isMainModule:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 200)
       discard engine.recordTimeout(0)
-    doAssert engine.probes[0].qualityDegraded
+    check engine.probes[0].qualityDegraded
 
     # Push 3 low-RTT entries (50ms). Window slides:
     # After 3 pushes: [200, 200, 200, 50, 50, 50] -> avg=125 > 100 still degraded
@@ -1016,14 +1000,14 @@ when isMainModule:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 50)
       discard engine.recordTimeout(0)
-    doAssert engine.probes[0].qualityDegraded  # avg still > 100
+    check engine.probes[0].qualityDegraded  # avg still > 100
 
     # Push 3 more: window becomes [50, 50, 50, 50, 50, 50] -> avg=50 < 100 -> recovered
     for i in 0 ..< 3:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 50)
       discard engine.recordTimeout(0)
-    doAssert not engine.probes[0].qualityDegraded
+    check not engine.probes[0].qualityDegraded
 
   # --- LOW priority ---
 
@@ -1040,7 +1024,7 @@ when isMainModule:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 20)
       discard engine.recordTimeout(0)
-    doAssert not engine.probes[0].qualityDegraded
+    check not engine.probes[0].qualityDegraded
 
     # Slide in high latency: push 3x 200ms -> window [20, 20, 20, 200, 200, 200]
     # avg = (20+20+20+200+200+200)/6 = 660/6 = 110 > 100 -> degraded
@@ -1048,14 +1032,14 @@ when isMainModule:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 200)
       discard engine.recordTimeout(0)
-    doAssert engine.probes[0].qualityDegraded  # latency threshold breached
+    check engine.probes[0].qualityDegraded  # latency threshold breached
 
     # Recover by replacing with low latency
     for i in 0 ..< 6:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 20)
       discard engine.recordTimeout(0)
-    doAssert not engine.probes[0].qualityDegraded
+    check not engine.probes[0].qualityDegraded
 
     # Now try loss only: 2 losses in window of 6 = 33% < 40%, should not degrade
     for i in 0 ..< 4:
@@ -1065,7 +1049,7 @@ when isMainModule:
     for i in 0 ..< 2:
       engine.simulateSend(0)
       discard engine.recordTimeout(0)  # timeout = loss
-    doAssert not engine.probes[0].qualityDegraded  # 33% < 40%, no degradation
+    check not engine.probes[0].qualityDegraded  # 33% < 40%, no degradation
 
   test "reset_counters_clears_quality_window":
     # Call resetCounters, verify quality window is empty and qualityOk=true.
@@ -1077,7 +1061,7 @@ when isMainModule:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 200)
       discard engine.recordTimeout(0)
-    doAssert engine.probes[0].qualityDegraded
+    check engine.probes[0].qualityDegraded
 
     # Reset clears everything
     engine.resetCounters(0)
@@ -1086,8 +1070,8 @@ when isMainModule:
     engine.simulateSend(0)
     engine.simulateResponseWithRtt(0, 200)
     let r = engine.recordTimeout(0)
-    doAssert r.isSome
-    doAssert r.get.qualityOk  # window not full (1/6)
+    check r.isSome
+    check r.get.qualityOk  # window not full (1/6)
 
   test "quality_metrics_api":
     # Call qualityMetrics and verify it returns correct avg_rtt and loss_percent.
@@ -1096,8 +1080,8 @@ when isMainModule:
 
     # No data yet
     let (avg0, loss0) = engine.qualityMetrics(0)
-    doAssert avg0.isNone
-    doAssert loss0 == 0
+    check avg0.isNone
+    check loss0 == 0
 
     # Add a successful probe with 50ms RTT
     engine.simulateSend(0)
@@ -1109,8 +1093,8 @@ when isMainModule:
     discard engine.recordTimeout(0)
 
     let (avg1, loss1) = engine.qualityMetrics(0)
-    doAssert avg1 == some(50'u32)  # only 1 successful probe contributes
-    doAssert loss1 == 50           # 1 loss out of 2
+    check avg1 == some(50'u32)  # only 1 successful probe contributes
+    check loss1 == 50           # 1 loss out of 2
 
   test "recovery_loss_hysteresis":
     # lossThreshold=30%, recoveryLoss=10%, window=6.
@@ -1142,7 +1126,7 @@ when isMainModule:
     engine.simulateSend(0)
     discard engine.recordTimeout(0)  # timeout
     # Window: [success, loss, loss, loss, success, loss] = 66% loss
-    doAssert engine.probes[0].qualityDegraded
+    check engine.probes[0].qualityDegraded
 
     # Slide in mostly successes but keep some loss: 4 success + 2 loss
     # Window becomes [success, success, success, success, loss, loss] = 33%
@@ -1168,14 +1152,14 @@ when isMainModule:
 
     engine.simulateSend(0)
     discard engine.recordTimeout(0)  # timeout
-    doAssert engine.probes[0].qualityDegraded  # 33% not < 10%
+    check engine.probes[0].qualityDegraded  # 33% not < 10%
 
     # Fill entirely with successes -> 0% loss < 10% -> recovered
     for i in 0 ..< 6:
       engine.simulateSend(0)
       engine.simulateResponse(0)
       discard engine.recordTimeout(0)
-    doAssert not engine.probes[0].qualityDegraded
+    check not engine.probes[0].qualityDegraded
 
   test "no_recovery_thresholds_uses_failure_thresholds":
     # No recovery thresholds set. Trigger degradation with latency > threshold.
@@ -1188,24 +1172,23 @@ when isMainModule:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 150)
       discard engine.recordTimeout(0)
-    doAssert engine.probes[0].qualityDegraded
+    check engine.probes[0].qualityDegraded
 
     # avg=100: not < 100, stays degraded (strict < comparison for recovery)
     for i in 0 ..< 6:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 100)
       discard engine.recordTimeout(0)
-    doAssert engine.probes[0].qualityDegraded  # 100 not < 100
+    check engine.probes[0].qualityDegraded  # 100 not < 100
 
     # avg=99: < 100, recovers
     for i in 0 ..< 6:
       engine.simulateSend(0)
       engine.simulateResponseWithRtt(0, 99)
       discard engine.recordTimeout(0)
-    doAssert not engine.probes[0].qualityDegraded
+    check not engine.probes[0].qualityDegraded
 
   echo ""
-  echo "=== Transport fd safety tests ==="
 
   test "getFds_filters_uninitialized_fd":
     # getFds must skip transports with fd=-1 and record them.
@@ -1215,37 +1198,28 @@ when isMainModule:
     engine.addTestInterface(0, "wan", 1, 1)
     # addTestInterface uses fd=-1 intentionally for simulation
     let fds = engine.getFds()
-    doAssert fds.len == 0, "getFds must not return fd=-1 entries"
-    doAssert engine.invalidFdInterfaces.len == 1,
-      "getFds must record invalid fd interfaces"
-    doAssert engine.invalidFdInterfaces[0] == "wan"
+    check fds.len == 0
+    check engine.invalidFdInterfaces.len == 1
+    check engine.invalidFdInterfaces[0] == "wan"
 
   test "dispatchGetFds_returns_stored_fd":
     # dispatchGetFds must return the exact fd stored in each transport kind.
     let t1 = ProbeTransport(kind: tkIcmp, icmpFd: 42.cint, icmpFamily: 2)
-    doAssert dispatchGetFds(t1) == @[42.cint], "ICMP fd not surfaced"
+    check dispatchGetFds(t1) == @[42.cint]
 
     let t2 = ProbeTransport(kind: tkDns, dnsFd: 43.cint, dnsFamily: 2,
                              dnsQueryLen: 0)
-    doAssert dispatchGetFds(t2) == @[43.cint], "DNS fd not surfaced"
+    check dispatchGetFds(t2) == @[43.cint]
 
     let t3 = ProbeTransport(kind: tkHttp, httpFd: 44.cint, httpFamily: 2,
                              httpDevice: "", httpPort: 80,
                              httpState: hsIdle)
-    doAssert dispatchGetFds(t3) == @[44.cint], "HTTP fd not surfaced"
+    check dispatchGetFds(t3) == @[44.cint]
 
     let t4 = ProbeTransport(kind: tkArp, arpFd: 45.cint, arpIfindex: 3)
-    doAssert dispatchGetFds(t4) == @[45.cint], "ARP fd not surfaced"
+    check dispatchGetFds(t4) == @[45.cint]
 
     let t5 = ProbeTransport(kind: tkHttps, httpsFamily: 2,
                              httpsDevice: "", httpsPort: 443)
-    doAssert dispatchGetFds(t5) == @[], "HTTPS should return no fds"
+    check dispatchGetFds(t5).len == 0
 
-  echo ""
-  echo "=== Results ==="
-  echo "  Passed: ", passed
-  echo "  Failed: ", failed
-  if failed > 0:
-    quit(1)
-  else:
-    echo "  All tests passed!"

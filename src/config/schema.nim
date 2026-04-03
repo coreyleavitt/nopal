@@ -30,6 +30,23 @@ type
     initOffline,  ## Wait for probes to confirm interface is online (default, safe)
     initOnline    ## Assume interface is online at startup
 
+  NamedProtocol* = enum
+    npTcp = "tcp"
+    npUdp = "udp"
+    npIcmp = "icmp"
+    npIcmpv6 = "icmpv6"
+    npSctp = "sctp"
+    npGre = "gre"
+    npEsp = "esp"
+    npAh = "ah"
+    npAll = "all"
+
+  Protocol* = object
+    ## Sum type for network protocol: named enum or numeric (0-255).
+    case named*: bool
+    of true: value*: NamedProtocol
+    of false: number*: uint8
+
   GlobalsConfig* = object
     enabled*: bool
     logLevel*: string
@@ -106,7 +123,7 @@ type
     srcPort*: string
     destIp*: seq[string]
     destPort*: string
-    proto*: string
+    proto*: Protocol
     family*: RuleFamily
     srcIface*: string
     ipset*: string
@@ -122,6 +139,47 @@ type
     members*: seq[MemberConfig]
     policies*: seq[PolicyConfig]
     rules*: seq[RuleConfig]
+
+# ---------------------------------------------------------------------------
+# Protocol and family helpers
+# ---------------------------------------------------------------------------
+
+func `==`*(a, b: Protocol): bool {.raises: [].} =
+  if a.named != b.named: return false
+  if a.named: a.value == b.value else: a.number == b.number
+
+func namedProto*(np: NamedProtocol): Protocol {.inline, raises: [].} =
+  Protocol(named: true, value: np)
+
+func numericProto*(n: uint8): Protocol {.inline, raises: [].} =
+  Protocol(named: false, number: n)
+
+func `$`*(p: Protocol): string {.raises: [].} =
+  ## nftables-compatible string representation.
+  if p.named: $p.value else: $int(p.number)
+
+func `$`*(f: RuleFamily): string {.raises: [].} =
+  ## nftables-compatible string representation.
+  case f
+  of rfAny: "any"
+  of rfIpv4: "ipv4"
+  of rfIpv6: "ipv6"
+
+func `$`*(sm: StickyMode): string {.raises: [].} =
+  case sm
+  of smFlow: "flow"
+  of smSrcIp: "src_ip"
+  of smSrcDst: "src_dst"
+
+func isIcmp*(p: Protocol): bool {.inline, raises: [].} =
+  p.named and p.value == npIcmp
+
+func isAll*(p: Protocol): bool {.inline, raises: [].} =
+  p.named and p.value == npAll
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
 
 proc defaultGlobals*(): GlobalsConfig =
   GlobalsConfig(
@@ -181,7 +239,7 @@ proc defaultInterface*(): InterfaceConfig =
 
 proc defaultRule*(): RuleConfig =
   RuleConfig(
-    proto: "all",
+    proto: namedProto(npAll),
     family: rfAny,
     stickyMode: smFlow,
     stickyTimeout: 600,

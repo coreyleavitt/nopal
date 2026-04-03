@@ -57,7 +57,7 @@ func stripQuotes*(s: string): string =
       return s[1 ..< s.len - 1]
   return s
 
-func isValidIpv4(s: string): bool =
+func isValidIpv4(s: string): bool {.raises: [].} =
   ## Validate an IPv4 address: 4 dot-separated octets 0-255, no leading zeros.
   let parts = s.split('.')
   if parts.len != 4:
@@ -71,12 +71,15 @@ func isValidIpv4(s: string): bool =
     for c in part:
       if c < '0' or c > '9':
         return false
-    let val = parseInt(part)
-    if val < 0 or val > 255:
+    # Manual int conversion (already validated digits above, avoids parseInt raises)
+    var val = 0
+    for c in part:
+      val = val * 10 + (ord(c) - ord('0'))
+    if val > 255:
       return false
   return true
 
-func isValidIpv6(s: string): bool =
+func isValidIpv6(s: string): bool {.raises: [].} =
   ## Validate an IPv6 address with optional :: compression and mixed notation.
   if s.len == 0:
     return false
@@ -157,11 +160,11 @@ func isValidIpv6(s: string): bool =
           return false
   return true
 
-func isValidIpAddress*(s: string): bool =
+func isValidIpAddress*(s: string): bool {.raises: [].} =
   ## Validate an IPv4 or IPv6 address string.
   return isValidIpv4(s) or isValidIpv6(s)
 
-func isIpv6*(s: string): bool =
+func isIpv6*(s: string): bool {.raises: [].} =
   ## Check whether a valid IP address string is IPv6.
   ## Assumes s is a valid IP address (call isValidIpAddress first).
   return ':' in s
@@ -238,7 +241,7 @@ proc parseUci*(text: string): seq[UciSection] =
       warn fmt"line {lineNum}: unknown directive '{directive}', skipping"
       continue
 
-func isValidMarkMask(mask: uint32): bool =
+func isValidMarkMask(mask: uint32): bool {.raises: [].} =
   ## Check that a bitmask has contiguous set bits and at least 2 usable slots.
   if mask == 0:
     return false
@@ -634,15 +637,22 @@ proc parseRule*(sec: UciSection): RuleConfig =
   let proto = sec.get("proto")
   if proto != "":
     case proto.toLowerAscii()
-    of "tcp", "udp", "icmp", "icmpv6", "sctp", "gre", "esp", "ah", "all":
-      result.proto = proto.toLowerAscii()
+    of "tcp": result.proto = namedProto(npTcp)
+    of "udp": result.proto = namedProto(npUdp)
+    of "icmp": result.proto = namedProto(npIcmp)
+    of "icmpv6": result.proto = namedProto(npIcmpv6)
+    of "sctp": result.proto = namedProto(npSctp)
+    of "gre": result.proto = namedProto(npGre)
+    of "esp": result.proto = namedProto(npEsp)
+    of "ah": result.proto = namedProto(npAh)
+    of "all": result.proto = namedProto(npAll)
     else:
       # Allow numeric protocol numbers
       try:
         let pnum = parseInt(proto)
         if pnum < 0 or pnum > 255:
           raise newException(ConfigError, fmt"{ctx}: protocol number {pnum} out of range (0-255)")
-        result.proto = proto
+        result.proto = numericProto(uint8(pnum))
       except ValueError:
         raise newException(ConfigError, fmt"{ctx}: unknown protocol '{proto}'")
 
@@ -877,7 +887,7 @@ config rule default_rule
       check cfg.rules.len == 1
       check cfg.rules[0].name == "default_rule"
       check cfg.rules[0].usePolicy == "balanced"
-      check cfg.rules[0].proto == "all"
+      check cfg.rules[0].proto == namedProto(npAll)
 
     test "parse_empty_config":
       let cfg = loadFromStr("")
@@ -1120,7 +1130,7 @@ config rule custom
       check rule.srcPort == "1024-65535"
       check rule.destIp == @["192.168.1.0/24"]
       check rule.destPort == "80"
-      check rule.proto == "tcp"
+      check rule.proto == namedProto(npTcp)
       check rule.family == rfIpv4
       check rule.sticky == true
       check rule.stickyTimeout == 300'u32

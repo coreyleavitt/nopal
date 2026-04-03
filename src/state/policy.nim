@@ -4,7 +4,7 @@
 ## sorts tiers by metric (lowest = highest priority). The active tier is
 ## the first one with at least one online member.
 
-import std/[algorithm, strformat]
+import std/[algorithm]
 import ./tracker
 import ../config/schema
 
@@ -87,7 +87,7 @@ func activeTotalWeight*(rp: ResolvedPolicy): uint32 =
       result += m.weight
 
 when isMainModule:
-  import std/unittest
+  import std/[unittest, strformat]
 
   proc makeMember(name, iface: string, metric, weight: uint32): MemberConfig =
     result = MemberConfig(name: name, metric: metric, weight: weight)

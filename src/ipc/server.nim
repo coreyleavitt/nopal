@@ -213,3 +213,107 @@ proc close*(s: var IpcServer) =
     discard posix.close(client.fd)
   s.clients.clear()
   discard unlink(cstring(s.socketPath))
+
+when isMainModule:
+  import std/[unittest, endians]
+
+  proc buildFrame(jsonStr: string): seq[byte] =
+    ## Build a length-prefixed frame: u32 BE length + UTF-8 payload.
+    var frame = newSeqOfCap[byte](4 + jsonStr.len)
+    let dataLen = uint32(jsonStr.len)
+    var lenBE: uint32
+    bigEndian32(addr lenBE, unsafeAddr dataLen)
+    frame.setLen(4)
+    copyMem(addr frame[0], addr lenBE, 4)
+    for c in jsonStr:
+      frame.add(byte(c))
+    frame
+
+  proc makeTestServer(): tuple[server: IpcServer, writeFd: cint, clientId: int, selector: Selector[int]] =
+    ## Create a test IPC server with a socket pair (no real Unix socket needed).
+    var fds: array[2, cint]
+    let rc = posix.socketpair(AF_UNIX.cint, SOCK_STREAM.cint, 0, fds)
+    doAssert rc == 0, "socketpair failed"
+
+    # Set read end non-blocking
+    let flags = fcntl(fds[1], F_GETFL)
+    discard fcntl(fds[1], F_SETFL, flags or O_NONBLOCK)
+
+    var selector = newSelector[int]()
+    var server = IpcServer(
+      listenerFd: -1,
+      socketPath: "",
+      clients: initTable[int, ClientConn](),
+      nextClientId: 0,
+    )
+
+    let clientId = server.nextClientId
+    server.nextClientId += 1
+    server.clients[clientId] = ClientConn(fd: fds[1], readBuf: @[], subscribed: false)
+    selector.registerHandle(fds[1].int, {Event.Read}, IpcClientBase + clientId)
+
+    (server, fds[0], clientId, selector)
+
+  suite "IPC server frame parsing":
+    test "single complete frame":
+      var (server, writeFd, clientId, selector) = makeTestServer()
+      let frame = buildFrame("""{"id":1,"method":"status"}""")
+      let n = posix.send(SocketHandle(writeFd), unsafeAddr frame[0], frame.len, 0)
+      check n == frame.len.int
+
+      let requests = server.readClient(clientId, selector)
+      check requests.len == 1
+      check requests[0].id == 1
+      check requests[0].rpcMethod == "status"
+
+      discard posix.close(writeFd)
+      selector.close()
+
+    test "multiple frames in one read":
+      var (server, writeFd, clientId, selector) = makeTestServer()
+      let f1 = buildFrame("""{"id":1,"method":"status"}""")
+      let f2 = buildFrame("""{"id":2,"method":"connected"}""")
+      var combined: seq[byte]
+      combined.add(f1)
+      combined.add(f2)
+      let n = posix.send(SocketHandle(writeFd), unsafeAddr combined[0], combined.len, 0)
+      check n == combined.len.int
+
+      let requests = server.readClient(clientId, selector)
+      check requests.len == 2
+      check requests[0].id == 1
+      check requests[1].id == 2
+      check requests[1].rpcMethod == "connected"
+
+      discard posix.close(writeFd)
+      selector.close()
+
+    test "partial frame returns empty":
+      var (server, writeFd, clientId, selector) = makeTestServer()
+      # Send only length prefix (4 bytes) with no payload
+      let frame = buildFrame("""{"id":1,"method":"status"}""")
+      let partial = frame[0 ..< 4]  # only the length prefix
+      let n = posix.send(SocketHandle(writeFd), unsafeAddr partial[0], partial.len, 0)
+      check n == 4
+
+      let requests = server.readClient(clientId, selector)
+      check requests.len == 0  # incomplete, buffered
+
+      discard posix.close(writeFd)
+      selector.close()
+
+    test "subscribe request sets client flag":
+      var (server, writeFd, clientId, selector) = makeTestServer()
+      check not server.clients[clientId].subscribed
+
+      let frame = buildFrame("""{"id":1,"method":"subscribe"}""")
+      let n = posix.send(SocketHandle(writeFd), unsafeAddr frame[0], frame.len, 0)
+      check n == frame.len.int
+
+      let requests = server.readClient(clientId, selector)
+      check requests.len == 1
+      check requests[0].rpcMethod == "subscribe"
+      check server.clients[clientId].subscribed
+
+      discard posix.close(writeFd)
+      selector.close()
