@@ -28,6 +28,8 @@ import ./netlink/monitor
 import ./netlink/conntrack
 import ./dnsmanager
 import ./timer
+import ./hooks
+import ./statusfiles
 import ./ipc/server
 import ./ipc/methods
 import ./ipc/protocol
@@ -66,18 +68,19 @@ type
     # Signal delivery
     signalFd: cint
 
+    # Extracted subsystems
+    hookRunner: HookRunner
+    statusFiles: StatusFileManager
+
     # State
     trackers*: seq[InterfaceTracker]
     startTime: MonoTime
     running: bool
-    firstConnectFired: bool
     connectedNetworks: seq[string]
-    hookScriptExists: bool
     connectedNetworksDirty: bool
     nftablesDirty: bool
     dnsDirty: bool
     cachedRules: seq[RuleInfo]
-    inFlightHooks: int
 
     # Reusable buffers to avoid per-iteration allocations
     timerBuf: seq[TimerEntry]
@@ -129,8 +132,6 @@ proc buildRulesFromConfig(config: NopalConfig): seq[RuleInfo] =
 # Initialization
 # =========================================================================
 
-proc checkHookScript(path: string): bool =
-  path.len > 0 and fileExists(path)
 
 proc enrichConfigWithDiscovery(config: var NopalConfig) =
   ## Discover WANs from OpenWrt firewall/network config and enrich
@@ -233,7 +234,6 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
 
     trackers.add(t)
 
-  let hookExists = checkHookScript(config.globals.hookScript)
   let cachedRules = buildRulesFromConfig(config)
 
   result = Daemon(
@@ -248,18 +248,17 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
     dnsManager: dnsMgr,
     conntrackMgr: ctMgr,
     ipcServer: ipcServer,
+    hookRunner: initHookRunner(config.globals.hookScript),
+    statusFiles: initStatusFileManager(),
     signalFd: signalFd,
     trackers: trackers,
     startTime: getMonoTime(),
     running: true,
-    firstConnectFired: false,
     connectedNetworks: @[],
-    hookScriptExists: hookExists,
     connectedNetworksDirty: true,
     nftablesDirty: false,
     dnsDirty: false,
     cachedRules: cachedRules,
-    inFlightHooks: 0,
     timerBuf: @[],
     linkEventBuf: @[],
     routeChangeBuf: @[],
@@ -546,156 +545,28 @@ proc maybeFlushConntrack(d: var Daemon, index: int, mark: uint32,
     d.flushConntrack(mark, d.config.globals.markMask)
 
 # =========================================================================
-# Hook script execution
+# Status file helpers
 # =========================================================================
 
-const MaxInFlightHooks = 4
-
-proc runHook(d: var Daemon, interfaceName: string, newState: InterfaceState) =
-  ## Execute the user hook script on state changes.
-  ## Fire-and-forget, errors are logged but not propagated.
-  if not d.hookScriptExists: return
-
-  let script = d.config.globals.hookScript
-
-  let action = case newState
-    of isOnline: "connected"
-    of isOffline: "disconnected"
-    of isProbing: "ifup"
-    of isDegraded: "degraded"
-    of isInit: return
-
-  var device = ""
-  for t in d.trackers:
-    if t.name == interfaceName:
-      device = t.device
-      break
-
-  let firstConnect = action == "connected" and not d.firstConnectFired
-  if firstConnect:
-    d.firstConnectFired = true
-
-  if d.inFlightHooks >= MaxInFlightHooks:
-    warn fmt"hook script skipped ({d.inFlightHooks} already in flight)"
-    return
-
-  info fmt"running hook: {script} ACTION={action} INTERFACE={interfaceName} DEVICE={device}"
-
-  # Fork and exec the hook script
-  let pid = posix.fork()
-  if pid < 0:
-    warn fmt"failed to fork for hook script: {strerror(errno)}"
-  elif pid == 0:
-    # Child process
-    # Set environment variables
-    putEnv("ACTION", action)
-    putEnv("INTERFACE", interfaceName)
-    putEnv("DEVICE", device)
-    if firstConnect:
-      putEnv("FIRSTCONNECT", "1")
-
-    discard posix.execl(cstring(script), cstring(script), nil)
-    # If exec fails, exit immediately
-    posix.exitnow(127)
+proc buildStatusMetrics(t: InterfaceTracker): StatusMetrics =
+  ## Build a StatusMetrics from a tracker for the status file manager.
+  let avgRtt = if t.avgRttMs.isSome: int(t.avgRttMs.get) else: -1
+  let uptime = if t.onlineSince.isSome:
+    (getMonoTime() - t.onlineSince.get).inSeconds
   else:
-    # Parent process -- reap asynchronously via SIGCHLD or periodic waitpid
-    inc d.inFlightHooks
-    # Non-blocking waitpid to reap immediately if already finished
-    var status: cint
-    let res = posix.waitpid(pid, status, WNOHANG)
-    if res > 0:
-      dec d.inFlightHooks
-      if WEXITSTATUS(status) != 0:
-        warn fmt"hook script exited with {WEXITSTATUS(status)}"
-
-proc reapHookChildren(d: var Daemon) =
-  ## Non-blocking reap of any finished hook child processes.
-  while d.inFlightHooks > 0:
-    var status: cint
-    let res = posix.waitpid(-1, status, WNOHANG)
-    if res <= 0: break
-    dec d.inFlightHooks
-    if WIFEXITED(status) and WEXITSTATUS(status) != 0:
-      warn fmt"hook script exited with {WEXITSTATUS(status)}"
-
-# =========================================================================
-# Status file management
-# =========================================================================
-
-proc createStatusDirs(d: Daemon) =
-  for t in d.trackers:
-    let dir = fmt"/var/run/nopal/{t.name}"
-    try:
-      createDir(dir)
-    except OSError as e:
-      warn fmt"failed to create status dir {dir}: {e.msg}"
-
-proc writeStatusFile(d: Daemon, index: int, state: InterfaceState) =
-  var t: InterfaceTracker
-  var found = false
-  for tr in d.trackers:
-    if tr.index == index:
-      t = tr
-      found = true
-      break
-  if not found: return
-
-  let dir = fmt"/var/run/nopal/{t.name}"
-  var content = $state & "\n"
-
-  if t.onlineSince.isSome:
-    let elapsed = (getMonoTime() - t.onlineSince.get).inSeconds
-    content.add(fmt"uptime={elapsed}" & "\n")
-  if t.offlineSince.isSome:
-    let elapsed = (getMonoTime() - t.offlineSince.get).inSeconds
-    content.add(fmt"downtime={elapsed}" & "\n")
-  content.add(fmt"success_count={t.successCount}" & "\n")
-  content.add(fmt"fail_count={t.failCount}" & "\n")
-  if t.avgRttMs.isSome:
-    content.add(fmt"avg_rtt_ms={t.avgRttMs.get}" & "\n")
-  content.add(fmt"loss_percent={t.lossPercent}" & "\n")
-
-  # Atomic write via temp + rename
-  let pid = posix.getpid()
-  let tmpPath = fmt"{dir}/status.tmp.{pid}"
-  let finalPath = fmt"{dir}/status"
-
-  try: removeFile(tmpPath)
-  except OSError: discard
-
-  let fd = posix.open(cstring(tmpPath),
-                      O_WRONLY or O_CREAT or O_EXCL, 0o644)
-  if fd < 0:
-    warn fmt"failed to create status file {tmpPath}"
-    return
-
-  let written = posix.write(fd, cstring(content), content.len)
-  if written < 0 or written != content.len:
-    warn "failed to write status file"
-    discard posix.close(fd)
-    try: removeFile(tmpPath)
-    except OSError: discard
-    return
-
-  discard posix.fsync(fd)
-  discard posix.close(fd)
-
-  try:
-    moveFile(tmpPath, finalPath)
-  except OSError as e:
-    warn fmt"failed to rename status file: {e.msg}"
-    try: removeFile(tmpPath)
-    except OSError: discard
-
-proc writeInitialStatusFiles(d: Daemon) =
-  for t in d.trackers:
-    d.writeStatusFile(t.index, t.state)
-
-proc cleanupStatusFiles(d: Daemon) =
-  try:
-    removeDir("/var/run/nopal")
-  except OSError:
-    debug "failed to clean up status files"
+    -1'i64
+  let downtime = if t.offlineSince.isSome:
+    (getMonoTime() - t.offlineSince.get).inSeconds
+  else:
+    -1'i64
+  StatusMetrics(
+    successCount: t.successCount,
+    failCount: t.failCount,
+    avgRttMs: avgRtt,
+    lossPercent: t.lossPercent,
+    uptimeSecs: uptime,
+    downtimeSecs: downtime,
+  )
 
 # =========================================================================
 # Action execution
@@ -731,9 +602,11 @@ proc executeEffects(d: var Daemon, trackerIdx: int, decision: StateDecision,
         )
         let eventResp = successResponse(0, eventData.toJson())
         d.ipcServer.broadcastEvent(eventResp, d.selector)
-        d.runHook(name, newState)
+        let device = d.trackers[trackerIdx].device
+        d.hookRunner.runHook(name, device, newState)
     of efWriteStatus:
-      d.writeStatusFile(index, newState)
+      let t = d.trackers[trackerIdx]
+      d.statusFiles.writeStatus(t.name, newState, buildStatusMetrics(t))
     of efCancelProbeTimers:
       d.timers.cancelByIndex(index, {tkProbe, tkProbeTimeout})
     of efResetProbeCounters:
@@ -1026,97 +899,108 @@ proc initializeInterfaces(d: var Daemon) =
   d.regenerateNftables()
 
   # Create status directories and write initial status files
-  d.createStatusDirs()
-  d.writeInitialStatusFiles()
+  var names: seq[string]
+  for t in d.trackers: names.add(t.name)
+  d.statusFiles.createDirs(names)
+  for t in d.trackers:
+    d.statusFiles.writeStatus(t.name, t.state, buildStatusMetrics(t))
 
 # =========================================================================
 # Reload
 # =========================================================================
 
-proc handleReload(d: var Daemon) =
-  ## Reload configuration, applying targeted or full rebuild as needed.
-  info fmt"reloading configuration from {d.configPath}"
+type
+  ReloadContext = object
+    newConfig: NopalConfig
+    cfgDiff: ConfigDiff
+    prevStates: seq[tuple[name: string, state: InterfaceState,
+                           onlineSince: Option[MonoTime]]]
+    newTrackers: seq[InterfaceTracker]
+
+proc reloadParseAndDiff(configPath: string,
+                        currentConfig: NopalConfig): Option[ReloadContext] =
+  ## Phase 1: Load new config, compute diff. No daemon access.
+  ## Returns none on error or if config is unchanged.
+  info fmt"reloading configuration from {configPath}"
 
   var newConfig: NopalConfig
   try:
-    newConfig = loadConfig(d.configPath)
+    newConfig = loadConfig(configPath)
   except CatchableError as e:
     error fmt"failed to reload config: {e.msg}"
-    return
+    return none[ReloadContext]()
 
-  # Re-run WAN discovery (interfaces may have changed)
   enrichConfigWithDiscovery(newConfig)
 
-  let cfgDiff = diff(d.config, newConfig)
+  let cfgDiff = diff(currentConfig, newConfig)
   if not cfgDiff.changed:
     info "config unchanged, skipping reload"
-    return
+    return none[ReloadContext]()
 
-  # Fast path: only routing policies/rules changed
-  if not cfgDiff.needsFullRebuild and
-     cfgDiff.changedInterfaces.len == 0 and
-     cfgDiff.routingChanged:
+  some(ReloadContext(newConfig: newConfig, cfgDiff: cfgDiff))
+
+proc reloadFastPath(ctx: ReloadContext, d: var Daemon): bool =
+  ## Phase 2: Handle routing-only changes without full rebuild.
+  ## Returns true if handled (no further phases needed).
+  if not ctx.cfgDiff.needsFullRebuild and
+     ctx.cfgDiff.changedInterfaces.len == 0 and
+     ctx.cfgDiff.routingChanged:
     info "only routing policies/rules changed, regenerating nftables"
-    d.config = newConfig
+    d.config = ctx.newConfig
     d.cachedRules = buildRulesFromConfig(d.config)
-    d.hookScriptExists = checkHookScript(d.config.globals.hookScript)
+    d.hookRunner.updateScript(d.config.globals.hookScript)
     d.regenerateNftables()
-    return
+    return true
+  false
 
-  # Save current interface states by name for restoration
-  var prevStates: seq[tuple[name: string, state: InterfaceState,
-                             onlineSince: Option[MonoTime]]]
-  for t in d.trackers:
-    prevStates.add((name: t.name, state: t.state, onlineSince: t.onlineSince))
+proc reloadTeardown(ctx: var ReloadContext,
+                    probeEngine: var ProbeEngine,
+                    selector: var Selector[int],
+                    dnsManager: var DnsManager,
+                    trackers: seq[InterfaceTracker],
+                    timers: var TimerWheel) =
+  ## Phase 3: Save previous states, tear down probes/DNS.
+  ## Route removal is done by the caller (needs var Daemon for addRoutes/removeRoutes).
+  ## Takes only the specific subsystems it mutates.
 
-  # -- Teardown existing state --
+  # Save current states for restoration
+  for t in trackers:
+    ctx.prevStates.add((name: t.name, state: t.state, onlineSince: t.onlineSince))
 
-  d.timers.cancelAll({tkIpcTimeout})  # keep IPC timeouts, cancel everything else
-
-  # Remove routes for active interfaces
-  var activeIndices: seq[int]
-  for t in d.trackers:
-    if t.state == isOnline or t.state == isDegraded:
-      activeIndices.add(t.index)
-  for index in activeIndices:
-    d.removeRoutes(index)
+  # Cancel non-IPC timers
+  timers.cancelAll({tkIpcTimeout})
 
   # Deregister probe sockets from selector
-  for (slot, fd) in d.probeEngine.getFds():
+  for (slot, fd) in probeEngine.getFds():
     try:
-      d.selector.unregister(fd.int)
+      selector.unregister(fd.int)
     except CatchableError:
       discard
 
   # Remove all interfaces from probe engine
   var probeIndices: seq[int]
-  for t in d.trackers: probeIndices.add(t.index)
+  for t in trackers: probeIndices.add(t.index)
   for idx in probeIndices:
-    d.probeEngine.removeInterface(idx)
+    probeEngine.removeInterface(idx)
 
   # Remove all DNS entries
-  for t in d.trackers:
-    d.dnsManager.removeInterface(t.name)
-  d.dnsManager.apply()
+  for t in trackers:
+    dnsManager.removeInterface(t.name)
+  dnsManager.apply()
 
-  # -- Replace config and rebuild trackers --
-
-  d.config = newConfig
-  d.cachedRules = buildRulesFromConfig(d.config)
-  d.hookScriptExists = checkHookScript(d.config.globals.hookScript)
-
-  let ipv6Enabled = d.config.globals.ipv6Enabled
+proc reloadBuildTrackers(ctx: var ReloadContext, config: NopalConfig) =
+  ## Phase 4: Create new trackers with mark assignment and state restoration.
+  let ipv6Enabled = config.globals.ipv6Enabled
   var enabledNames: seq[string]
-  for iface in d.config.interfaces:
+  for iface in config.interfaces:
     if not iface.enabled: continue
     if not ipv6Enabled and iface.family == afIpv6: continue
     enabledNames.add(iface.name)
 
-  let marks = assignMarks(enabledNames, d.config.globals.markMask)
+  let marks = assignMarks(enabledNames, config.globals.markMask)
 
-  var newTrackers: seq[InterfaceTracker]
   var markIdx = 0
-  for i, iface in d.config.interfaces:
+  for i, iface in config.interfaces:
     if not iface.enabled: continue
     if not ipv6Enabled and iface.family == afIpv6:
       warn fmt"{iface.name}: skipping IPv6-only interface (ipv6_enabled=false)"
@@ -1144,7 +1028,7 @@ proc handleReload(d: var Daemon) =
 
     # Restore state for previously-known interfaces
     var restoredState = false
-    for prev in prevStates:
+    for prev in ctx.prevStates:
       if prev.name == iface.name:
         case prev.state
         of isOnline:
@@ -1167,18 +1051,25 @@ proc handleReload(d: var Daemon) =
         break
 
     if not restoredState:
-      # New interface: assume link is up, start probing
       t.state = isProbing
       t.successCount = 0
       t.failCount = 0
 
-    newTrackers.add(t)
+    ctx.newTrackers.add(t)
 
-  d.trackers = newTrackers
-  d.createStatusDirs()
+proc reloadReinitSubsystems(ctx: ReloadContext, d: var Daemon) =
+  ## Phase 5: Re-register probes, restore routes/DNS, regenerate nftables.
+  ## Legitimately needs var Daemon — touches most subsystems.
+  d.config = ctx.newConfig
+  d.cachedRules = buildRulesFromConfig(d.config)
+  d.hookRunner.updateScript(d.config.globals.hookScript)
+  d.trackers = ctx.newTrackers
 
-  # -- Reinitialize probes, routes, and DNS --
+  var names: seq[string]
+  for t in d.trackers: names.add(t.name)
+  d.statusFiles.createDirs(names)
 
+  # Re-register probes
   for t in d.trackers:
     let cfg = d.configForIndex(t.index)
     if cfg.isNone: continue
@@ -1214,23 +1105,39 @@ proc handleReload(d: var Daemon) =
       index: t.index,
     ))
 
-  # Register new probe sockets with selector
+  # Register probe sockets with selector
   for (slot, fd) in d.probeEngine.getFds():
     d.selector.registerHandle(fd.int, {Read}, ProbeTokenBase + slot)
   for name in d.probeEngine.invalidFdInterfaces:
     error fmt"probe socket creation failed for interface '{name}' — probes will not work"
 
-  # Restore routes and DNS for Online and Degraded interfaces
-  var restoreIndices: seq[int]
+  # Restore routes and DNS for active interfaces
   for t in d.trackers:
     if t.state == isOnline or t.state == isDegraded:
-      restoreIndices.add(t.index)
-  for index in restoreIndices:
-    d.addRoutes(index)
-    d.updateDns(index)
+      d.addRoutes(t.index)
+      d.updateDns(t.index)
 
-  # Regenerate nftables
   d.regenerateNftables()
+
+proc handleReload(d: var Daemon) =
+  ## Reload configuration using Phase Object pattern.
+  ## Each phase has minimum access: phases 1,4 are pure config operations,
+  ## phase 3 takes specific subsystems, phase 5 takes var Daemon.
+  let ctxOpt = reloadParseAndDiff(d.configPath, d.config)
+  if ctxOpt.isNone: return
+  var ctx = ctxOpt.get
+
+  if reloadFastPath(ctx, d): return
+
+  # Remove routes for active interfaces (needs var Daemon)
+  for t in d.trackers:
+    if t.state == isOnline or t.state == isDegraded:
+      d.removeRoutes(t.index)
+
+  reloadTeardown(ctx, d.probeEngine, d.selector, d.dnsManager,
+                 d.trackers, d.timers)
+  reloadBuildTrackers(ctx, d.config)
+  reloadReinitSubsystems(ctx, d)
 
   info fmt"configuration reloaded: {d.config.interfaces.len} interfaces, {d.config.policies.len} policies, {d.config.rules.len} rules"
 
@@ -1276,7 +1183,7 @@ proc shutdown(d: var Daemon) =
     if not r.ok and r.error.osError != int32(ENOENT) and r.error.osError != int32(ESRCH):
       warn fmt"shutdown: failed to flush table {t.tableId} for {t.name}: {r.error}"
 
-  d.cleanupStatusFiles()
+  d.statusFiles.cleanup()
 
   # Close the signal pipe read end
   if d.signalFd >= 0:
@@ -1305,7 +1212,7 @@ proc run*(d: var Daemon) =
   while d.running:
 
     # Reap any finished hook child processes
-    d.reapHookChildren()
+    d.hookRunner.reapChildren()
 
     # Calculate poll timeout from next timer deadline
     let nextDeadline = d.timers.nextDeadline()
