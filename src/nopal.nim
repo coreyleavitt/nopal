@@ -300,7 +300,12 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
   let reloadPending = resp.data{"reload_pending"}
   if reloadPending != nil and reloadPending.kind == JObject:
     let remaining = reloadPending{"remaining_secs"}.getInt(0)
-    echo fmt"  RELOAD PENDING — auto-rollback in {remaining}s (run 'nopal accept' to keep)"
+    let mins = remaining div 60
+    let secs = remaining mod 60
+    if mins > 0:
+      echo fmt"  RELOAD PENDING — auto-rollback in {mins}m{secs}s (run 'nopal accept' to keep)"
+    else:
+      echo fmt"  RELOAD PENDING — auto-rollback in {secs}s (run 'nopal accept' to keep)"
   echo ""
 
   let interfaces = resp.data{"interfaces"}
@@ -372,7 +377,7 @@ proc cliConnected(socketPath: string, jsonMode: bool) =
 
 proc cliReload(socketPath: string, args: seq[string]) =
   # Parse reload subcommand flags
-  var confirmTimeout = 0
+  var rollbackMinutes = 0
 
   var i = 0
   while i < args.len:
@@ -380,28 +385,29 @@ proc cliReload(socketPath: string, args: seq[string]) =
     of "--rollback":
       if i + 1 < args.len:
         try:
-          confirmTimeout = parseInt(args[i + 1])
-          if confirmTimeout <= 0:
-            stderr.writeLine "error: --rollback requires a positive number of seconds"
+          rollbackMinutes = parseInt(args[i + 1])
+          if rollbackMinutes <= 0:
+            stderr.writeLine "error: --rollback requires a positive number of minutes"
             quit(1)
         except ValueError:
           stderr.writeLine fmt"error: invalid timeout value '{args[i + 1]}'"
           quit(1)
         inc i
       else:
-        stderr.writeLine "error: --rollback requires a timeout in seconds"
+        stderr.writeLine "error: --rollback requires a timeout in minutes"
         quit(1)
     else:
       stderr.writeLine fmt"error: unknown reload flag '{args[i]}'"
       quit(1)
     inc i
 
-  if confirmTimeout > 0:
-    let params = %*{"confirm_timeout": confirmTimeout}
+  if rollbackMinutes > 0:
+    let timeoutSecs = rollbackMinutes * 60
+    let params = %*{"confirm_timeout": timeoutSecs}
     let req = IpcRequest(id: 1, rpcMethod: "config.reload", params: params)
     let resp = sendIpcRequest(socketPath, req)
     if resp.success:
-      echo fmt"configuration reloaded — auto-rollback in {confirmTimeout}s"
+      echo fmt"configuration reloaded — auto-rollback in {rollbackMinutes} minute(s)"
       echo "run 'nopal accept' to keep, or wait for rollback"
     else:
       stderr.writeLine fmt"reload failed: {resp.error}"
@@ -543,7 +549,7 @@ proc printUsage() =
   echo "  nopal use <iface> <cmd...>   Run command via specific WAN"
   echo "  nopal rules                  Show active nftables rules"
   echo "  nopal reload                 Reload configuration"
-  echo "  nopal reload --rollback <s>  Reload with auto-rollback after <s> seconds"
+  echo "  nopal reload --rollback <m>  Reload with auto-rollback after <m> minutes"
   echo "  nopal accept                 Keep pending reload (cancel rollback timer)"
   echo "  nopal cancel                 Rollback pending reload now"
   echo "  nopal version                Show version"

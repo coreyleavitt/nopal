@@ -1206,7 +1206,8 @@ proc handleReloadCommand(d: var Daemon, req: IpcRequest): IpcResponse =
       index: 0,
     ))
 
-    info fmt"configuration reloaded with {confirmTimeout}s rollback timeout"
+    let rollbackMins = confirmTimeout div 60
+    info fmt"configuration reloaded with {rollbackMins} minute(s) rollback timeout"
     let data = %*{"status": "pending_rollback", "rollback_secs": confirmTimeout}
     return successResponse(req.id, data)
   else:
