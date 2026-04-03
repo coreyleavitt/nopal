@@ -4,6 +4,8 @@
 ## Max message size: 64 KB.
 
 import std/[json, options]
+import ../snapshot
+export snapshot
 
 const
   MaxMsgSize* = 65536
@@ -20,42 +22,10 @@ type
     error*: string     ## empty on success
     data*: JsonNode    ## method-specific payload, nil if none
 
-  InterfaceStatusData* = object
-    name*: string
-    device*: string
-    state*: string
-    enabled*: bool
-    mark*: uint32
-    tableId*: uint32
-    successCount*: uint32
-    failCount*: uint32
-    avgRttMs*: int       ## -1 if unavailable
-    lossPercent*: uint32
-    uptimeSecs*: int64   ## -1 if not online
-    targets*: JsonNode   ## array of {ip, up, rttMs}
-
-  PolicyStatusData* = object
-    name*: string
-    activeMembers*: seq[string]
-    activeTier*: int     ## -1 if empty
-
-  ReloadPendingInfo* = object
-    remainingSecs*: int
-
-  DaemonStatus* = object
-    version*: string
-    uptimeSecs*: int64
-    interfaces*: seq[InterfaceStatusData]
-    policies*: seq[PolicyStatusData]
-    reloadPending*: Option[ReloadPendingInfo]
-
   EventData* = object
     event*: string       ## "interface.state_change"
     interfaceName*: string
     state*: string
-
-  ConnectedData* = object
-    networks*: seq[string]
 
 proc parseResponse*(j: JsonNode): IpcResponse =
   ## Parse a JSON object into an IpcResponse.
@@ -64,30 +34,48 @@ proc parseResponse*(j: JsonNode): IpcResponse =
   result.error = j.getOrDefault("error").getStr()
   result.data = j.getOrDefault("data")
 
-proc parseDaemonStatus*(j: JsonNode): DaemonStatus =
-  ## Parse a JSON object into a DaemonStatus.
+proc parseDaemonStatus*(j: JsonNode): DaemonSnapshot =
+  ## Parse a JSON object into a DaemonSnapshot.
+  result.apiVersion = j.getOrDefault("api_version").getInt(0)
   result.version = j.getOrDefault("version").getStr()
   result.uptimeSecs = j.getOrDefault("uptime_secs").getBiggestInt()
   for iface in j.getOrDefault("interfaces"):
-    result.interfaces.add(InterfaceStatusData(
+    var targets: seq[TargetSnapshot]
+    let targetsNode = iface.getOrDefault("targets")
+    if targetsNode != nil and targetsNode.kind == JArray:
+      for t in targetsNode:
+        targets.add(TargetSnapshot(
+          ip: t.getOrDefault("ip").getStr(),
+          up: t.getOrDefault("up").getBool(),
+          rttMs: t.getOrDefault("rtt_ms").getInt(-1),
+        ))
+    result.interfaces.add(InterfaceSnapshot(
       name: iface.getOrDefault("name").getStr(),
       device: iface.getOrDefault("device").getStr(),
       state: iface.getOrDefault("state").getStr(),
       enabled: iface.getOrDefault("enabled").getBool(),
       mark: iface.getOrDefault("mark").getInt().uint32,
       tableId: iface.getOrDefault("table_id").getInt().uint32,
+      successCount: iface.getOrDefault("success_count").getInt().uint32,
+      failCount: iface.getOrDefault("fail_count").getInt().uint32,
       avgRttMs: iface.getOrDefault("avg_rtt_ms").getInt(-1),
       lossPercent: iface.getOrDefault("loss_percent").getInt().uint32,
       uptimeSecs: iface.getOrDefault("uptime_secs").getBiggestInt(),
+      targets: targets,
     ))
   for pol in j.getOrDefault("policies"):
     var members: seq[string]
     for m in pol.getOrDefault("active_members"):
       members.add(m.getStr())
-    result.policies.add(PolicyStatusData(
+    result.policies.add(PolicySnapshot(
       name: pol.getOrDefault("name").getStr(),
       activeMembers: members,
       activeTier: pol.getOrDefault("active_tier").getInt(-1),
+    ))
+  let reloadNode = j.getOrDefault("reload_pending")
+  if reloadNode != nil and reloadNode.kind == JObject:
+    result.reloadPending = some(ReloadPendingInfo(
+      remainingSecs: reloadNode.getOrDefault("remaining_secs").getInt(0),
     ))
 
 proc parseRequest*(j: JsonNode): IpcRequest =
@@ -109,7 +97,11 @@ proc toJson*(r: IpcResponse): JsonNode =
   if r.data != nil:
     result["data"] = r.data
 
-proc toJson*(s: InterfaceStatusData): JsonNode =
+proc toJson*(t: TargetSnapshot): JsonNode =
+  result = %*{"ip": t.ip, "up": t.up}
+  if t.rttMs >= 0: result["rtt_ms"] = %t.rttMs
+
+proc toJson*(s: InterfaceSnapshot): JsonNode =
   result = %*{
     "name": s.name, "device": s.device, "state": s.state,
     "enabled": s.enabled, "mark": s.mark, "table_id": s.tableId,
@@ -118,28 +110,34 @@ proc toJson*(s: InterfaceStatusData): JsonNode =
   }
   if s.avgRttMs >= 0: result["avg_rtt_ms"] = %s.avgRttMs
   if s.uptimeSecs >= 0: result["uptime_secs"] = %s.uptimeSecs
-  if s.targets != nil: result["targets"] = s.targets
+  if s.targets.len > 0:
+    var arr = newJArray()
+    for t in s.targets: arr.add(t.toJson())
+    result["targets"] = arr
 
-proc toJson*(p: PolicyStatusData): JsonNode =
+proc toJson*(p: PolicySnapshot): JsonNode =
   result = %*{"name": p.name, "active_members": p.activeMembers}
   if p.activeTier >= 0: result["active_tier"] = %p.activeTier
 
-proc toJson*(d: DaemonStatus): JsonNode =
+proc toJson*(b: BypassSnapshot): JsonNode =
+  %*{"v4": b.v4, "v6": b.v6}
+
+proc toJson*(d: DaemonSnapshot): JsonNode =
   var ifaces = newJArray()
   for i in d.interfaces: ifaces.add(i.toJson())
   var pols = newJArray()
   for p in d.policies: pols.add(p.toJson())
-  var j = %*{"version": d.version, "uptime_secs": d.uptimeSecs,
-              "interfaces": ifaces, "policies": pols}
+  var j = %*{"api_version": d.apiVersion, "version": d.version,
+              "uptime_secs": d.uptimeSecs,
+              "interfaces": ifaces, "policies": pols,
+              "connected_networks": d.connectedNetworks,
+              "dynamic_bypass": d.dynamicBypass.toJson()}
   if d.reloadPending.isSome:
     j["reload_pending"] = %*{"remaining_secs": d.reloadPending.get.remainingSecs}
   j
 
 proc toJson*(e: EventData): JsonNode =
   %*{"event": e.event, "interface": e.interfaceName, "state": e.state}
-
-proc toJson*(c: ConnectedData): JsonNode =
-  %*{"networks": c.networks}
 
 when isMainModule:
   import std/unittest
@@ -165,23 +163,55 @@ when isMainModule:
       check j["success"].getBool() == false
       check j["error"].getStr() == "not found"
 
-    test "DaemonStatus serialization":
-      let status = DaemonStatus(
+    test "DaemonSnapshot serialization":
+      let snap = DaemonSnapshot(
+        apiVersion: 1,
         version: "0.1.0",
         uptimeSecs: 3600,
-        interfaces: @[InterfaceStatusData(
+        interfaces: @[InterfaceSnapshot(
           name: "wan", device: "eth0", state: "online",
           enabled: true, mark: 0x100, tableId: 101,
           successCount: 10, failCount: 0,
           avgRttMs: 25, lossPercent: 0, uptimeSecs: 1800,
-          targets: %*[{"ip": "8.8.8.8", "up": true, "rtt_ms": 25}],
+          targets: @[TargetSnapshot(ip: "8.8.8.8", up: true, rttMs: 25)],
         )],
-        policies: @[PolicyStatusData(
+        policies: @[PolicySnapshot(
           name: "balanced", activeMembers: @["wan", "lte"], activeTier: 1,
         )],
+        connectedNetworks: @["192.168.1.0/24"],
+        dynamicBypass: BypassSnapshot(v4: @[], v6: @[]),
       )
-      let j = status.toJson()
+      let j = snap.toJson()
+      check j["api_version"].getInt() == 1
       check j["version"].getStr() == "0.1.0"
       check j["interfaces"].len == 1
       check j["interfaces"][0]["name"].getStr() == "wan"
+      check j["interfaces"][0]["targets"].len == 1
+      check j["interfaces"][0]["targets"][0]["ip"].getStr() == "8.8.8.8"
+      check j["interfaces"][0]["targets"][0]["rtt_ms"].getInt() == 25
       check j["policies"][0]["active_members"].len == 2
+      check j["connected_networks"].len == 1
+
+    test "DaemonSnapshot parseDaemonStatus round-trip":
+      let snap = DaemonSnapshot(
+        apiVersion: 1,
+        version: "0.2.0",
+        uptimeSecs: 120,
+        interfaces: @[InterfaceSnapshot(
+          name: "lte", device: "wwan0", state: "degraded",
+          enabled: true, mark: 0x200, tableId: 102,
+          successCount: 5, failCount: 2,
+          avgRttMs: 80, lossPercent: 20, uptimeSecs: 60,
+          targets: @[TargetSnapshot(ip: "1.1.1.1", up: true, rttMs: 80)],
+        )],
+        policies: @[PolicySnapshot(name: "main", activeMembers: @["lte"], activeTier: 2)],
+        reloadPending: some(ReloadPendingInfo(remainingSecs: 30)),
+      )
+      let j = snap.toJson()
+      let parsed = parseDaemonStatus(j)
+      check parsed.version == "0.2.0"
+      check parsed.interfaces.len == 1
+      check parsed.interfaces[0].name == "lte"
+      check parsed.interfaces[0].targets.len == 1
+      check parsed.reloadPending.isSome
+      check parsed.reloadPending.get.remainingSecs == 30

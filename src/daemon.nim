@@ -30,6 +30,8 @@ import ./dnsmanager
 import ./timer
 import ./hooks
 import ./statusfiles
+import ./snapshot
+import ./version
 import ./ipc/server
 import ./ipc/methods
 import ./ipc/protocol
@@ -1386,6 +1388,65 @@ proc shutdown(d: var Daemon) =
   info "nopal daemon stopped"
 
 # =========================================================================
+# Snapshot builder
+# =========================================================================
+
+proc buildDaemonSnapshot(d: Daemon, now: MonoTime): DaemonSnapshot =
+  ## Build a pure value snapshot of all daemon state for IPC queries.
+  let uptime = inSeconds(now - d.startTime)
+
+  # Build interface snapshots
+  var ifaces: seq[InterfaceSnapshot]
+  for t in d.trackers:
+    let targets = d.probeEngine.getTargetStatuses(t.index)
+    var targetSnaps: seq[TargetSnapshot]
+    for ts in targets:
+      targetSnaps.add(TargetSnapshot(
+        ip: formatIpBytes(ts.ip, ts.isV6),
+        up: ts.up,
+        rttMs: if ts.lastRttMs.isSome: int(ts.lastRttMs.get) else: -1,
+      ))
+    let ifUptime = if t.onlineSince.isSome: inSeconds(now - t.onlineSince.get) else: -1'i64
+    let avgRtt = if t.avgRttMs.isSome: int(t.avgRttMs.get) else: -1
+    ifaces.add(InterfaceSnapshot(
+      name: t.name, device: t.device, state: $t.state,
+      enabled: t.enabled, mark: t.mark, tableId: t.tableId,
+      successCount: t.successCount, failCount: t.failCount,
+      avgRttMs: avgRtt, lossPercent: t.lossPercent,
+      uptimeSecs: ifUptime, targets: targetSnaps,
+    ))
+
+  # Build policy snapshots
+  var pols: seq[PolicySnapshot]
+  for pc in d.config.policies:
+    let resolved = resolvePolicy(pc, d.config.members, d.trackers)
+    var activeMembers: seq[string]
+    var activeTier = -1
+    if resolved.tiers.len > 0:
+      activeTier = int(resolved.tiers[0].metric)
+      for m in resolved.tiers[0].members:
+        activeMembers.add(m.interfaceName)
+    pols.add(PolicySnapshot(name: pc.name, activeMembers: activeMembers, activeTier: activeTier))
+
+  # Reload pending
+  let pending = if d.reloadState.pending:
+    let remaining = int((d.reloadState.context.deadline - now).inSeconds)
+    some(ReloadPendingInfo(remainingSecs: max(0, remaining)))
+  else:
+    none[ReloadPendingInfo]()
+
+  DaemonSnapshot(
+    apiVersion: 1,
+    version: NimblePkgVersion,
+    uptimeSecs: uptime,
+    interfaces: ifaces,
+    policies: pols,
+    connectedNetworks: d.connectedNetworks,
+    dynamicBypass: BypassSnapshot(v4: d.dynamicBypassV4, v6: d.dynamicBypassV6),
+    reloadPending: pending,
+  )
+
+# =========================================================================
 # Main event loop
 # =========================================================================
 
@@ -1441,28 +1502,14 @@ proc run*(d: var Daemon) =
           let resp = if ipcMethod.isNone:
             errorResponse(req.id, "unknown method '" & req.rpcMethod & "'")
           else:
-            let pendingInfo = if d.reloadState.pending:
-              let remaining = int((d.reloadState.context.deadline - getMonoTime()).inSeconds)
-              some(ReloadPendingInfo(remainingSecs: max(0, remaining)))
-            else:
-              none[ReloadPendingInfo]()
-            let view = DaemonView(
-              trackers: addr d.trackers,
-              config: unsafeAddr d.config,
-              startTime: d.startTime,
-              connectedNetworks: addr d.connectedNetworks,
-              dynamicBypassV4: addr d.dynamicBypassV4,
-              dynamicBypassV6: addr d.dynamicBypassV6,
-              probeEngine: addr d.probeEngine,
-              reloadPending: pendingInfo,
-            )
+            let snap = buildDaemonSnapshot(d, getMonoTime())
             case ipcMethod.get
             of imStatus:
-              handleStatusQuery(view, req)
+              handleStatusQuery(snap, req)
             of imInterfaceStatus:
-              handleInterfaceStatusQuery(view, req)
+              handleInterfaceStatusQuery(snap, req)
             of imConnected:
-              handleConnectedQuery(view, req)
+              handleConnectedQuery(snap, req)
             of imConfigReload:
               d.handleReloadCommand(req)
             of imConfigAccept:
@@ -1474,7 +1521,7 @@ proc run*(d: var Daemon) =
             of imBypassRemove:
               d.handleBypassRemove(req)
             of imBypassList:
-              handleBypassListQuery(view, req)
+              handleBypassListQuery(snap, req)
             of imSubscribe:
               successResponse(req.id)
           d.ipcServer.sendResponse(clientId, resp, d.selector)

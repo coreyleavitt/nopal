@@ -174,7 +174,7 @@ proc sendIpcRequest(socketPath: string, req: IpcRequest): IpcResponse =
 # CLI helpers
 # ---------------------------------------------------------------------------
 
-proc fetchStatus(socketPath: string): DaemonStatus =
+proc fetchStatus(socketPath: string): DaemonSnapshot =
   let req = IpcRequest(id: 1, rpcMethod: "status")
   let resp = sendIpcRequest(socketPath, req)
   if not resp.success:

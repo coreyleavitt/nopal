@@ -6,13 +6,9 @@
 ##
 ## Dispatch routing also lives in daemon.nim (case on IpcMethod enum).
 
-import std/[json, options, monotimes, times]
+import std/[json, options]
 import ./protocol
-import ../state/tracker
-import ../state/policy
-import ../health/engine
-import ../version
-import ../config/schema
+import ../snapshot
 
 type
   IpcMethod* = enum
@@ -26,17 +22,6 @@ type
     imBypassRemove
     imBypassList
     imSubscribe
-
-  ## Read-only view of daemon state for query handlers.
-  DaemonView* = object
-    trackers*: ptr seq[InterfaceTracker]
-    config*: ptr NopalConfig
-    startTime*: MonoTime
-    connectedNetworks*: ptr seq[string]
-    dynamicBypassV4*: ptr seq[string]
-    dynamicBypassV6*: ptr seq[string]
-    probeEngine*: ptr ProbeEngine
-    reloadPending*: Option[ReloadPendingInfo]
 
 func parseIpcMethod*(s: string): Option[IpcMethod] {.raises: [].} =
   ## Parse an RPC method name to the IpcMethod enum.
@@ -54,75 +39,11 @@ func parseIpcMethod*(s: string): Option[IpcMethod] {.raises: [].} =
   of "subscribe": some(imSubscribe)
   else: none[IpcMethod]()
 
-proc buildTargetsJson(targetStatuses: seq[TargetStatus]): JsonNode =
-  ## Convert probe target statuses to JSON array.
-  if targetStatuses.len == 0: return nil
-  var arr = newJArray()
-  for ts in targetStatuses:
-    let ipStr = formatIpBytes(ts.ip, ts.isV6)
-    var t = %*{"ip": ipStr, "up": ts.up}
-    if ts.lastRttMs.isSome:
-      t["rtt_ms"] = %*ts.lastRttMs.get
-    arr.add(t)
-  arr
-
-proc buildInterfaceStatus*(t: InterfaceTracker,
-                           targetStatuses: seq[TargetStatus] = @[]): InterfaceStatusData {.raises: [].} =
-  let uptimeSecs = if t.onlineSince.isSome:
-    inSeconds(getMonoTime() - t.onlineSince.get)
-  else:
-    -1'i64
-  let avgRtt = if t.avgRttMs.isSome: int(t.avgRttMs.get) else: -1
-
-  InterfaceStatusData(
-    name: t.name,
-    device: t.device,
-    state: $t.state,
-    enabled: t.enabled,
-    mark: t.mark,
-    tableId: t.tableId,
-    successCount: t.successCount,
-    failCount: t.failCount,
-    avgRttMs: avgRtt,
-    lossPercent: t.lossPercent,
-    uptimeSecs: uptimeSecs,
-    targets: buildTargetsJson(targetStatuses),
-  )
-
-proc handleStatusQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises: [].} =
+proc handleStatusQuery*(snap: DaemonSnapshot, req: IpcRequest): IpcResponse {.raises: [].} =
   ## Query: return full daemon status.
-  let uptime = inSeconds(getMonoTime() - view.startTime)
+  successResponse(req.id, snap.toJson())
 
-  var ifaces: seq[InterfaceStatusData]
-  for t in view.trackers[]:
-    let targets = view.probeEngine[].getTargetStatuses(t.index)
-    ifaces.add(buildInterfaceStatus(t, targets))
-
-  var pols: seq[PolicyStatusData]
-  for pc in view.config.policies:
-    let resolved = resolvePolicy(pc, view.config.members, view.trackers[])
-    var activeMembers: seq[string]
-    var activeTier = -1
-    if resolved.tiers.len > 0:
-      activeTier = int(resolved.tiers[0].metric)
-      for m in resolved.tiers[0].members:
-        activeMembers.add(m.interfaceName)
-    pols.add(PolicyStatusData(
-      name: pc.name,
-      activeMembers: activeMembers,
-      activeTier: activeTier,
-    ))
-
-  let status = DaemonStatus(
-    version: NimblePkgVersion,
-    uptimeSecs: uptime,
-    interfaces: ifaces,
-    policies: pols,
-    reloadPending: view.reloadPending,
-  )
-  successResponse(req.id, status.toJson())
-
-proc handleInterfaceStatusQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises: [].} =
+proc handleInterfaceStatusQuery*(snap: DaemonSnapshot, req: IpcRequest): IpcResponse {.raises: [].} =
   ## Query: return status for a single interface.
   let ifaceName = if req.params != nil and req.params.hasKey("interface"):
     req.params{"interface"}.getStr()
@@ -131,21 +52,18 @@ proc handleInterfaceStatusQuery*(view: DaemonView, req: IpcRequest): IpcResponse
   if ifaceName == "" or ifaceName.len > 64:
     return errorResponse(req.id, "missing or invalid 'interface' parameter")
 
-  for t in view.trackers[]:
-    if t.name == ifaceName:
-      let data = buildInterfaceStatus(t)
-      return successResponse(req.id, data.toJson())
+  for iface in snap.interfaces:
+    if iface.name == ifaceName:
+      return successResponse(req.id, iface.toJson())
   errorResponse(req.id, "interface '" & ifaceName & "' not found")
 
-proc handleConnectedQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises: [].} =
+proc handleConnectedQuery*(snap: DaemonSnapshot, req: IpcRequest): IpcResponse {.raises: [].} =
   ## Query: return connected networks.
-  let data = ConnectedData(networks: view.connectedNetworks[])
-  successResponse(req.id, data.toJson())
+  successResponse(req.id, %*{"networks": snap.connectedNetworks})
 
-proc handleBypassListQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises: [].} =
+proc handleBypassListQuery*(snap: DaemonSnapshot, req: IpcRequest): IpcResponse {.raises: [].} =
   ## Query: return dynamic bypass entries.
-  let data = %*{"v4": view.dynamicBypassV4[], "v6": view.dynamicBypassV6[]}
-  successResponse(req.id, data)
+  successResponse(req.id, snap.dynamicBypass.toJson())
 
 when isMainModule:
   import std/[unittest, strutils]
@@ -163,78 +81,75 @@ when isMainModule:
       check parseIpcMethod("").isNone
       check parseIpcMethod("STATUS").isNone  # case sensitive
 
-  var testEngine = initProbeEngine()
-
-  template makeTestView(trackers: var seq[InterfaceTracker], config: NopalConfig,
-                        connected: var seq[string]): DaemonView =
-    var bypassV4: seq[string] = @[]
-    var bypassV6: seq[string] = @[]
-    DaemonView(
-      trackers: addr trackers,
-      config: unsafeAddr config,
-      startTime: getMonoTime(),
-      connectedNetworks: addr connected,
-      dynamicBypassV4: addr bypassV4,
-      dynamicBypassV6: addr bypassV6,
-      probeEngine: addr testEngine,
-      reloadPending: none[ReloadPendingInfo](),
+  proc makeTestSnap(ifaces: seq[InterfaceSnapshot] = @[],
+                    policies: seq[PolicySnapshot] = @[],
+                    connected: seq[string] = @[],
+                    bypassV4: seq[string] = @[],
+                    bypassV6: seq[string] = @[],
+                    reloadPending: Option[ReloadPendingInfo] = none[ReloadPendingInfo]()): DaemonSnapshot =
+    DaemonSnapshot(
+      apiVersion: 1,
+      version: "0.1.0",
+      uptimeSecs: 100,
+      interfaces: ifaces,
+      policies: policies,
+      connectedNetworks: connected,
+      dynamicBypass: BypassSnapshot(v4: bypassV4, v6: bypassV6),
+      reloadPending: reloadPending,
     )
 
   suite "query handlers":
-    test "handleStatusQuery returns DaemonStatus":
-      var trackers = @[newTracker("wan", 0, 0x100, 101, "eth0", 3, 5)]
-      trackers[0].state = isOnline
-      let config = NopalConfig(globals: defaultGlobals())
-      var connected: seq[string] = @[]
-      let view = makeTestView(trackers, config, connected)
+    test "handleStatusQuery returns DaemonSnapshot":
+      let snap = makeTestSnap(
+        ifaces = @[InterfaceSnapshot(
+          name: "wan", device: "eth0", state: "online",
+          enabled: true, mark: 0x100, tableId: 101,
+        )],
+      )
       let req = IpcRequest(id: 1, rpcMethod: "status")
-      let resp = handleStatusQuery(view, req)
+      let resp = handleStatusQuery(snap, req)
       check resp.success
       check resp.data["interfaces"].len == 1
       check resp.data["interfaces"][0]["name"].getStr == "wan"
 
     test "handleInterfaceStatusQuery returns single interface":
-      var trackers = @[newTracker("wan", 0, 0x100, 101, "eth0", 3, 5)]
-      trackers[0].state = isOnline
-      let config = NopalConfig(globals: defaultGlobals())
-      var connected: seq[string] = @[]
-      let view = makeTestView(trackers, config, connected)
+      let snap = makeTestSnap(
+        ifaces = @[InterfaceSnapshot(
+          name: "wan", device: "eth0", state: "online",
+          enabled: true, mark: 0x100, tableId: 101,
+        )],
+      )
       let req = IpcRequest(id: 1, rpcMethod: "interface.status",
                            params: %*{"interface": "wan"})
-      let resp = handleInterfaceStatusQuery(view, req)
+      let resp = handleInterfaceStatusQuery(snap, req)
       check resp.success
       check resp.data["name"].getStr == "wan"
 
     test "handleInterfaceStatusQuery unknown interface":
-      var trackers: seq[InterfaceTracker] = @[]
-      let config = NopalConfig(globals: defaultGlobals())
-      var connected: seq[string] = @[]
-      let view = makeTestView(trackers, config, connected)
+      let snap = makeTestSnap()
       let req = IpcRequest(id: 1, rpcMethod: "interface.status",
                            params: %*{"interface": "nonexistent"})
-      let resp = handleInterfaceStatusQuery(view, req)
+      let resp = handleInterfaceStatusQuery(snap, req)
       check not resp.success
       check "not found" in resp.error
 
     test "status reports degraded state with quality metrics":
-      var trackers = @[newTracker("wan", 0, 0x100, 101, "eth0", 3, 5)]
-      trackers[0].state = isDegraded
-      trackers[0].avgRttMs = some(150'u32)
-      trackers[0].lossPercent = 30
-      trackers[0].successCount = 7
-      trackers[0].failCount = 3
-      let config = NopalConfig(
-        globals: defaultGlobals(),
-        policies: @[PolicyConfig(name: "balanced",
-                                  members: @["wan_m"],
-                                  lastResort: lrDefault)],
-        members: @[MemberConfig(name: "wan_m", interfaceName: "wan",
-                                 metric: 1, weight: 50)],
+      let snap = makeTestSnap(
+        ifaces = @[InterfaceSnapshot(
+          name: "wan", device: "eth0", state: "degraded",
+          enabled: true, mark: 0x100, tableId: 101,
+          successCount: 7, failCount: 3,
+          avgRttMs: 150, lossPercent: 30,
+          uptimeSecs: -1,
+        )],
+        policies = @[PolicySnapshot(
+          name: "balanced",
+          activeMembers: @["wan"],
+          activeTier: 1,
+        )],
       )
-      var connected: seq[string] = @[]
-      let view = makeTestView(trackers, config, connected)
       let req = IpcRequest(id: 1, rpcMethod: "status")
-      let resp = handleStatusQuery(view, req)
+      let resp = handleStatusQuery(snap, req)
       check resp.success
       let iface = resp.data["interfaces"][0]
       check iface["state"].getStr == "degraded"
@@ -247,11 +162,16 @@ when isMainModule:
       check pol["active_members"][0].getStr == "wan"
 
     test "handleConnectedQuery returns networks":
-      var trackers: seq[InterfaceTracker] = @[]
-      let config = NopalConfig(globals: defaultGlobals())
-      var connected = @["127.0.0.0/8", "::1/128"]
-      let view = makeTestView(trackers, config, connected)
+      let snap = makeTestSnap(connected = @["127.0.0.0/8", "::1/128"])
       let req = IpcRequest(id: 1, rpcMethod: "connected")
-      let resp = handleConnectedQuery(view, req)
+      let resp = handleConnectedQuery(snap, req)
       check resp.success
       check resp.data["networks"].len == 2
+
+    test "handleBypassListQuery returns bypass entries":
+      let snap = makeTestSnap(bypassV4 = @["10.0.0.0/8"], bypassV6 = @["fc00::/7"])
+      let req = IpcRequest(id: 1, rpcMethod: "bypass.list")
+      let resp = handleBypassListQuery(snap, req)
+      check resp.success
+      check resp.data["v4"].len == 1
+      check resp.data["v6"].len == 1
