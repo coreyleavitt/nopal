@@ -138,8 +138,27 @@ proc attrStr*(data: openArray[byte], s: Slice[int]): string =
 # =============================================================================
 
 type
+  NlAckKind* = enum
+    nakSendFailed      ## sendMsg syscall failed
+    nakRecvFailed      ## recvMsg syscall failed
+    nakTimeout         ## No ACK received within deadline
+    nakKernelError     ## ACK received with non-zero errno
+
+  NlAckResult* = object
+    case ok*: bool
+    of true: discard
+    of false:
+      kind*: NlAckKind
+      osError*: int32  ## Socket/kernel errno (0 for nakTimeout)
+
   NetlinkSocket* = object
     fd*: cint
+
+func nlAckOk*(): NlAckResult {.inline.} =
+  NlAckResult(ok: true)
+
+func nlAckErr*(kind: NlAckKind, osError: int32 = 0): NlAckResult {.inline.} =
+  NlAckResult(ok: false, kind: kind, osError: osError)
 
 proc openNetlink*(protocol: cint, groups: uint32 = 0): NetlinkSocket =
   ## Open an AF_NETLINK socket, bind with optional multicast groups.
@@ -174,11 +193,13 @@ proc openNetlink*(protocol: cint, groups: uint32 = 0): NetlinkSocket =
 
   NetlinkSocket(fd: fd)
 
-proc sendMsg*(s: NetlinkSocket, data: openArray[byte]): bool =
-  ## Send a netlink message. Returns false on error.
+proc sendMsg*(s: NetlinkSocket, data: openArray[byte]): NlAckResult =
+  ## Send a netlink message. Returns NlAckResult with errno on failure.
   let sh = SocketHandle(s.fd)
   let n = posix.send(sh, cast[pointer](unsafeAddr data[0]), data.len, 0'i32)
-  n >= 0
+  if n < 0:
+    return nlAckErr(nakSendFailed, errno.int32)
+  nlAckOk()
 
 proc recvMsg*(s: NetlinkSocket, buf: var seq[byte]): int =
   ## Receive into buffer. Returns bytes read, 0 on EAGAIN, -1 on error.
@@ -193,16 +214,17 @@ proc recvMsg*(s: NetlinkSocket, buf: var seq[byte]): int =
   min(int(n), buf.len)
 
 proc sendAndAck*(s: NetlinkSocket, data: openArray[byte],
-                 buf: var seq[byte], timeoutMs: int = 5000): bool =
-  ## Send message and wait for ACK. Returns true if ACK with error==0 received.
-  if not s.sendMsg(data):
-    return false
+                 buf: var seq[byte], timeoutMs: int = 5000): NlAckResult =
+  ## Send message and wait for ACK. Returns NlAckResult with error details.
+  let sendResult = s.sendMsg(data)
+  if not sendResult.ok:
+    return sendResult
 
   let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
   while getMonoTime() < deadline:
     let n = s.recvMsg(buf)
     if n < 0:
-      return false
+      return nlAckErr(nakRecvFailed, errno.int32)
     if n == 0:
       # EAGAIN — brief sleep and retry
       discard posix.poll(nil, 0, 1)  # 1ms sleep
@@ -214,9 +236,12 @@ proc sendAndAck*(s: NetlinkSocket, data: openArray[byte],
     if hdr.nlmsgType == NLMSG_ERROR:
       if n >= sizeof(NlMsgHdr) + sizeof(int32):
         let errCode = readStruct[int32](buf, sizeof(NlMsgHdr))
-        return errCode == 0
+        if errCode == 0:
+          return nlAckOk()
+        # Kernel returns negative errno in NLMSG_ERROR
+        return nlAckErr(nakKernelError, -errCode)
     # Not an error message — might be a multicast notification, skip
-  false  # timeout
+  nlAckErr(nakTimeout)
 
 proc close*(s: var NetlinkSocket) =
   if s.fd >= 0:
