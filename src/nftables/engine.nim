@@ -30,6 +30,46 @@ proc applyRuleset*(rs: Ruleset): bool =
   process.close()
   true
 
+proc applyElementChange(op, setName, cidr: string): bool =
+  ## Add or delete a single element from an nftables named set.
+  ## op is "add" or "delete".
+  let slashIdx = cidr.find('/')
+  var elemJson: JsonNode
+  if slashIdx >= 0:
+    let addrPart = cidr[0 ..< slashIdx]
+    let prefLen = cidr[slashIdx + 1 .. ^1]
+    elemJson = %*{"prefix": {"addr": addrPart, "len": parseInt(prefLen)}}
+  else:
+    elemJson = %*cidr
+
+  let json = %*{"nftables": [{op: {"element": {
+    "family": TableFamily, "table": TableName,
+    "name": setName, "elem": [elemJson]
+  }}}]}
+
+  let jsonStr = $json
+  let process = startProcess("nft", args = ["-j", "-f", "-"],
+                             options = {poUsePath, poStdErrToStdOut})
+  let input = process.inputStream()
+  input.write(jsonStr)
+  input.close()
+  let output = process.outputStream().readAll()
+  let exitCode = process.waitForExit()
+  if exitCode != 0:
+    error fmt"nft element {op} failed for {setName}: {output}"
+    process.close()
+    return false
+  process.close()
+  true
+
+proc addSetElement*(setName, cidr: string): bool =
+  ## Add a CIDR to an nftables named set. Returns true on success.
+  applyElementChange("add", setName, cidr)
+
+proc delSetElement*(setName, cidr: string): bool =
+  ## Delete a CIDR from an nftables named set. Returns true on success.
+  applyElementChange("delete", setName, cidr)
+
 proc cleanup*(): bool =
   ## Delete the nopal nftables table. Ignores "table not found" errors.
   let process = startProcess("nft", args = ["delete", "table", TableFamily, TableName],

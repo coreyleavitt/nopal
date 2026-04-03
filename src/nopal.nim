@@ -421,6 +421,59 @@ proc cliReload(socketPath: string, args: seq[string]) =
       stderr.writeLine fmt"reload failed: {resp.error}"
       quit(1)
 
+proc cliBypass(socketPath: string, args: seq[string]) =
+  if args.len == 0:
+    stderr.writeLine "usage: nopal bypass add|remove|list [network]"
+    quit(1)
+
+  case args[0]
+  of "add":
+    if args.len < 2:
+      stderr.writeLine "usage: nopal bypass add <cidr>"
+      quit(1)
+    let params = %*{"network": args[1]}
+    let req = IpcRequest(id: 1, rpcMethod: "bypass.add", params: params)
+    let resp = sendIpcRequest(socketPath, req)
+    if resp.success:
+      echo fmt"bypass added: {args[1]}"
+    else:
+      stderr.writeLine fmt"error: {resp.error}"
+      quit(1)
+
+  of "remove", "del":
+    if args.len < 2:
+      stderr.writeLine "usage: nopal bypass remove <cidr>"
+      quit(1)
+    let params = %*{"network": args[1]}
+    let req = IpcRequest(id: 1, rpcMethod: "bypass.remove", params: params)
+    let resp = sendIpcRequest(socketPath, req)
+    if resp.success:
+      echo fmt"bypass removed: {args[1]}"
+    else:
+      stderr.writeLine fmt"error: {resp.error}"
+      quit(1)
+
+  of "list", "ls":
+    let req = IpcRequest(id: 1, rpcMethod: "bypass.list")
+    let resp = sendIpcRequest(socketPath, req)
+    if not resp.success:
+      stderr.writeLine fmt"error: {resp.error}"
+      quit(1)
+    let v4 = resp.data{"v4"}
+    let v6 = resp.data{"v6"}
+    echo "Dynamic bypass networks:"
+    if v4 != nil and v4.kind == JArray:
+      for n in v4: echo fmt"  {n.getStr()}"
+    if v6 != nil and v6.kind == JArray:
+      for n in v6: echo fmt"  {n.getStr()}"
+    if (v4 == nil or v4.len == 0) and (v6 == nil or v6.len == 0):
+      echo "  (none)"
+
+  else:
+    stderr.writeLine fmt"unknown bypass subcommand: {args[0]}"
+    stderr.writeLine "usage: nopal bypass add|remove|list [network]"
+    quit(1)
+
 proc cliAccept(socketPath: string) =
   let req = IpcRequest(id: 1, rpcMethod: "config.accept")
   let resp = sendIpcRequest(socketPath, req)
@@ -552,6 +605,9 @@ proc printUsage() =
   echo "  nopal reload --rollback <m>  Reload with auto-rollback after <m> minutes"
   echo "  nopal accept                 Keep pending reload (cancel rollback timer)"
   echo "  nopal cancel                 Rollback pending reload now"
+  echo "  nopal bypass add <cidr>      Add network to policy routing bypass"
+  echo "  nopal bypass remove <cidr>   Remove network from bypass"
+  echo "  nopal bypass list            Show dynamic bypass networks"
   echo "  nopal version                Show version"
   echo "  nopal help                   Show this help"
   echo ""
@@ -619,6 +675,8 @@ proc runCli(args: seq[string]) =
       cliInternal()
     of "reload":
       cliReload(socketPath, positional[1..^1])
+    of "bypass":
+      cliBypass(socketPath, positional[1..^1])
     of "accept":
       cliAccept(socketPath)
     of "cancel":

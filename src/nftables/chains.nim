@@ -570,7 +570,9 @@ proc buildStickyMapAndChain(rs: var Ruleset, ruleIndex: int, rule: RuleInfo,
 
 proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[PolicyInfo],
                    rules: openArray[RuleInfo], connected: openArray[string],
-                   markMask: uint32, ipv6Enabled, logging: bool): Ruleset =
+                   markMask: uint32, ipv6Enabled, logging: bool,
+                   dynamicBypassV4: openArray[string] = [],
+                   dynamicBypassV6: openArray[string] = []): Ruleset =
   # TODO: ipv6Enabled gates IPv6 chain generation; logging gates per-rule log stmts
   var rs = initRuleset()
 
@@ -578,9 +580,15 @@ proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[Pol
   rs.addTable()
   rs.addFlushTable()
 
-  # Dynamic bypass sets
+  # Dynamic bypass sets (created empty, populated below if entries exist)
   rs.addSet("bypass_v4", "ipv4_addr", @["interval"])
   rs.addSet("bypass_v6", "ipv6_addr", @["interval"])
+
+  # Populate dynamic bypass sets with runtime entries (survive regen)
+  if dynamicBypassV4.len > 0:
+    rs.addSetElements("bypass_v4", dynamicBypassV4)
+  if dynamicBypassV6.len > 0:
+    rs.addSetElements("bypass_v6", dynamicBypassV6)
 
   # Base chains
   rs.addBaseChain("prerouting", "filter", "prerouting", -150, "accept")

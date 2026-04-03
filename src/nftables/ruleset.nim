@@ -4,7 +4,7 @@
 ## (table, chain, rule, set, map) and serializes to the format
 ## expected by `nft -j -f -`.
 
-import std/json
+import std/[json, strutils]
 
 const
   TableFamily* = "inet"
@@ -53,6 +53,26 @@ proc addSet*(rs: var Ruleset, name, setType: string,
     for flag in flags: f.add(%flag)
     s["flags"] = f
   rs.cmds.add(%*{"add": {"set": s}})
+
+proc addSetElements*(rs: var Ruleset, name: string, cidrs: openArray[string]) =
+  ## Add CIDR elements to a named set in the ruleset batch.
+  if cidrs.len == 0: return
+  var elems = newJArray()
+  for cidr in cidrs:
+    let slashIdx = cidr.find('/')
+    if slashIdx >= 0:
+      let addrPart = cidr[0 ..< slashIdx]
+      let lenPart = cidr[slashIdx + 1 .. ^1]
+      try:
+        elems.add(%*{"prefix": {"addr": addrPart, "len": parseInt(lenPart)}})
+      except ValueError:
+        elems.add(%*cidr)
+    else:
+      elems.add(%*cidr)
+  rs.cmds.add(%*{"add": {"element": {
+    "family": TableFamily, "table": TableName,
+    "name": name, "elem": elems
+  }}})
 
 proc addMap*(rs: var Ruleset, name: string, keyType: JsonNode,
              valueType: string, timeout: uint32 = 0) =

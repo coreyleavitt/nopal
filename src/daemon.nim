@@ -111,6 +111,8 @@ type
     running: bool
     connectedNetworks: seq[string]
     connectedNetworksDirty: bool
+    dynamicBypassV4: seq[string]
+    dynamicBypassV6: seq[string]
     nftablesDirty: bool
     dnsDirty: bool
     cachedRules: seq[RuleInfo]
@@ -434,6 +436,7 @@ proc regenerateNftables(d: var Daemon) =
     interfaces, policies, d.cachedRules, d.connectedNetworks,
     d.config.globals.markMask, d.config.globals.ipv6Enabled,
     d.config.globals.logging,
+    d.dynamicBypassV4, d.dynamicBypassV6,
   )
 
   if not applyRuleset(rs):
@@ -1237,6 +1240,79 @@ proc handleCancelCommand(d: var Daemon, req: IpcRequest): IpcResponse =
   successResponse(req.id)
 
 # =========================================================================
+# Dynamic bypass commands
+# =========================================================================
+
+proc handleBypassAdd(d: var Daemon, req: IpcRequest): IpcResponse =
+  ## IPC command: add a CIDR to the dynamic bypass set.
+  let network = if req.params != nil and req.params.hasKey("network"):
+    req.params{"network"}.getStr()
+  else:
+    ""
+  if network.len == 0:
+    return errorResponse(req.id, "missing 'network' parameter")
+
+  # Validate CIDR format (addr/prefix)
+  let slashIdx = network.find('/')
+  if slashIdx < 0:
+    return errorResponse(req.id, "invalid CIDR: missing prefix length (e.g., 10.0.0.0/8)")
+
+  let isV6 = ':' in network
+  let setName = if isV6: "bypass_v6" else: "bypass_v4"
+
+  # Check for duplicate
+  if isV6:
+    if network in d.dynamicBypassV6:
+      return errorResponse(req.id, "network already in bypass set: " & network)
+    d.dynamicBypassV6.add(network)
+  else:
+    if network in d.dynamicBypassV4:
+      return errorResponse(req.id, "network already in bypass set: " & network)
+    d.dynamicBypassV4.add(network)
+
+  # Immediate nft element injection (no full regen needed)
+  if not nftEngine.addSetElement(setName, network):
+    warn fmt"failed to add bypass element {network} to {setName}"
+
+  info fmt"dynamic bypass added: {network}"
+  successResponse(req.id)
+
+proc handleBypassRemove(d: var Daemon, req: IpcRequest): IpcResponse =
+  ## IPC command: remove a CIDR from the dynamic bypass set.
+  let network = if req.params != nil and req.params.hasKey("network"):
+    req.params{"network"}.getStr()
+  else:
+    ""
+  if network.len == 0:
+    return errorResponse(req.id, "missing 'network' parameter")
+
+  let isV6 = ':' in network
+  let setName = if isV6: "bypass_v6" else: "bypass_v4"
+
+  # Find and remove
+  var found = false
+  if isV6:
+    let idx = d.dynamicBypassV6.find(network)
+    if idx >= 0:
+      d.dynamicBypassV6.delete(idx)
+      found = true
+  else:
+    let idx = d.dynamicBypassV4.find(network)
+    if idx >= 0:
+      d.dynamicBypassV4.delete(idx)
+      found = true
+
+  if not found:
+    return errorResponse(req.id, "network not in bypass set: " & network)
+
+  # Immediate nft element removal
+  if not nftEngine.delSetElement(setName, network):
+    warn fmt"failed to remove bypass element {network} from {setName}"
+
+  info fmt"dynamic bypass removed: {network}"
+  successResponse(req.id)
+
+# =========================================================================
 # Shutdown
 # =========================================================================
 
@@ -1375,6 +1451,8 @@ proc run*(d: var Daemon) =
               config: unsafeAddr d.config,
               startTime: d.startTime,
               connectedNetworks: addr d.connectedNetworks,
+              dynamicBypassV4: addr d.dynamicBypassV4,
+              dynamicBypassV6: addr d.dynamicBypassV6,
               reloadPending: pendingInfo,
             )
             case ipcMethod.get
@@ -1390,6 +1468,12 @@ proc run*(d: var Daemon) =
               d.handleAcceptCommand(req)
             of imConfigCancel:
               d.handleCancelCommand(req)
+            of imBypassAdd:
+              d.handleBypassAdd(req)
+            of imBypassRemove:
+              d.handleBypassRemove(req)
+            of imBypassList:
+              handleBypassListQuery(view, req)
             of imSubscribe:
               successResponse(req.id)
           d.ipcServer.sendResponse(clientId, resp, d.selector)

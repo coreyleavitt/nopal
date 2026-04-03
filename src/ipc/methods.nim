@@ -20,6 +20,9 @@ type
     imConfigReload
     imConfigAccept
     imConfigCancel
+    imBypassAdd
+    imBypassRemove
+    imBypassList
     imSubscribe
 
   ## Read-only view of daemon state for query handlers.
@@ -28,6 +31,8 @@ type
     config*: ptr NopalConfig
     startTime*: MonoTime
     connectedNetworks*: ptr seq[string]
+    dynamicBypassV4*: ptr seq[string]
+    dynamicBypassV6*: ptr seq[string]
     reloadPending*: Option[ReloadPendingInfo]
 
 func parseIpcMethod*(s: string): Option[IpcMethod] {.raises: [].} =
@@ -40,6 +45,9 @@ func parseIpcMethod*(s: string): Option[IpcMethod] {.raises: [].} =
   of "config.reload": some(imConfigReload)
   of "config.accept": some(imConfigAccept)
   of "config.cancel": some(imConfigCancel)
+  of "bypass.add": some(imBypassAdd)
+  of "bypass.remove": some(imBypassRemove)
+  of "bypass.list": some(imBypassList)
   of "subscribe": some(imSubscribe)
   else: none[IpcMethod]()
 
@@ -116,6 +124,11 @@ proc handleConnectedQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.rai
   ## Query: return connected networks.
   let data = ConnectedData(networks: view.connectedNetworks[])
   successResponse(req.id, data.toJson())
+
+proc handleBypassListQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises: [].} =
+  ## Query: return dynamic bypass entries.
+  let data = %*{"v4": view.dynamicBypassV4[], "v6": view.dynamicBypassV6[]}
+  successResponse(req.id, data)
 
 when isMainModule:
   import std/[unittest, strutils]
