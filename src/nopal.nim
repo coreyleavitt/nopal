@@ -303,9 +303,9 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
     let mins = remaining div 60
     let secs = remaining mod 60
     if mins > 0:
-      echo fmt"  RELOAD PENDING — auto-rollback in {mins}m{secs}s (run 'nopal accept' to keep)"
+      echo fmt"  RELOAD PENDING — auto-rollback in {mins}m{secs}s (run 'nopal reload accept' to keep)"
     else:
-      echo fmt"  RELOAD PENDING — auto-rollback in {secs}s (run 'nopal accept' to keep)"
+      echo fmt"  RELOAD PENDING — auto-rollback in {secs}s (run 'nopal reload accept' to keep)"
   echo ""
 
   let interfaces = resp.data{"interfaces"}
@@ -376,9 +376,33 @@ proc cliConnected(socketPath: string, jsonMode: bool) =
       echo fmt"  {net.getStr()}"
 
 proc cliReload(socketPath: string, args: seq[string]) =
-  # Parse reload subcommand flags
-  var rollbackMinutes = 0
+  # Subcommands: accept, cancel. Flags: --rollback N. No args = immediate reload.
+  if args.len > 0 and not args[0].startsWith("-"):
+    case args[0]
+    of "accept":
+      let req = IpcRequest(id: 1, rpcMethod: "config.accept")
+      let resp = sendIpcRequest(socketPath, req)
+      if resp.success:
+        echo "reload accepted — new configuration kept"
+      else:
+        stderr.writeLine fmt"accept failed: {resp.error}"
+        quit(1)
+      return
+    of "cancel":
+      let req = IpcRequest(id: 1, rpcMethod: "config.cancel")
+      let resp = sendIpcRequest(socketPath, req)
+      if resp.success:
+        echo "reload cancelled — configuration rolled back"
+      else:
+        stderr.writeLine fmt"cancel failed: {resp.error}"
+        quit(1)
+      return
+    else:
+      stderr.writeLine fmt"unknown reload subcommand: {args[0]}"
+      quit(1)
 
+  # Parse flags
+  var rollbackMinutes = 0
   var i = 0
   while i < args.len:
     case args[i]
@@ -408,7 +432,7 @@ proc cliReload(socketPath: string, args: seq[string]) =
     let resp = sendIpcRequest(socketPath, req)
     if resp.success:
       echo fmt"configuration reloaded — auto-rollback in {rollbackMinutes} minute(s)"
-      echo "run 'nopal accept' to keep, or wait for rollback"
+      echo "run 'nopal reload accept' to keep, or wait for rollback"
     else:
       stderr.writeLine fmt"reload failed: {resp.error}"
       quit(1)
@@ -472,24 +496,6 @@ proc cliBypass(socketPath: string, args: seq[string]) =
   else:
     stderr.writeLine fmt"unknown bypass subcommand: {args[0]}"
     stderr.writeLine "usage: nopal bypass add|remove|list [network]"
-    quit(1)
-
-proc cliAccept(socketPath: string) =
-  let req = IpcRequest(id: 1, rpcMethod: "config.accept")
-  let resp = sendIpcRequest(socketPath, req)
-  if resp.success:
-    echo "reload accepted — new configuration kept"
-  else:
-    stderr.writeLine fmt"accept failed: {resp.error}"
-    quit(1)
-
-proc cliCancel(socketPath: string) =
-  let req = IpcRequest(id: 1, rpcMethod: "config.cancel")
-  let resp = sendIpcRequest(socketPath, req)
-  if resp.success:
-    echo "reload cancelled — configuration rolled back"
-  else:
-    stderr.writeLine fmt"cancel failed: {resp.error}"
     quit(1)
 
 proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
@@ -603,8 +609,8 @@ proc printUsage() =
   echo "  nopal rules                  Show active nftables rules"
   echo "  nopal reload                 Reload configuration"
   echo "  nopal reload --rollback <m>  Reload with auto-rollback after <m> minutes"
-  echo "  nopal accept                 Keep pending reload (cancel rollback timer)"
-  echo "  nopal cancel                 Rollback pending reload now"
+  echo "  nopal reload accept          Keep pending reload (cancel rollback timer)"
+  echo "  nopal reload cancel          Rollback pending reload now"
   echo "  nopal bypass add <cidr>      Add network to policy routing bypass"
   echo "  nopal bypass remove <cidr>   Remove network from bypass"
   echo "  nopal bypass list            Show dynamic bypass networks"
@@ -677,10 +683,6 @@ proc runCli(args: seq[string]) =
       cliReload(socketPath, positional[1..^1])
     of "bypass":
       cliBypass(socketPath, positional[1..^1])
-    of "accept":
-      cliAccept(socketPath)
-    of "cancel":
-      cliCancel(socketPath)
     of "help":
       printUsage()
     of "version":
