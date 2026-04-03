@@ -28,8 +28,8 @@ Cross-compilation uses clang + musl sysroots + compiler-rt. Target profiles are 
 # Run all module tests (each module has `when isMainModule` test blocks)
 nim c -r src/config/parser.nim
 nim c -r src/config/diff.nim
+nim c -r src/state/machine.nim
 nim c -r src/state/tracker.nim
-nim c -r src/state/transition.nim
 nim c -r src/state/policy.nim
 nim c -r src/health/dampening.nim
 nim c -r src/health/engine.nim
@@ -61,7 +61,7 @@ CI runs compile, compile with HTTPS, and all module tests on Nim 2.2.
 
 - **`src/config/`** — UCI config parser (`/etc/config/nopal`). `schema.nim` defines types, `parser.nim` parses, `diff.nim` computes minimal changes for hot reload.
 - **`src/health/`** — Pluggable health probes via `ProbeTransport` variant type. Implementations: `icmp.nim`, `dns.nim`, `http.nim`, `https.nim` (feature-gated), `arp.nim`. `dampening.nim` implements RFC 2439 exponential penalty/decay. `engine.nim` orchestrates probe cycles.
-- **`src/state/`** — Interface state machine (Init → Probing → Online ↔ Degraded ↔ Offline). `policy.nim` resolves active members by metric tiers. `transition.nim` maps state changes to kernel actions.
+- **`src/state/`** — Interface state machine (Init → Probing → Online ↔ Degraded ↔ Offline). `machine.nim` is the pure core (`func decide` with `{.raises: [].}`). `tracker.nim` is the mutable shell (snapshot/apply). `policy.nim` resolves active members by metric tiers.
 - **`src/netlink/`** — Native netlink via `socket.nim` abstraction. `route.nim` manages routes/rules, `link.nim` monitors link state, `monitor.nim` detects route/address changes, `conntrack.nim` flushes conntrack entries.
 - **`src/nftables/`** — Atomic JSON ruleset generation. `chains.nim` builds policy rules with load balancing/sticky routing. `engine.nim` pipes JSON to `nft -j -f -` for atomic application. `marks.nim` does FNV-1a mark hashing.
 - **`src/ipc/`** — Unix socket server at `/var/run/nopal.sock`. `methods.nim` dispatches RPC methods (status, interface.status, connected, config.reload). `protocol.nim` defines JSON wire types.

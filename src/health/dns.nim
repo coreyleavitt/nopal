@@ -8,7 +8,7 @@
 ## SO_BINDTODEVICE and marked with SO_MARK = 0xDEAD for nftables
 ## exemption.
 
-import std/[posix, os, strformat]
+import std/[posix, os]
 import ../linux_constants
 
 const DNS_PORT = 53'u16
