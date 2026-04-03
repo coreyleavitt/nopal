@@ -637,15 +637,22 @@ proc parseRule*(sec: UciSection): RuleConfig =
   let proto = sec.get("proto")
   if proto != "":
     case proto.toLowerAscii()
-    of "tcp", "udp", "icmp", "icmpv6", "sctp", "gre", "esp", "ah", "all":
-      result.proto = proto.toLowerAscii()
+    of "tcp": result.proto = namedProto(npTcp)
+    of "udp": result.proto = namedProto(npUdp)
+    of "icmp": result.proto = namedProto(npIcmp)
+    of "icmpv6": result.proto = namedProto(npIcmpv6)
+    of "sctp": result.proto = namedProto(npSctp)
+    of "gre": result.proto = namedProto(npGre)
+    of "esp": result.proto = namedProto(npEsp)
+    of "ah": result.proto = namedProto(npAh)
+    of "all": result.proto = namedProto(npAll)
     else:
       # Allow numeric protocol numbers
       try:
         let pnum = parseInt(proto)
         if pnum < 0 or pnum > 255:
           raise newException(ConfigError, fmt"{ctx}: protocol number {pnum} out of range (0-255)")
-        result.proto = proto
+        result.proto = numericProto(uint8(pnum))
       except ValueError:
         raise newException(ConfigError, fmt"{ctx}: unknown protocol '{proto}'")
 
@@ -880,7 +887,7 @@ config rule default_rule
       check cfg.rules.len == 1
       check cfg.rules[0].name == "default_rule"
       check cfg.rules[0].usePolicy == "balanced"
-      check cfg.rules[0].proto == "all"
+      check cfg.rules[0].proto == namedProto(npAll)
 
     test "parse_empty_config":
       let cfg = loadFromStr("")
@@ -1123,7 +1130,7 @@ config rule custom
       check rule.srcPort == "1024-65535"
       check rule.destIp == @["192.168.1.0/24"]
       check rule.destPort == "80"
-      check rule.proto == "tcp"
+      check rule.proto == namedProto(npTcp)
       check rule.family == rfIpv4
       check rule.sticky == true
       check rule.stickyTimeout == 300'u32
