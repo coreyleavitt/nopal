@@ -35,6 +35,10 @@ proc newRouteManager*(): RouteManager =
     recvBuf: newSeq[byte](RecvBufSize),
   )
 
+proc close*(m: var RouteManager) {.raises: [].} =
+  ## Close the netlink socket.
+  m.sock.close()
+
 proc nextSeq(m: var RouteManager): uint32 =
   ## Return the next sequence number, wrapping on overflow.
   m.nlSeq = m.nlSeq + 1
