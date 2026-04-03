@@ -161,49 +161,38 @@ proc recvIcmpReply*(fd: cint, buf: var array[1500, byte]): tuple[ok: bool, id, s
   result = (ok: true, id: id, seq: seq)
 
 when isMainModule:
-  # Tests for icmpChecksum
+  import std/unittest
 
-  block testAllZeros:
-    ## All-zero buffer should produce 0xFFFF checksum.
-    var data: array[16, byte]
-    doAssert icmpChecksum(data) == 0xFFFF'u16,
-      "all-zeros checksum should be 0xFFFF"
+  suite "ICMP checksum":
+    test "all-zero buffer produces 0xFFFF":
+      var data: array[16, byte]
+      check icmpChecksum(data) == 0xFFFF'u16
 
-  block testKnownPayload:
-    ## Known payload "nopalprb" (8 bytes).
-    let data = [0x6E'u8, 0x6F, 0x70, 0x61, 0x6C, 0x70, 0x72, 0x62] # "nopalprb"
-    let cksum = icmpChecksum(data)
-    doAssert cksum != 0, "checksum of non-zero data should not be zero"
-    # Verify the validation property: checksum of (data + checksum) == 0
-    var withCksum: array[10, byte]
-    for i in 0 ..< 8:
-      withCksum[i] = data[i]
-    withCksum[8] = uint8(cksum shr 8)
-    withCksum[9] = uint8(cksum and 0xFF)
-    doAssert icmpChecksum(withCksum) == 0,
-      "checksum of data+checksum should be 0"
+    test "known payload produces non-zero checksum":
+      let data = [0x6E'u8, 0x6F, 0x70, 0x61, 0x6C, 0x70, 0x72, 0x62]
+      let cksum = icmpChecksum(data)
+      check cksum != 0
+      var withCksum: array[10, byte]
+      for i in 0 ..< 8:
+        withCksum[i] = data[i]
+      withCksum[8] = uint8(cksum shr 8)
+      withCksum[9] = uint8(cksum and 0xFF)
+      check icmpChecksum(withCksum) == 0
 
-  block testOddLength:
-    ## Odd-length payload.
-    let data = [byte 0xAA, 0xBB, 0xCC]
-    let cksum = icmpChecksum(data)
-    doAssert cksum != 0, "odd-length checksum should not be zero"
+    test "odd-length payload":
+      let data = [byte 0xAA, 0xBB, 0xCC]
+      check icmpChecksum(data) != 0
 
-  block testValidationProperty:
-    ## Build a mock ICMP echo request and verify checksum validation.
-    var pkt: array[16, byte]
-    pkt[0] = ICMP_ECHO_REQUEST
-    pkt[1] = 0
-    pkt[4] = 0; pkt[5] = 1  # id = 1
-    pkt[6] = 0; pkt[7] = 1  # seq = 1
-    let pattern = [0x6E'u8, 0x6F, 0x70, 0x61, 0x6C, 0x70, 0x72, 0x62]
-    for i in 0 ..< 8:
-      pkt[8 + i] = pattern[i]
-    let cksum = icmpChecksum(pkt)
-    pkt[2] = uint8(cksum shr 8)
-    pkt[3] = uint8(cksum and 0xFF)
-    # Recomputing over the whole packet with checksum filled should yield 0
-    doAssert icmpChecksum(pkt) == 0,
-      "checksum of complete packet should be 0"
-
-  echo "All icmpChecksum tests passed."
+    test "ICMP echo request validation property":
+      var pkt: array[16, byte]
+      pkt[0] = ICMP_ECHO_REQUEST
+      pkt[1] = 0
+      pkt[4] = 0; pkt[5] = 1
+      pkt[6] = 0; pkt[7] = 1
+      let pattern = [0x6E'u8, 0x6F, 0x70, 0x61, 0x6C, 0x70, 0x72, 0x62]
+      for i in 0 ..< 8:
+        pkt[8 + i] = pattern[i]
+      let cksum = icmpChecksum(pkt)
+      pkt[2] = uint8(cksum shr 8)
+      pkt[3] = uint8(cksum and 0xFF)
+      check icmpChecksum(pkt) == 0
