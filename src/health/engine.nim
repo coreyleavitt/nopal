@@ -337,6 +337,31 @@ proc closeAll*(engine: var ProbeEngine) {.raises: [].} =
 # ProbeEngine API
 # ===================================================================
 
+func formatIpBytes*(ip: array[16, byte], isV6: bool): string {.raises: [].} =
+  ## Convert raw IP bytes to a human-readable string.
+  if isV6:
+    # IPv6: 8 groups of 2-byte hex values
+    var parts: array[8, string]
+    for i in 0 ..< 8:
+      let hi = ip[i * 2]
+      let lo = ip[i * 2 + 1]
+      let val = (uint16(hi) shl 8) or uint16(lo)
+      parts[i] = val.toHex(1).toLowerAscii().strip(chars = {'0'}, trailing = false)
+      if parts[i].len == 0: parts[i] = "0"
+    result = parts[0]
+    for i in 1 ..< 8:
+      result &= ":" & parts[i]
+  else:
+    # IPv4: 4 decimal octets
+    result = $ip[0] & "." & $ip[1] & "." & $ip[2] & "." & $ip[3]
+
+proc getTargetStatuses*(engine: ProbeEngine, index: int): seq[TargetStatus] =
+  ## Return per-target status for an interface. Empty if not found.
+  for probe in engine.probes:
+    if probe.index == index:
+      return probe.targetStatus
+  @[]
+
 proc initProbeEngine*(): ProbeEngine =
   ProbeEngine(probes: @[])
 

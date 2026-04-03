@@ -261,6 +261,16 @@ proc printInterfaceDetail(iface: JsonNode) =
   echo fmt"  Loss:      {lossVal}%"
   echo fmt"  Probes:    {okCount} ok / {failCount} fail"
 
+  let targets = iface{"targets"}
+  if targets != nil and targets.kind == JArray and targets.len > 0:
+    echo "  Targets:"
+    for t in targets:
+      let ip = t{"ip"}.getStr("?")
+      let up = if t{"up"}.getBool(false): "up" else: "down"
+      let rttMs = t{"rtt_ms"}
+      let rttStr = if rttMs != nil and rttMs.kind != JNull: fmt"{rttMs.getFloat():.1f}ms" else: "-"
+      echo fmt"    {ip}: {up} ({rttStr})"
+
 proc printPolicyTable(policies: JsonNode) =
   echo "  " & alignLeft("POLICY", 16) & " " &
        alignLeft("TIER", 8) & " " &

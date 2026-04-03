@@ -1453,6 +1453,7 @@ proc run*(d: var Daemon) =
               connectedNetworks: addr d.connectedNetworks,
               dynamicBypassV4: addr d.dynamicBypassV4,
               dynamicBypassV6: addr d.dynamicBypassV6,
+              probeEngine: addr d.probeEngine,
               reloadPending: pendingInfo,
             )
             case ipcMethod.get

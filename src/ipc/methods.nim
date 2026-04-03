@@ -10,6 +10,7 @@ import std/[json, options, monotimes, times]
 import ./protocol
 import ../state/tracker
 import ../state/policy
+import ../health/engine
 import ../version
 import ../config/schema
 
@@ -34,6 +35,7 @@ type
     connectedNetworks*: ptr seq[string]
     dynamicBypassV4*: ptr seq[string]
     dynamicBypassV6*: ptr seq[string]
+    probeEngine*: ptr ProbeEngine
     reloadPending*: Option[ReloadPendingInfo]
 
 func parseIpcMethod*(s: string): Option[IpcMethod] {.raises: [].} =
@@ -52,7 +54,20 @@ func parseIpcMethod*(s: string): Option[IpcMethod] {.raises: [].} =
   of "subscribe": some(imSubscribe)
   else: none[IpcMethod]()
 
-proc buildInterfaceStatus*(t: InterfaceTracker): InterfaceStatusData {.raises: [].} =
+proc buildTargetsJson(targetStatuses: seq[TargetStatus]): JsonNode =
+  ## Convert probe target statuses to JSON array.
+  if targetStatuses.len == 0: return nil
+  var arr = newJArray()
+  for ts in targetStatuses:
+    let ipStr = formatIpBytes(ts.ip, ts.isV6)
+    var t = %*{"ip": ipStr, "up": ts.up}
+    if ts.lastRttMs.isSome:
+      t["rtt_ms"] = %*ts.lastRttMs.get
+    arr.add(t)
+  arr
+
+proc buildInterfaceStatus*(t: InterfaceTracker,
+                           targetStatuses: seq[TargetStatus] = @[]): InterfaceStatusData {.raises: [].} =
   let uptimeSecs = if t.onlineSince.isSome:
     inSeconds(getMonoTime() - t.onlineSince.get)
   else:
@@ -71,7 +86,7 @@ proc buildInterfaceStatus*(t: InterfaceTracker): InterfaceStatusData {.raises: [
     avgRttMs: avgRtt,
     lossPercent: t.lossPercent,
     uptimeSecs: uptimeSecs,
-    targets: nil,
+    targets: buildTargetsJson(targetStatuses),
   )
 
 proc handleStatusQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises: [].} =
@@ -80,7 +95,8 @@ proc handleStatusQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises
 
   var ifaces: seq[InterfaceStatusData]
   for t in view.trackers[]:
-    ifaces.add(buildInterfaceStatus(t))
+    let targets = view.probeEngine[].getTargetStatuses(t.index)
+    ifaces.add(buildInterfaceStatus(t, targets))
 
   var pols: seq[PolicyStatusData]
   for pc in view.config.policies:
@@ -147,18 +163,30 @@ when isMainModule:
       check parseIpcMethod("").isNone
       check parseIpcMethod("STATUS").isNone  # case sensitive
 
+  var testEngine = initProbeEngine()
+
+  template makeTestView(trackers: var seq[InterfaceTracker], config: NopalConfig,
+                        connected: var seq[string]): DaemonView =
+    var bypassV4: seq[string] = @[]
+    var bypassV6: seq[string] = @[]
+    DaemonView(
+      trackers: addr trackers,
+      config: unsafeAddr config,
+      startTime: getMonoTime(),
+      connectedNetworks: addr connected,
+      dynamicBypassV4: addr bypassV4,
+      dynamicBypassV6: addr bypassV6,
+      probeEngine: addr testEngine,
+      reloadPending: none[ReloadPendingInfo](),
+    )
+
   suite "query handlers":
     test "handleStatusQuery returns DaemonStatus":
       var trackers = @[newTracker("wan", 0, 0x100, 101, "eth0", 3, 5)]
       trackers[0].state = isOnline
       let config = NopalConfig(globals: defaultGlobals())
       var connected: seq[string] = @[]
-      let view = DaemonView(
-        trackers: addr trackers,
-        config: unsafeAddr config,
-        startTime: getMonoTime(),
-        connectedNetworks: addr connected,
-      )
+      let view = makeTestView(trackers, config, connected)
       let req = IpcRequest(id: 1, rpcMethod: "status")
       let resp = handleStatusQuery(view, req)
       check resp.success
@@ -170,12 +198,7 @@ when isMainModule:
       trackers[0].state = isOnline
       let config = NopalConfig(globals: defaultGlobals())
       var connected: seq[string] = @[]
-      let view = DaemonView(
-        trackers: addr trackers,
-        config: unsafeAddr config,
-        startTime: getMonoTime(),
-        connectedNetworks: addr connected,
-      )
+      let view = makeTestView(trackers, config, connected)
       let req = IpcRequest(id: 1, rpcMethod: "interface.status",
                            params: %*{"interface": "wan"})
       let resp = handleInterfaceStatusQuery(view, req)
@@ -186,12 +209,7 @@ when isMainModule:
       var trackers: seq[InterfaceTracker] = @[]
       let config = NopalConfig(globals: defaultGlobals())
       var connected: seq[string] = @[]
-      let view = DaemonView(
-        trackers: addr trackers,
-        config: unsafeAddr config,
-        startTime: getMonoTime(),
-        connectedNetworks: addr connected,
-      )
+      let view = makeTestView(trackers, config, connected)
       let req = IpcRequest(id: 1, rpcMethod: "interface.status",
                            params: %*{"interface": "nonexistent"})
       let resp = handleInterfaceStatusQuery(view, req)
@@ -214,12 +232,7 @@ when isMainModule:
                                  metric: 1, weight: 50)],
       )
       var connected: seq[string] = @[]
-      let view = DaemonView(
-        trackers: addr trackers,
-        config: unsafeAddr config,
-        startTime: getMonoTime(),
-        connectedNetworks: addr connected,
-      )
+      let view = makeTestView(trackers, config, connected)
       let req = IpcRequest(id: 1, rpcMethod: "status")
       let resp = handleStatusQuery(view, req)
       check resp.success
@@ -237,12 +250,7 @@ when isMainModule:
       var trackers: seq[InterfaceTracker] = @[]
       let config = NopalConfig(globals: defaultGlobals())
       var connected = @["127.0.0.0/8", "::1/128"]
-      let view = DaemonView(
-        trackers: addr trackers,
-        config: unsafeAddr config,
-        startTime: getMonoTime(),
-        connectedNetworks: addr connected,
-      )
+      let view = makeTestView(trackers, config, connected)
       let req = IpcRequest(id: 1, rpcMethod: "connected")
       let resp = handleConnectedQuery(view, req)
       check resp.success
