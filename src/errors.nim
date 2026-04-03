@@ -55,3 +55,22 @@ func `$`*(e: NlError): string =
     result &= " (errno " & $e.osError & ")"
   if e.detail.len > 0:
     result &= " [" & e.detail & "]"
+
+# ---------------------------------------------------------------------------
+# Error propagation operator (Rust-style ?)
+# ---------------------------------------------------------------------------
+
+template `?`*[T](r: NlResult[T]): T =
+  ## Rust-style error propagation: unwrap Ok value or return Err from
+  ## the calling function. Only usable in functions that return NlResult.
+  ## Compiler enforces this via the `return` statement.
+  let tmp = r
+  if not tmp.ok:
+    return NlResult[void](ok: false, error: tmp.error)
+  tmp.value
+
+template `?`*(r: NlResult[void]) =
+  ## Void variant: propagate error or continue execution.
+  let tmp = r
+  if not tmp.ok:
+    return NlResult[void](ok: false, error: tmp.error)

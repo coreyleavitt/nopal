@@ -353,11 +353,8 @@ proc flushTable*(m: var RouteManager, table: uint32,
 
 proc flushTableBoth*(m: var RouteManager, table: uint32): NlResult[void] {.raises: [].} =
   ## Flush all routes in a routing table (both IPv4 and IPv6).
-  let r4 = m.flushTableFamily(table, AF_INET)
-  let r6 = m.flushTableFamily(table, AF_INET6)
-  # Return first error if any
-  if not r4.ok: return r4
-  if not r6.ok: return r6
+  `?`(m.flushTableFamily(table, AF_INET))
+  `?`(m.flushTableFamily(table, AF_INET6))
   nlOk()
 
 # ---------------------------------------------------------------------------
