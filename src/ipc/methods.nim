@@ -1,23 +1,44 @@
-## IPC method dispatch: routes RPC requests to handlers.
+## IPC query handlers: read-only projections of daemon state.
+##
+## CQS architecture: this module contains query handlers only.
+## Command handlers (config.reload) live in daemon.nim where they
+## have mutable access to the Daemon.
+##
+## Dispatch routing also lives in daemon.nim (case on IpcMethod enum).
 
-import std/[json, options, monotimes, times, strformat]
+import std/[json, options, monotimes, times]
 import ./protocol
 import ../state/tracker
 import ../state/policy
 import ../config/schema
 
 type
-  DispatchAction* = enum
-    daNone, daReload
+  IpcMethod* = enum
+    imStatus
+    imInterfaceStatus
+    imConnected
+    imConfigReload
+    imSubscribe
 
-  ## Read-only view of daemon state for dispatch.
+  ## Read-only view of daemon state for query handlers.
   DaemonView* = object
     trackers*: ptr seq[InterfaceTracker]
     config*: ptr NopalConfig
     startTime*: MonoTime
     connectedNetworks*: ptr seq[string]
 
-proc buildInterfaceStatus(t: InterfaceTracker): InterfaceStatusData =
+func parseIpcMethod*(s: string): Option[IpcMethod] {.raises: [].} =
+  ## Parse an RPC method name to the IpcMethod enum.
+  ## Returns none for unknown methods.
+  case s
+  of "status": some(imStatus)
+  of "interface.status": some(imInterfaceStatus)
+  of "connected": some(imConnected)
+  of "config.reload": some(imConfigReload)
+  of "subscribe": some(imSubscribe)
+  else: none[IpcMethod]()
+
+proc buildInterfaceStatus*(t: InterfaceTracker): InterfaceStatusData {.raises: [].} =
   let uptimeSecs = if t.onlineSince.isSome:
     inSeconds(getMonoTime() - t.onlineSince.get)
   else:
@@ -39,7 +60,8 @@ proc buildInterfaceStatus(t: InterfaceTracker): InterfaceStatusData =
     targets: nil,
   )
 
-proc buildStatus(view: DaemonView): DaemonStatus =
+proc handleStatusQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises: [].} =
+  ## Query: return full daemon status.
   let uptime = inSeconds(getMonoTime() - view.startTime)
 
   var ifaces: seq[InterfaceStatusData]
@@ -61,55 +83,52 @@ proc buildStatus(view: DaemonView): DaemonStatus =
       activeTier: activeTier,
     ))
 
-  DaemonStatus(
+  let status = DaemonStatus(
     version: "0.1.0-alpha.5",
     uptimeSecs: uptime,
     interfaces: ifaces,
     policies: pols,
   )
+  successResponse(req.id, status.toJson())
 
-proc dispatch*(req: IpcRequest, view: DaemonView): (IpcResponse, DispatchAction) =
-  ## Route an IPC request to the appropriate handler.
-  ## Returns (response, action) where action tells the daemon what to do.
-  case req.rpcMethod
-  of "status":
-    let status = buildStatus(view)
-    (successResponse(req.id, status.toJson()), daNone)
-
-  of "interface.status":
-    let ifaceName = if req.params != nil and req.params.hasKey("interface"):
-      req.params["interface"].getStr()
-    else:
-      ""
-    if ifaceName == "" or ifaceName.len > 64:
-      return (errorResponse(req.id, "missing or invalid 'interface' parameter"), daNone)
-
-    for t in view.trackers[]:
-      if t.name == ifaceName:
-        let data = buildInterfaceStatus(t)
-        return (successResponse(req.id, data.toJson()), daNone)
-    (errorResponse(req.id, fmt"interface '{ifaceName}' not found"), daNone)
-
-  of "connected":
-    let data = ConnectedData(networks: view.connectedNetworks[])
-    (successResponse(req.id, data.toJson()), daNone)
-
-  of "config.reload":
-    (successResponse(req.id), daReload)
-
-  of "subscribe":
-    # Subscription is handled by the server (marks client.subscribed = true).
-    # Just acknowledge.
-    (successResponse(req.id), daNone)
-
+proc handleInterfaceStatusQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises: [].} =
+  ## Query: return status for a single interface.
+  let ifaceName = if req.params != nil and req.params.hasKey("interface"):
+    req.params{"interface"}.getStr()
   else:
-    (errorResponse(req.id, fmt"unknown method '{req.rpcMethod}'"), daNone)
+    ""
+  if ifaceName == "" or ifaceName.len > 64:
+    return errorResponse(req.id, "missing or invalid 'interface' parameter")
+
+  for t in view.trackers[]:
+    if t.name == ifaceName:
+      let data = buildInterfaceStatus(t)
+      return successResponse(req.id, data.toJson())
+  errorResponse(req.id, "interface '" & ifaceName & "' not found")
+
+proc handleConnectedQuery*(view: DaemonView, req: IpcRequest): IpcResponse {.raises: [].} =
+  ## Query: return connected networks.
+  let data = ConnectedData(networks: view.connectedNetworks[])
+  successResponse(req.id, data.toJson())
 
 when isMainModule:
   import std/[unittest, strutils]
 
-  suite "IPC methods":
-    test "dispatch status returns DaemonStatus":
+  suite "parseIpcMethod":
+    test "known methods parse correctly":
+      check parseIpcMethod("status") == some(imStatus)
+      check parseIpcMethod("interface.status") == some(imInterfaceStatus)
+      check parseIpcMethod("connected") == some(imConnected)
+      check parseIpcMethod("config.reload") == some(imConfigReload)
+      check parseIpcMethod("subscribe") == some(imSubscribe)
+
+    test "unknown methods return none":
+      check parseIpcMethod("nonexistent").isNone
+      check parseIpcMethod("").isNone
+      check parseIpcMethod("STATUS").isNone  # case sensitive
+
+  suite "query handlers":
+    test "handleStatusQuery returns DaemonStatus":
       var trackers = @[newTracker("wan", 0, 0x100, 101, "eth0", 3, 5)]
       trackers[0].state = isOnline
       let config = NopalConfig(globals: defaultGlobals())
@@ -121,13 +140,29 @@ when isMainModule:
         connectedNetworks: addr connected,
       )
       let req = IpcRequest(id: 1, rpcMethod: "status")
-      let (resp, action) = dispatch(req, view)
+      let resp = handleStatusQuery(view, req)
       check resp.success
-      check action == daNone
       check resp.data["interfaces"].len == 1
       check resp.data["interfaces"][0]["name"].getStr == "wan"
 
-    test "dispatch unknown method returns error":
+    test "handleInterfaceStatusQuery returns single interface":
+      var trackers = @[newTracker("wan", 0, 0x100, 101, "eth0", 3, 5)]
+      trackers[0].state = isOnline
+      let config = NopalConfig(globals: defaultGlobals())
+      var connected: seq[string] = @[]
+      let view = DaemonView(
+        trackers: addr trackers,
+        config: unsafeAddr config,
+        startTime: getMonoTime(),
+        connectedNetworks: addr connected,
+      )
+      let req = IpcRequest(id: 1, rpcMethod: "interface.status",
+                           params: %*{"interface": "wan"})
+      let resp = handleInterfaceStatusQuery(view, req)
+      check resp.success
+      check resp.data["name"].getStr == "wan"
+
+    test "handleInterfaceStatusQuery unknown interface":
       var trackers: seq[InterfaceTracker] = @[]
       let config = NopalConfig(globals: defaultGlobals())
       var connected: seq[string] = @[]
@@ -137,10 +172,11 @@ when isMainModule:
         startTime: getMonoTime(),
         connectedNetworks: addr connected,
       )
-      let req = IpcRequest(id: 2, rpcMethod: "nonexistent")
-      let (resp, action) = dispatch(req, view)
+      let req = IpcRequest(id: 1, rpcMethod: "interface.status",
+                           params: %*{"interface": "nonexistent"})
+      let resp = handleInterfaceStatusQuery(view, req)
       check not resp.success
-      check "unknown method" in resp.error
+      check "not found" in resp.error
 
     test "status reports degraded state with quality metrics":
       var trackers = @[newTracker("wan", 0, 0x100, 101, "eth0", 3, 5)]
@@ -165,7 +201,7 @@ when isMainModule:
         connectedNetworks: addr connected,
       )
       let req = IpcRequest(id: 1, rpcMethod: "status")
-      let (resp, action) = dispatch(req, view)
+      let resp = handleStatusQuery(view, req)
       check resp.success
       let iface = resp.data["interfaces"][0]
       check iface["state"].getStr == "degraded"
@@ -173,22 +209,21 @@ when isMainModule:
       check iface["loss_percent"].getInt == 30
       check iface["success_count"].getInt == 7
       check iface["fail_count"].getInt == 3
-      # Degraded interface should be in active policy members
       let pol = resp.data["policies"][0]
       check pol["active_members"].len == 1
       check pol["active_members"][0].getStr == "wan"
 
-    test "dispatch config.reload sets action":
+    test "handleConnectedQuery returns networks":
       var trackers: seq[InterfaceTracker] = @[]
       let config = NopalConfig(globals: defaultGlobals())
-      var connected: seq[string] = @[]
+      var connected = @["127.0.0.0/8", "::1/128"]
       let view = DaemonView(
         trackers: addr trackers,
         config: unsafeAddr config,
         startTime: getMonoTime(),
         connectedNetworks: addr connected,
       )
-      let req = IpcRequest(id: 3, rpcMethod: "config.reload")
-      let (resp, action) = dispatch(req, view)
+      let req = IpcRequest(id: 1, rpcMethod: "connected")
+      let resp = handleConnectedQuery(view, req)
       check resp.success
-      check action == daReload
+      check resp.data["networks"].len == 2

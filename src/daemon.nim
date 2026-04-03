@@ -70,7 +70,6 @@ type
     trackers*: seq[InterfaceTracker]
     startTime: MonoTime
     running: bool
-    reloadRequested: bool
     firstConnectFired: bool
     connectedNetworks: seq[string]
     hookScriptExists: bool
@@ -253,7 +252,6 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
     trackers: trackers,
     startTime: getMonoTime(),
     running: true,
-    reloadRequested: false,
     firstConnectFired: false,
     connectedNetworks: @[],
     hookScriptExists: hookExists,
@@ -837,6 +835,8 @@ proc processProbeResult(d: var Daemon, probeResult: ProbeResult) =
 # Event handlers
 # =========================================================================
 
+proc handleReload(d: var Daemon) # forward declaration
+
 proc handleSignals(d: var Daemon) =
   ## Drain the signal pipe and process each signal byte.
   var buf: array[32, byte]
@@ -850,7 +850,7 @@ proc handleSignals(d: var Daemon) =
         d.running = false
       of 'R':
         info "received reload signal"
-        d.reloadRequested = true
+        d.handleReload()
       else:
         discard
 
@@ -1234,6 +1234,14 @@ proc handleReload(d: var Daemon) =
 
   info fmt"configuration reloaded: {d.config.interfaces.len} interfaces, {d.config.policies.len} policies, {d.config.rules.len} rules"
 
+proc handleReloadCommand(d: var Daemon, req: IpcRequest): IpcResponse =
+  ## IPC command: reload configuration synchronously, return real result.
+  try:
+    d.handleReload()
+    successResponse(req.id)
+  except CatchableError as e:
+    errorResponse(req.id, "reload failed: " & e.msg)
+
 # =========================================================================
 # Shutdown
 # =========================================================================
@@ -1295,9 +1303,6 @@ proc run*(d: var Daemon) =
   d.initializeInterfaces()
 
   while d.running:
-    if d.reloadRequested:
-      d.handleReload()
-      d.reloadRequested = false
 
     # Reap any finished hook child processes
     d.reapHookChildren()
@@ -1337,16 +1342,28 @@ proc run*(d: var Daemon) =
         let clientId = token - IpcClientBase
         let requests = d.ipcServer.readClient(clientId, d.selector)
         for req in requests:
-          let view = DaemonView(
-            trackers: addr d.trackers,
-            config: unsafeAddr d.config,
-            startTime: d.startTime,
-            connectedNetworks: addr d.connectedNetworks,
-          )
-          let (resp, action) = dispatch(req, view)
+          let ipcMethod = parseIpcMethod(req.rpcMethod)
+          let resp = if ipcMethod.isNone:
+            errorResponse(req.id, "unknown method '" & req.rpcMethod & "'")
+          else:
+            let view = DaemonView(
+              trackers: addr d.trackers,
+              config: unsafeAddr d.config,
+              startTime: d.startTime,
+              connectedNetworks: addr d.connectedNetworks,
+            )
+            case ipcMethod.get
+            of imStatus:
+              handleStatusQuery(view, req)
+            of imInterfaceStatus:
+              handleInterfaceStatusQuery(view, req)
+            of imConnected:
+              handleConnectedQuery(view, req)
+            of imConfigReload:
+              d.handleReloadCommand(req)
+            of imSubscribe:
+              successResponse(req.id)
           d.ipcServer.sendResponse(clientId, resp, d.selector)
-          if action == daReload:
-            d.reloadRequested = true
 
     # Process expired timers
     let timerNow = getMonoTime()
