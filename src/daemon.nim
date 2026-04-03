@@ -829,6 +829,59 @@ proc handleProbeResponse(d: var Daemon, slotIndex: int) =
 # Interface initialization
 # =========================================================================
 
+# =========================================================================
+# Shared probe setup helpers (used by init and reload)
+# =========================================================================
+
+proc setupProbeForInterface(d: var Daemon, t: InterfaceTracker,
+                            c: InterfaceConfig) =
+  ## Configure probes for a single interface: filter targets, create transport,
+  ## register with probe engine, schedule first probe timer.
+  let ipv6Ok = d.config.globals.ipv6Enabled
+  let isV6 = c.family == afIpv6 or (c.family == afBoth and ipv6Ok)
+  var targets: seq[string]
+  for ip in c.trackIp:
+    if not ipv6Ok and ':' in ip: continue
+    targets.add(ip)
+
+  if targets.len > 0:
+    let transport = makeProbeTransport(c)
+    d.probeEngine.addInterface(
+      t.index, t.name, t.device, targets, isV6, transport,
+      c.reliability, int(c.count),
+      latencyThreshold = if c.checkQuality and c.latencyThreshold > 0:
+                           some(uint32(c.latencyThreshold)) else: none(uint32),
+      lossThreshold = if c.checkQuality and c.lossThreshold > 0:
+                        some(uint32(c.lossThreshold)) else: none(uint32),
+      recoveryLatency = if c.checkQuality and c.recoveryLatency > 0:
+                          some(uint32(c.recoveryLatency)) else: none(uint32),
+      recoveryLoss = if c.checkQuality and c.recoveryLoss > 0:
+                       some(uint32(c.recoveryLoss)) else: none(uint32),
+      qualityWindowSize = int(c.qualityWindow),
+      probeSize = int(c.probeSize),
+    )
+
+  d.timers.push(TimerEntry(
+    deadline: getMonoTime() + initDuration(seconds = 1),
+    kind: tkProbe,
+    index: t.index,
+  ))
+
+proc registerProbeSockets(d: var Daemon) =
+  ## Register all probe engine FDs with the selector. Log invalid sockets.
+  for (slot, fd) in d.probeEngine.getFds():
+    d.selector.registerHandle(fd.int, {Read}, ProbeTokenBase + slot)
+  for name in d.probeEngine.invalidFdInterfaces:
+    error fmt"probe socket creation failed for interface '{name}' — probes will not work"
+
+proc deregisterProbeSockets(probeEngine: var ProbeEngine, selector: var Selector[int]) =
+  ## Unregister all probe engine FDs from the selector.
+  for (slot, fd) in probeEngine.getFds():
+    try: selector.unregister(fd.int)
+    except CatchableError: discard
+
+# =========================================================================
+
 proc initializeInterfaces(d: var Daemon) =
   ## Set up initial interface states, probes, routes, and nftables.
   var onlineIndices: seq[int]
@@ -848,60 +901,20 @@ proc initializeInterfaces(d: var Daemon) =
       onlineIndices.add(index)
       info fmt"{d.trackers[ti].name}: initial_state=online, active immediately"
     else:
-      # Assume link is up, start probing
       d.trackers[ti].state = isProbing
       d.trackers[ti].successCount = 0
       d.trackers[ti].failCount = 0
 
-    # Set up probe targets
-    let ipv6Ok = d.config.globals.ipv6Enabled
-    let isV6 = c.family == afIpv6 or (c.family == afBoth and ipv6Ok)
-    var targets: seq[string]
-    for ip in c.trackIp:
-      # Filter IPv6 targets if ipv6 disabled
-      if not ipv6Ok and ':' in ip: continue
-      targets.add(ip)
+    d.setupProbeForInterface(d.trackers[ti], c)
 
-    if targets.len > 0:
-      let transport = makeProbeTransport(c)
-      d.probeEngine.addInterface(
-        index, d.trackers[ti].name, d.trackers[ti].device,
-        targets, isV6, transport,
-        c.reliability, int(c.count),
-        latencyThreshold = if c.checkQuality and c.latencyThreshold > 0:
-                             some(uint32(c.latencyThreshold)) else: none(uint32),
-        lossThreshold = if c.checkQuality and c.lossThreshold > 0:
-                          some(uint32(c.lossThreshold)) else: none(uint32),
-        recoveryLatency = if c.checkQuality and c.recoveryLatency > 0:
-                            some(uint32(c.recoveryLatency)) else: none(uint32),
-        recoveryLoss = if c.checkQuality and c.recoveryLoss > 0:
-                         some(uint32(c.recoveryLoss)) else: none(uint32),
-        qualityWindowSize = int(c.qualityWindow),
-        probeSize = int(c.probeSize),
-      )
+  d.registerProbeSockets()
 
-    # Schedule first probe
-    d.timers.push(TimerEntry(
-      deadline: getMonoTime() + initDuration(seconds = 1),
-      kind: tkProbe,
-      index: index,
-    ))
-
-  # Register probe socket fds with selector
-  for (slot, fd) in d.probeEngine.getFds():
-    d.selector.registerHandle(fd.int, {Read}, ProbeTokenBase + slot)
-  for name in d.probeEngine.invalidFdInterfaces:
-    error fmt"probe socket creation failed for interface '{name}' — probes will not work"
-
-  # Set up routes and DNS for initial_state=online interfaces
   for index in onlineIndices:
     d.addRoutes(index)
     d.updateDns(index)
 
-  # Generate initial nftables
   d.regenerateNftables()
 
-  # Create status directories and write initial status files
   var names: seq[string]
   for t in d.trackers: names.add(t.name)
   d.statusFiles.createDirs(names)
@@ -974,11 +987,7 @@ proc reloadTeardown(ctx: var ReloadContext,
   timers.cancelAll({tkIpcTimeout})
 
   # Deregister probe sockets from selector
-  for (slot, fd) in probeEngine.getFds():
-    try:
-      selector.unregister(fd.int)
-    except CatchableError:
-      discard
+  deregisterProbeSockets(probeEngine, selector)
 
   # Remove all interfaces from probe engine
   var probeIndices: seq[int]
@@ -1073,47 +1082,13 @@ proc reloadReinitSubsystems(ctx: ReloadContext, d: var Daemon) =
   for t in d.trackers: names.add(t.name)
   d.statusFiles.createDirs(names)
 
-  # Re-register probes
+  # Re-register probes using shared helper
   for t in d.trackers:
     let cfg = d.configForIndex(t.index)
     if cfg.isNone: continue
-    let c = cfg.get
+    d.setupProbeForInterface(t, cfg.get)
 
-    let ipv6Ok = d.config.globals.ipv6Enabled
-    let isV6 = c.family == afIpv6 or (c.family == afBoth and ipv6Ok)
-    var targets: seq[string]
-    for ip in c.trackIp:
-      if not ipv6Ok and ':' in ip: continue
-      targets.add(ip)
-
-    if targets.len > 0:
-      let transport = makeProbeTransport(c)
-      d.probeEngine.addInterface(
-        t.index, t.name, t.device, targets, isV6, transport,
-        c.reliability, int(c.count),
-        latencyThreshold = if c.checkQuality and c.latencyThreshold > 0:
-                             some(uint32(c.latencyThreshold)) else: none(uint32),
-        lossThreshold = if c.checkQuality and c.lossThreshold > 0:
-                          some(uint32(c.lossThreshold)) else: none(uint32),
-        recoveryLatency = if c.checkQuality and c.recoveryLatency > 0:
-                            some(uint32(c.recoveryLatency)) else: none(uint32),
-        recoveryLoss = if c.checkQuality and c.recoveryLoss > 0:
-                         some(uint32(c.recoveryLoss)) else: none(uint32),
-        qualityWindowSize = int(c.qualityWindow),
-        probeSize = int(c.probeSize),
-      )
-
-    d.timers.push(TimerEntry(
-      deadline: getMonoTime() + initDuration(seconds = 1),
-      kind: tkProbe,
-      index: t.index,
-    ))
-
-  # Register probe sockets with selector
-  for (slot, fd) in d.probeEngine.getFds():
-    d.selector.registerHandle(fd.int, {Read}, ProbeTokenBase + slot)
-  for name in d.probeEngine.invalidFdInterfaces:
-    error fmt"probe socket creation failed for interface '{name}' — probes will not work"
+  d.registerProbeSockets()
 
   # Restore routes and DNS for active interfaces
   for t in d.trackers:
@@ -1168,15 +1143,18 @@ proc shutdown(d: var Daemon) =
   d.ipcServer.close()
 
   # 3. Deregister probe FDs from selector, then close all probe sockets
-  for (slot, fd) in d.probeEngine.getFds():
-    try: d.selector.unregister(fd.int)
-    except CatchableError: discard
+  deregisterProbeSockets(d.probeEngine, d.selector)
   d.probeEngine.closeAll()
 
   # 4. Close conntrack netlink socket (if opened)
   d.conntrackMgr.close()
 
-  # 5. Remove routes/rules (uses routeManager — must be before routeManager.close)
+  # 5. Clean up DNS
+  for t in d.trackers:
+    d.dnsManager.removeInterface(t.name)
+  d.dnsManager.apply()
+
+  # 6. Remove routes/rules (uses routeManager — must be before routeManager.close)
   const AF_INET = uint8(2)
   const AF_INET6 = uint8(10)
 
