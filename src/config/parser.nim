@@ -14,41 +14,56 @@ type
 
 func get*(s: UciSection, key: string): string =
   ## Return first value for key, or "" if missing.
-  if key in s.options and s.options[key].len > 0:
-    return s.options[key][0]
-  return ""
+  let vals = s.options.getOrDefault(key)
+  if vals.len > 0: vals[0] else: ""
 
 func getAll*(s: UciSection, key: string): seq[string] =
   ## Return all values for key, or empty seq if missing.
-  if key in s.options:
-    return s.options[key]
-  return @[]
+  s.options.getOrDefault(key)
 
-proc getU32*(s: UciSection, key: string, default: uint32): uint32 =
-  ## Parse a uint32 from the first value of key, or return default.
+func tryU32*(s: UciSection, key: string): Option[uint32] {.raises: [].} =
+  ## Pure parse: returns none if absent or invalid.
   let v = s.get(key)
-  if v == "":
-    return default
+  if v == "": return none[uint32]()
   try:
     let parsed = parseUInt(v)
-    if parsed > uint32.high:
-      return default
-    return uint32(parsed)
+    if parsed > uint32.high: none[uint32]()
+    else: some(uint32(parsed))
   except ValueError:
-    return default
+    none[uint32]()
 
-func getBool*(s: UciSection, key: string, default: bool): bool =
-  ## Parse a boolean value. Recognizes 1/yes/true/on and 0/no/false/off.
+func tryBool*(s: UciSection, key: string): Option[bool] {.raises: [].} =
+  ## Pure parse: returns none if absent or unrecognized.
   let v = s.get(key).toLowerAscii()
-  if v == "":
-    return default
+  if v == "": return none[bool]()
   case v
-  of "1", "yes", "true", "on":
-    return true
-  of "0", "no", "false", "off":
-    return false
-  else:
-    return default
+  of "1", "yes", "true", "on": some(true)
+  of "0", "no", "false", "off": some(false)
+  else: none[bool]()
+
+proc warnInvalidValue(sectionType, name, key, value, default: string) =
+  ## Log a warning about an invalid config value.
+  warn sectionType & " '" & name & "': invalid value '" & value & "' for '" & key & "', using default " & default
+
+proc getU32*(s: UciSection, key: string, default: uint32): uint32 =
+  ## Parse uint32 with automatic warning on invalid values.
+  ## Context (section type/name) derived from UciSection.
+  let opt = s.tryU32(key)
+  if opt.isSome: return opt.get
+  let v = s.get(key)
+  if v != "":
+    warnInvalidValue(s.sectionType, s.name, key, v, $default)
+  default
+
+proc getBool*(s: UciSection, key: string, default: bool): bool =
+  ## Parse boolean with automatic warning on invalid values.
+  ## Context derived from UciSection.
+  let opt = s.tryBool(key)
+  if opt.isSome: return opt.get
+  let v = s.get(key)
+  if v != "":
+    warnInvalidValue(s.sectionType, s.name, key, v, $default)
+  default
 
 func stripQuotes*(s: string): string =
   ## Strip matching single or double quotes from start and end.
