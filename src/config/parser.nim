@@ -382,8 +382,7 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
   validateName("interface", sec.name)
   result.name = sec.name
 
-  # mwan3 field migration: warn AND apply old values under new names
-  var sec = sec  # mutable local copy for field migration
+  # Reject mwan3 field names with clear guidance
   const mwan3Renames = [
     ("interval", "probe_interval"),
     ("timeout", "probe_timeout"),
@@ -392,23 +391,17 @@ proc parseInterface*(sec: UciSection): InterfaceConfig =
     ("size", "probe_size"),
     ("failure_latency", "latency_threshold"),
     ("failure_loss", "loss_threshold"),
+    ("httping_ssl", "track_method 'https'"),
+    ("list_type", ""),
   ]
   for (oldName, newName) in mwan3Renames:
     if sec.get(oldName) != "":
-      if sec.get(newName) == "":
-        warn fmt"interface '{sec.name}': mwan3 option '{oldName}' migrated to '{newName}'"
-        sec.options[newName] = sec.options.getOrDefault(oldName)
+      if newName != "":
+        raise newException(ConfigError,
+          fmt"interface '{sec.name}': unknown option '{oldName}' — use '{newName}' instead (run 'nopal migrate' to convert mwan3 configs)")
       else:
-        warn fmt"interface '{sec.name}': mwan3 option '{oldName}' ignored ('{newName}' already set)"
-  if sec.get("httping_ssl") != "":
-    if sec.get("track_method") == "":
-      warn fmt"interface '{sec.name}': 'httping_ssl' migrated to track_method 'https'"
-      sec.options["track_method"] = @["https"]
-    else:
-      warn fmt"interface '{sec.name}': 'httping_ssl' ignored (track_method already set)"
-
-  if sec.get("list_type") != "":
-    warn fmt"interface '{sec.name}': 'list_type' is an mwan3 field, ignored by nopal"
+        raise newException(ConfigError,
+          fmt"interface '{sec.name}': unknown mwan3 option '{oldName}' — not supported by nopal")
 
   result.enabled = sec.getBool("enabled", result.enabled)
 
