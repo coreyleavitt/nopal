@@ -430,9 +430,12 @@ proc regenerateNftables(d: var Daemon) =
 
   if d.connectedNetworksDirty:
     d.connectedNetworksDirty = false
-    # Connected networks will be populated by route table dumps when available
-    # For now, use basic loopback and link-local prefixes
-    d.connectedNetworks = @["127.0.0.0/8", "::1/128"]
+    let r = d.routeManager.getConnectedNetworks()
+    if r.ok:
+      d.connectedNetworks = r.value
+    else:
+      warn "failed to dump connected networks: " & $r.error
+      d.connectedNetworks = @["127.0.0.0/8", "::1/128"]
 
   let rs = buildRuleset(
     interfaces, policies, d.cachedRules, d.connectedNetworks,

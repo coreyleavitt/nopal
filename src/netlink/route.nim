@@ -4,7 +4,7 @@
 ## All operations use a single NETLINK_ROUTE socket with sequence numbering.
 ## Returns NlResult for all operations — callers decide error policy.
 
-import std/[posix, os, monotimes, times]
+import std/[posix, os, monotimes, times, strutils]
 import ../linux_constants
 import ../errors
 import ./socket
@@ -406,8 +406,116 @@ proc getAddresses*(m: var RouteManager, ifindex: uint32,
       res
   )
 
+# ---------------------------------------------------------------------------
+# getConnectedNetworks
+# ---------------------------------------------------------------------------
+
+func formatIpv4Cidr(ip: openArray[byte], prefixLen: uint8): string {.raises: [].} =
+  ## Format raw IPv4 bytes + prefix length as CIDR string.
+  if ip.len < 4: return ""
+  $ip[0] & "." & $ip[1] & "." & $ip[2] & "." & $ip[3] & "/" & $prefixLen
+
+func formatIpv6Cidr(ip: openArray[byte], prefixLen: uint8): string {.raises: [].} =
+  ## Format raw IPv6 bytes + prefix length as CIDR string.
+  if ip.len < 16: return ""
+  var parts: array[8, string]
+  for i in 0 ..< 8:
+    let val = (uint16(ip[i * 2]) shl 8) or uint16(ip[i * 2 + 1])
+    parts[i] = val.toHex(4).toLowerAscii().strip(chars = {'0'}, trailing = false)
+    if parts[i].len == 0: parts[i] = "0"
+  var s = parts[0]
+  for i in 1 ..< 8:
+    s &= ":" & parts[i]
+  s & "/" & $prefixLen
+
+proc getConnectedNetworksFamily(m: var RouteManager,
+                                family: uint8): NlResult[seq[string]] {.raises: [].} =
+  ## Dump connected (scope-link) routes for one address family.
+  let rtm = RtMsg(
+    rtmFamily: family,
+    rtmDstLen: 0, rtmSrcLen: 0, rtmTos: 0,
+    rtmTable: 0, rtmProtocol: 0, rtmScope: 0, rtmType: 0, rtmFlags: 0,
+  )
+  var payloadBuf: seq[byte]
+  writeStruct(payloadBuf, rtm)
+
+  m.foldDump(newSeq[string](), RTM_GETROUTE.uint16, payloadBuf,
+    proc(acc: sink seq[string], msg: DumpMsg): seq[string] {.raises: [].} =
+      var res = acc
+      if msg.hdr.nlmsgType != RTM_NEWROUTE.uint16:
+        return res
+      if msg.payload.len < sizeof(RtMsg):
+        return res
+
+      let rtmMsg = readStruct[RtMsg](msg.payload, 0)
+
+      # Filter: scope-link routes (directly connected subnets)
+      if rtmMsg.rtmScope != RT_SCOPE_LINK:
+        return res
+      if rtmMsg.rtmType != RTN_UNICAST:
+        return res
+      # Skip routes with no destination (default routes)
+      if rtmMsg.rtmDstLen == 0:
+        return res
+
+      # Extract RTA_DST attribute
+      let attrStart = nlmsgAlign(sizeof(RtMsg))
+      for (attrType, s) in nlAttrs(msg.payload, attrStart):
+        if attrType == RTA_DST.uint16:
+          let addrLen = s.b - s.a + 1
+          let expectedLen = if family == AF_INET: 4 else: 16
+          if addrLen >= expectedLen:
+            let cidr = if family == AF_INET:
+              formatIpv4Cidr(msg.payload[s.a ..< s.a + expectedLen], rtmMsg.rtmDstLen)
+            else:
+              formatIpv6Cidr(msg.payload[s.a ..< s.a + expectedLen], rtmMsg.rtmDstLen)
+            if cidr.len > 0:
+              res.add(cidr)
+          break
+
+      res
+  )
+
+proc getConnectedNetworks*(m: var RouteManager): NlResult[seq[string]] {.raises: [].} =
+  ## Dump all connected networks (scope-link routes) from the kernel routing table.
+  ## Returns CIDRs for directly connected subnets. Always includes loopback fallbacks.
+  var networks: seq[string] = @["127.0.0.0/8"]
+
+  let r4 = m.getConnectedNetworksFamily(AF_INET)
+  if r4.ok:
+    for cidr in r4.value:
+      if cidr notin networks:
+        networks.add(cidr)
+
+  let r6 = m.getConnectedNetworksFamily(AF_INET6)
+  if r6.ok:
+    for cidr in r6.value:
+      if cidr notin networks:
+        networks.add(cidr)
+  elif networks.len == 1:
+    # Only loopback so far — add IPv6 loopback fallback
+    networks.add("::1/128")
+
+  # Ensure IPv6 loopback is present
+  if "::1/128" notin networks:
+    networks.add("::1/128")
+
+  nlOk(networks)
+
 when isMainModule:
   import std/unittest
+
+  suite "IP CIDR formatting":
+    test "formatIpv4Cidr":
+      check formatIpv4Cidr([192'u8, 168, 1, 0], 24) == "192.168.1.0/24"
+      check formatIpv4Cidr([10'u8, 0, 0, 0], 8) == "10.0.0.0/8"
+
+    test "formatIpv6Cidr":
+      var ip: array[16, byte]
+      ip[0] = 0xfd; ip[1] = 0x00
+      let cidr = formatIpv6Cidr(ip, 48)
+      check cidr.startsWith("fd00:")
+      check cidr.endsWith("/48")
 
   suite "toNlResult mapping":
     test "ok maps to success":
