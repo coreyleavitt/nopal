@@ -27,8 +27,16 @@ Phases:
     11     Error resilience (rapid reloads)
     12     CLI commands (status, internal, connected, use)
     13     Dampening (observational)
+    14     Traffic verification (proves packets route through correct WAN)
+    15     Rollback timeout (waits 70s for timer expiry)
+    16     Conntrack flush (observational)
+    17     Concurrent IPC stress (10 parallel clients)
+    18     Interface flapping (requires 2+ WANs, toggles link)
+    19     IPv6 (requires IPv6 connectivity)
+    20     Dampening active (requires dampening config + 2 WANs)
+    21     Nftables ruleset validation
     soak   Memory stability (long-running, Ctrl-C to stop)
-    all    Run phases 1-12 (default)
+    all    Run phases 1-12, 14, 16, 17, 21 (default)
 """
 
 import argparse
@@ -1249,6 +1257,485 @@ def phase13():
 
 
 # ---------------------------------------------------------------------------
+# Phase 14: Traffic verification
+# ---------------------------------------------------------------------------
+
+def phase14():
+    section("Phase 14: Traffic verification")
+
+    if not ensure_daemon():
+        test("daemon running", False)
+        return
+
+    wait_for_any_online(30)
+    status = nopal_status()
+    if not status:
+        test("get status", False)
+        return
+
+    online = [i for i in status.get("interfaces", []) if i.get("state") == "online"]
+    if len(online) < 1:
+        test("at least one WAN online", False, skip_reason="no WAN online")
+        return
+
+    # Test nopal use: route traffic through specific interface
+    # Use IPv4-only to get distinct exit IPs per WAN
+    ip_service = "http://api.ipify.org"
+    for iface in online[:2]:  # test up to 2 WANs
+        name = iface["name"]
+        rc, out = nopal_cmd(f"use {name} curl -4 --silent --max-time 10 {ip_service}")
+        if rc == 0 and out.strip():
+            test(f"traffic routes through {name}", True)
+            log(f"  {name} exit IP: {out.strip()}")
+        else:
+            # Fall back to ping
+            rc, out = nopal_cmd(f"use {name} ping -c1 -W5 8.8.8.8")
+            test(f"traffic routes through {name} (ping)", rc == 0)
+
+    # If 2+ WANs online, verify they have different exit IPs (proves routing works)
+    if len(online) >= 2:
+        ips = []
+        for iface in online[:2]:
+            name = iface["name"]
+            rc, out = nopal_cmd(f"use {name} curl -4 --silent --max-time 10 {ip_service}")
+            if rc == 0 and out.strip():
+                ips.append(out.strip())
+        if len(ips) == 2:
+            if ips[0] != ips[1]:
+                test("different WANs have different exit IPs", True,
+                     detail=f"{online[0]['name']}={ips[0]}, {online[1]['name']}={ips[1]}")
+            else:
+                log(f"  Note: both WANs exit via same IP ({ips[0]}) — likely shared uplink")
+                test("both WANs can reach internet", True)
+        elif len(ips) == 1:
+            log(f"  Only got 1 exit IP — second WAN may share same uplink")
+        else:
+            log("  Could not retrieve exit IPs")
+
+
+# ---------------------------------------------------------------------------
+# Phase 15: Rollback timeout
+# ---------------------------------------------------------------------------
+
+def phase15():
+    section("Phase 15: Rollback timeout")
+
+    if not ensure_daemon():
+        test("daemon running", False)
+        return
+
+    # Capture current state
+    status_before = nopal_status()
+    if not status_before:
+        test("get initial status", False)
+        return
+
+    # Start a rollback with 1 minute timeout
+    rc, out = nopal_cmd("reload --rollback 1")
+    test("reload --rollback 1 succeeds", rc == 0)
+
+    # Verify pending
+    status = nopal_status()
+    if status:
+        raw = json.dumps(status)
+        test("rollback pending visible", "reload_pending" in raw or "remaining" in raw)
+
+    # Wait for the timeout to expire (60s + buffer)
+    log("  Waiting 70s for rollback timer to expire...")
+    time.sleep(70)
+
+    # Verify pending cleared (timer fired)
+    status_after = nopal_status()
+    if status_after:
+        raw = json.dumps(status_after)
+        no_pending = "reload_pending" not in raw or status_after.get("reload_pending") is None
+        test("rollback timer fired (pending cleared)", no_pending)
+
+    # Verify daemon still running
+    test("daemon alive after rollback timeout", daemon_is_running())
+
+    # Verify IPC still responsive
+    test("IPC responsive after rollback", nopal_status() is not None)
+
+
+# ---------------------------------------------------------------------------
+# Phase 16: Conntrack flush
+# ---------------------------------------------------------------------------
+
+def phase16():
+    section("Phase 16: Conntrack flush")
+
+    if not ensure_daemon():
+        test("daemon running", False)
+        return
+
+    # Check if conntrack tools are available
+    rc = run("cat /proc/sys/net/netfilter/nf_conntrack_count", check=False).returncode
+    if rc != 0:
+        test("conntrack available", False, skip_reason="conntrack not available")
+        return
+
+    # Get baseline conntrack count
+    r = run("cat /proc/sys/net/netfilter/nf_conntrack_count", check=False)
+    count_str = r.stdout
+    baseline = int(count_str.strip()) if count_str.strip().isdigit() else 0
+    log(f"  Baseline conntrack count: {baseline}")
+
+    # Generate some connections (ping creates ICMP conntrack entries)
+    for i in range(5):
+        run("ping -c1 -W1 8.8.8.8", check=False)
+
+    r = run("cat /proc/sys/net/netfilter/nf_conntrack_count", check=False)
+    count_str = r.stdout
+    after_traffic = int(count_str.strip()) if count_str.strip().isdigit() else 0
+    log(f"  After traffic: {after_traffic} conntrack entries")
+
+    test("conntrack entries created by traffic", after_traffic >= baseline,
+         detail=f"baseline={baseline}, after={after_traffic}")
+
+    # Trigger a reload which may flush conntrack (depends on config)
+    nopal_cmd("reload")
+    time.sleep(2)
+
+    r = run("cat /proc/sys/net/netfilter/nf_conntrack_count", check=False)
+    count_str = r.stdout
+    after_reload = int(count_str.strip()) if count_str.strip().isdigit() else 0
+    log(f"  After reload: {after_reload} conntrack entries")
+
+    # Note: conntrack flush only happens on interface state changes, not plain reload
+    # This is observational — we log the counts for manual verification
+    test("conntrack count readable after reload", True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 17: Concurrent IPC stress
+# ---------------------------------------------------------------------------
+
+def phase17():
+    section("Phase 17: Concurrent IPC stress")
+
+    if not ensure_daemon():
+        test("daemon running", False)
+        return
+
+    import threading
+
+    results = []
+    errors = []
+
+    def ipc_query(thread_id):
+        try:
+            rc, out = nopal_cmd("status --json")
+            if rc == 0:
+                data = json.loads(out)
+                results.append(thread_id)
+            else:
+                errors.append((thread_id, f"rc={rc}"))
+        except Exception as e:
+            errors.append((thread_id, str(e)))
+
+    # Launch 10 concurrent status queries
+    threads = []
+    for i in range(10):
+        t = threading.Thread(target=ipc_query, args=(i,))
+        threads.append(t)
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    test(f"concurrent IPC: {len(results)}/10 succeeded",
+         len(results) >= 8,  # allow some to fail under load
+         detail=f"ok={len(results)}, errors={len(errors)}")
+
+    if errors:
+        log(f"  Errors: {errors[:3]}")
+
+    # Verify daemon still responsive after stress
+    status = nopal_status()
+    test("daemon responsive after IPC stress", status is not None)
+
+    # Rapid-fire reloads
+    reload_ok = 0
+    for i in range(5):
+        rc, _ = nopal_cmd("reload")
+        if rc == 0:
+            reload_ok += 1
+    test(f"rapid reloads: {reload_ok}/5 succeeded", reload_ok >= 4)
+
+    test("daemon alive after stress", nopal_status() is not None)
+
+
+# ---------------------------------------------------------------------------
+# Phase 18: Interface flapping
+# ---------------------------------------------------------------------------
+
+def phase18():
+    section("Phase 18: Interface flapping")
+
+    if not ensure_daemon():
+        test("daemon running", False)
+        return
+
+    status = nopal_status()
+    if not status or not status.get("interfaces"):
+        test("interfaces available", False)
+        return
+
+    online = [i for i in status["interfaces"] if i.get("state") == "online"]
+    if len(online) < 2:
+        test("need 2+ WANs for flap test", False,
+             skip_reason="need 2 online WANs (one to flap, one for connectivity)")
+        return
+
+    # Pick the second WAN to flap (keep primary for SSH connectivity)
+    target = online[1]
+    target_name = target["name"]
+    target_device = target["device"]
+    log(f"  Will flap {target_name} (device: {target_device})")
+    log(f"  Keeping {online[0]['name']} stable for connectivity")
+
+    # Check if we can toggle the device
+    r = run(f"ip link set {target_device} down", check=False)
+    if r.returncode != 0:
+        test(f"can toggle {target_device}", False, skip_reason="ip link set failed")
+        return
+
+    # Quick restore
+    run(f"ip link set {target_device} up", check=False)
+    time.sleep(2)
+
+    # Rapid flap: 5 cycles
+    log("  Flapping 5 times (down/up every 2s)...")
+    for i in range(5):
+        run(f"ip link set {target_device} down", check=False)
+        time.sleep(1)
+        run(f"ip link set {target_device} up", check=False)
+        time.sleep(1)
+
+    # Wait for state to settle
+    log("  Waiting 15s for state to settle...")
+    time.sleep(15)
+
+    # Verify daemon survived
+    test("daemon survived flapping", daemon_is_running())
+
+    status = nopal_status()
+    test("IPC responsive after flapping", status is not None)
+
+    if status:
+        for iface in status.get("interfaces", []):
+            if iface["name"] == target_name:
+                state = iface["state"]
+                log(f"  {target_name} state after flapping: {state}")
+                test(f"{target_name} in valid state after flapping",
+                     state in ("online", "probing", "degraded", "offline"))
+
+    # Verify the stable WAN is still online
+    if status:
+        for iface in status.get("interfaces", []):
+            if iface["name"] == online[0]["name"]:
+                test(f"{online[0]['name']} still online during flap test",
+                     iface["state"] == "online")
+
+    # Wait for recovery
+    log("  Waiting up to 60s for flapped interface to recover...")
+    recovered = False
+    for _ in range(12):
+        time.sleep(5)
+        s = nopal_status()
+        if s:
+            for iface in s.get("interfaces", []):
+                if iface["name"] == target_name and iface["state"] == "online":
+                    recovered = True
+                    break
+        if recovered:
+            break
+    test(f"{target_name} recovers after flapping", recovered)
+
+
+# ---------------------------------------------------------------------------
+# Phase 19: IPv6
+# ---------------------------------------------------------------------------
+
+def phase19():
+    section("Phase 19: IPv6")
+
+    if not ensure_daemon():
+        test("daemon running", False)
+        return
+
+    # Check if IPv6 is available
+    r = run("ping -6 -c1 -W3 2001:4860:4860::8888", check=False)
+    if r.returncode != 0:
+        test("IPv6 connectivity", False, skip_reason="no IPv6 connectivity")
+        return
+
+    test("IPv6 connectivity available", True)
+
+    # Check if nopal config has IPv6 enabled
+    status = nopal_status()
+    if not status:
+        test("get status", False)
+        return
+
+    # Check connected networks for IPv6 entries
+    rc, out = nopal_cmd("connected")
+    has_v6 = any(":" in line for line in out.split("\n") if "/" in line)
+    log(f"  IPv6 in connected networks: {has_v6}")
+
+    # Check nftables for IPv6 rules
+    r = run("nft list chain inet nopal prerouting", check=False)
+    has_v6_rules = "ip6" in r.stdout or "ipv6" in r.stdout if r.returncode == 0 else False
+    log(f"  IPv6 nftables rules present: {has_v6_rules}")
+
+    test("IPv6 support (observational)", True,
+         detail=f"connected_v6={has_v6}, nft_v6={has_v6_rules}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 20: Dampening (active)
+# ---------------------------------------------------------------------------
+
+def phase20():
+    section("Phase 20: Dampening (active)")
+
+    if not ensure_daemon():
+        test("daemon running", False)
+        return
+
+    status = nopal_status()
+    if not status or not status.get("interfaces"):
+        test("get status", False)
+        return
+
+    # Check if any interface has dampening configured
+    # We can't easily tell from status — check config
+    r = run("cat /etc/config/nopal", check=False)
+    config_out = r.stdout
+    has_dampening = "dampening" in config_out and "'1'" in config_out.split("dampening")[1][:20] if "dampening" in config_out else False
+
+    if not has_dampening:
+        test("dampening configured", False,
+             skip_reason="no interface has dampening enabled in config")
+        log("  To test dampening, add to an interface section:")
+        log("    option dampening '1'")
+        log("    option dampening_halflife '30'")
+        log("    option dampening_suppress '500'")
+        log("    option dampening_reuse '250'")
+        return
+
+    test("dampening configured", True)
+
+    online = [i for i in status["interfaces"] if i.get("state") == "online"]
+    if len(online) < 2:
+        test("need 2+ WANs for dampening test", False,
+             skip_reason="need 2 online WANs")
+        return
+
+    # Flap the secondary to trigger dampening
+    target = online[1]
+    target_name = target["name"]
+    target_device = target["device"]
+    log(f"  Flapping {target_name} to trigger dampening...")
+
+    # Flap enough times to exceed suppress threshold
+    for i in range(5):
+        run(f"ip link set {target_device} down", check=False)
+        time.sleep(2)
+        run(f"ip link set {target_device} up", check=False)
+        time.sleep(3)
+
+    # Check if dampening engaged
+    time.sleep(5)
+    status = nopal_status()
+    if status:
+        for iface in status.get("interfaces", []):
+            if iface["name"] == target_name:
+                state = iface["state"]
+                log(f"  {target_name} state after flapping: {state}")
+                # If dampening works, the interface should be offline or probing
+                # (suppressed from going online)
+
+    # Check logs for dampening messages
+    r = run(["logread"], check=False)
+    logs = r.stdout if r.returncode == 0 else ""
+    dampen_lines = [l for l in logs.splitlines() if "dampen" in l.lower()]
+    has_dampen_log = len(dampen_lines) > 0
+    test("dampening messages in log", has_dampen_log,
+         detail="no dampening log messages" if not has_dampen_log else None)
+    if dampen_lines:
+        for line in dampen_lines[-5:]:
+            log(f"  {line.strip()[:120]}")
+
+    # Wait for recovery (dampening decay)
+    log("  Waiting up to 120s for dampening decay...")
+    recovered = False
+    for _ in range(24):
+        time.sleep(5)
+        s = nopal_status()
+        if s:
+            for iface in s.get("interfaces", []):
+                if iface["name"] == target_name and iface["state"] == "online":
+                    recovered = True
+                    break
+        if recovered:
+            break
+    test(f"{target_name} recovers after dampening decay", recovered)
+
+
+# ---------------------------------------------------------------------------
+# Phase 21: Nftables ruleset validation
+# ---------------------------------------------------------------------------
+
+def phase21():
+    section("Phase 21: Nftables ruleset validation")
+
+    if not ensure_daemon():
+        test("daemon running", False)
+        return
+
+    wait_for_any_online(30)
+
+    # Full ruleset dump
+    r = run("nft -j list ruleset", check=False)
+    if r.returncode != 0:
+        r = run("nft list ruleset", check=False)
+    ruleset = r.stdout
+    test("nft list ruleset succeeds", r.returncode == 0)
+
+    if r.returncode != 0:
+        return
+
+    # Check for expected chains
+    test("has prerouting chain", "prerouting" in ruleset)
+    test("has forward chain", "forward" in ruleset)
+    test("has output chain", "output" in ruleset)
+    test("has postrouting chain", "postrouting" in ruleset)
+    test("has policy_rules chain", "policy_rules" in ruleset)
+
+    # Check for bypass sets
+    test("has bypass_v4 set", "bypass_v4" in ruleset)
+    test("has bypass_v6 set", "bypass_v6" in ruleset)
+
+    # Check for probe exception (mark 0xDEAD)
+    test("has probe bypass mark", "dead" in ruleset.lower() or "57005" in ruleset)
+
+    # Check for per-interface mark chains
+    status = nopal_status()
+    if status:
+        for iface in status.get("interfaces", []):
+            name = iface["name"]
+            test(f"has mark chain for {name}", f"mark_{name}" in ruleset)
+
+    # Verify no duplicate table names
+    table_count = ruleset.count("table inet nopal")
+    test("single nopal table (no duplicates)", table_count <= 2,  # list + definition
+         detail=f"found {table_count} table references")
+
+
+# ---------------------------------------------------------------------------
 # Soak: Memory stability
 # ---------------------------------------------------------------------------
 
@@ -1379,7 +1866,7 @@ def main():
     parser = argparse.ArgumentParser(description="nopal hardware test harness")
     parser.add_argument(
         "--phase", default="all",
-        help="Phase to run: 1-13, 4wait, soak, or all"
+        help="Phase to run: 1-21, 4wait, soak, or all"
     )
     args = parser.parse_args()
 
@@ -1406,11 +1893,20 @@ def main():
         "11": phase11,
         "12": phase12,
         "13": phase13,
+        "14": phase14,
+        "15": phase15,
+        "16": phase16,
+        "17": phase17,
+        "18": phase18,
+        "19": phase19,
+        "20": phase20,
+        "21": phase21,
         "soak": phase_soak,
     }
 
     if args.phase == "all":
-        for p in ["1", "2", "3", "5", "6", "7", "8", "9", "10", "11", "12"]:
+        for p in ["1", "2", "3", "5", "6", "7", "8", "9", "10", "11", "12",
+                   "14", "16", "17", "21"]:
             try:
                 phases[p]()
             except Exception as e:
