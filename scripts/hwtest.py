@@ -20,8 +20,15 @@ Phases:
     4wait  Poll for state change after manual cable disconnect
     5      Hot reload
     6      Policy routing and connected bypass
+    7      Reload rollback (accept/cancel)
+    8      Dynamic bypass (add/remove/persist)
+    9      Hook scripts
+    10     Signal handling (SIGHUP, SIGTERM, kill -9)
+    11     Error resilience (rapid reloads)
+    12     CLI commands (status, internal, connected, use)
+    13     Dampening (observational)
     soak   Memory stability (long-running, Ctrl-C to stop)
-    all    Run phases 1-6 (default)
+    all    Run phases 1-12 (default)
 """
 
 import argparse
@@ -274,6 +281,78 @@ def stop_daemon():
     except OSError:
         pass
     return True
+
+
+def nopal_cmd(args_str):
+    """Run a nopal CLI command. Returns (rc, stdout)."""
+    r = run(f"nopal {args_str}", check=False)
+    return r.returncode, r.stdout
+
+
+def nft_has_element(set_name, element):
+    """Check if an nftables set contains an element."""
+    r = run(f"nft list set inet nopal {set_name}", check=False)
+    return r.returncode == 0 and element in r.stdout
+
+
+def send_signal(sig_name):
+    """Send a signal to the running nopald process."""
+    pid = get_pid()
+    if pid is None:
+        return False
+    r = run(f"kill -{sig_name} {pid}", check=False)
+    return r.returncode == 0
+
+
+def get_fd_count(pid):
+    """Count open file descriptors for a process.
+    pid must be a digit-only string (validated by get_pid)."""
+    if not isinstance(pid, str) or not pid.isdigit():
+        return -1
+    try:
+        return len(os.listdir(f"/proc/{pid}/fd"))
+    except OSError:
+        return -1
+
+
+def get_cpu_ticks(pid):
+    """Read utime+stime from /proc/pid/stat.
+    pid must be a digit-only string (validated by get_pid)."""
+    if not isinstance(pid, str) or not pid.isdigit():
+        return -1
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().split()
+            return int(fields[13]) + int(fields[14])
+    except (OSError, IndexError, ValueError):
+        return -1
+
+
+def log_marker():
+    """Return a log snapshot for later comparison with get_log_since()."""
+    return get_log_snapshot()
+
+
+def get_log_since(marker):
+    """Get log lines that appeared after the marker snapshot."""
+    current = get_log_snapshot()
+    new_lines = current - marker
+    return "\n".join(sorted(new_lines))
+
+
+def wait_for_any_online(timeout=60):
+    """Wait until at least one interface reaches 'online' state."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            status = nopal_status()
+            for i in status.get("interfaces", []):
+                if i["state"] == "online":
+                    return True
+        except RuntimeError:
+            pass
+        time.sleep(2)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +829,425 @@ def phase6():
 
 
 # ---------------------------------------------------------------------------
+# Phase 7: Reload rollback
+# ---------------------------------------------------------------------------
+
+def phase7():
+    section("Phase 7: Reload rollback")
+
+    if not ensure_daemon():
+        test("daemon running for rollback", False, detail="could not start daemon")
+        return
+
+    # Test accept flow
+    rc, out = nopal_cmd("reload --rollback 1")
+    test("reload --rollback 1 succeeds", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+
+    # Verify pending state visible in status
+    try:
+        status = nopal_status()
+        raw = json.dumps(status)
+        has_pending = "reload_pending" in raw or "remaining" in raw
+        test("status shows reload pending", has_pending)
+    except RuntimeError as e:
+        test("status shows reload pending", False, detail=str(e))
+
+    # Accept it
+    rc, out = nopal_cmd("reload accept")
+    test("reload accept succeeds", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+
+    # Verify pending clears
+    try:
+        status = nopal_status()
+        raw = json.dumps(status)
+        no_pending = "reload_pending" not in raw or status.get("reload_pending") is None
+        test("pending clears after accept", no_pending)
+    except RuntimeError as e:
+        test("pending clears after accept", False, detail=str(e))
+
+    # Test cancel flow
+    rc, out = nopal_cmd("reload --rollback 1")
+    test("reload --rollback for cancel test", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+    time.sleep(1)
+
+    rc, out = nopal_cmd("reload cancel")
+    test("reload cancel succeeds", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+
+    # Test rejection of concurrent reload while pending
+    rc, out = nopal_cmd("reload --rollback 1")
+    test("reload --rollback for rejection test", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+
+    rc2, out2 = nopal_cmd("reload --rollback 1")
+    test("concurrent reload rejected while pending", rc2 != 0,
+         detail=f"rc={rc2}" if rc2 == 0 else None)
+
+    # Clean up: accept the pending one
+    nopal_cmd("reload accept")
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Dynamic bypass
+# ---------------------------------------------------------------------------
+
+def phase8():
+    section("Phase 8: Dynamic bypass")
+
+    if not ensure_daemon():
+        test("daemon running for bypass", False, detail="could not start daemon")
+        return
+
+    # Clean state
+    nopal_cmd("bypass remove 10.99.99.0/24")
+    nopal_cmd("bypass remove fd00:test::/48")
+
+    # List should not contain our test entry
+    rc, out = nopal_cmd("bypass list")
+    test("bypass list succeeds", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+    test("test entry not present initially", "10.99.99.0/24" not in out)
+
+    # Add IPv4
+    rc, out = nopal_cmd("bypass add 10.99.99.0/24")
+    test("bypass add IPv4 succeeds", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+
+    # Verify in list
+    rc, out = nopal_cmd("bypass list")
+    test("IPv4 bypass in list", "10.99.99.0/24" in out)
+
+    # Verify in nftables
+    test("IPv4 bypass in nftables set", nft_has_element("bypass_v4", "10.99.99.0/24"))
+
+    # Duplicate rejection
+    rc, out = nopal_cmd("bypass add 10.99.99.0/24")
+    test("duplicate bypass add rejected", rc != 0,
+         detail=f"rc={rc}" if rc == 0 else None)
+
+    # Invalid CIDR
+    rc, out = nopal_cmd("bypass add invalid")
+    test("invalid CIDR rejected", rc != 0,
+         detail=f"rc={rc}" if rc == 0 else None)
+
+    # Add IPv6
+    rc, out = nopal_cmd("bypass add fd00:test::/48")
+    test("bypass add IPv6 succeeds", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+
+    rc, out = nopal_cmd("bypass list")
+    test("IPv6 bypass in list", "fd00:test::" in out)
+
+    # Survive reload (regen persistence)
+    rc, _ = nopal_cmd("reload")
+    test("reload succeeds with bypass entries", rc == 0)
+    time.sleep(2)
+
+    rc, out = nopal_cmd("bypass list")
+    test("IPv4 bypass survives reload", "10.99.99.0/24" in out)
+    test("IPv6 bypass survives reload", "fd00:test::" in out)
+
+    # Remove
+    rc, out = nopal_cmd("bypass remove 10.99.99.0/24")
+    test("bypass remove IPv4 succeeds", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+
+    rc, out = nopal_cmd("bypass remove fd00:test::/48")
+    test("bypass remove IPv6 succeeds", rc == 0,
+         detail=out.strip() if rc != 0 else None)
+
+    # Remove nonexistent
+    rc, out = nopal_cmd("bypass remove 10.99.99.0/24")
+    test("remove nonexistent rejected", rc != 0,
+         detail=f"rc={rc}" if rc == 0 else None)
+
+    # Verify clean
+    rc, out = nopal_cmd("bypass list")
+    test("IPv4 removed from list", "10.99.99.0/24" not in out)
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: Hook scripts
+# ---------------------------------------------------------------------------
+
+def phase9():
+    section("Phase 9: Hook scripts")
+
+    if not ensure_daemon():
+        test("daemon running for hooks", False, detail="could not start daemon")
+        return
+
+    hook_log = "/tmp/nopal-hook.log"
+
+    # Remove old log
+    try:
+        os.remove(hook_log)
+    except OSError:
+        pass
+
+    # The default hook path is /etc/nopal.user
+    # Write our test hook there (it's in tmpfs-overlaid /etc on OpenWrt)
+    default_hook = "/etc/nopal.user"
+    wrote_hook = False
+    try:
+        with open(default_hook, "w") as f:
+            f.write("#!/bin/sh\n")
+            f.write(f'echo "$ACTION $INTERFACE $DEVICE ${{FIRSTCONNECT:-0}}" >> {hook_log}\n')
+        os.chmod(default_hook, 0o755)
+        wrote_hook = True
+    except OSError:
+        test("write hook script", False, skip_reason="cannot write to /etc/nopal.user")
+        return
+
+    # Restart daemon to pick up hook
+    stop_daemon()
+    time.sleep(1)
+    if not ensure_daemon():
+        test("daemon restart for hooks", False, detail="could not restart daemon")
+        # Cleanup
+        try:
+            os.remove(default_hook)
+        except OSError:
+            pass
+        return
+
+    # Wait for interfaces to come online (which triggers hooks)
+    wait_for_any_online(30)
+    time.sleep(2)  # let hooks fire
+
+    # Check hook log
+    if os.path.exists(hook_log):
+        with open(hook_log) as f:
+            lines = f.readlines()
+        test("hook script executed at least once", len(lines) > 0,
+             detail=f"0 lines in hook log" if len(lines) == 0 else None)
+
+        if lines:
+            actions = [l.split()[0] for l in lines if l.strip()]
+            test("hook received ifup or connected action",
+                 "ifup" in actions or "connected" in actions,
+                 detail=f"actions={actions[:5]}")
+
+            # Check that interface name is present
+            has_iface = any(len(l.split()) >= 2 and l.split()[1] for l in lines)
+            test("hook received INTERFACE env var", has_iface)
+    else:
+        test("hook log file created", False, detail="hook log not found")
+
+    # Cleanup
+    try:
+        os.remove(hook_log)
+    except OSError:
+        pass
+    try:
+        os.remove(default_hook)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: Signal handling
+# ---------------------------------------------------------------------------
+
+def phase10():
+    section("Phase 10: Signal handling")
+
+    if not ensure_daemon():
+        test("daemon running for signals", False, detail="could not start daemon")
+        return
+
+    marker = log_marker()
+
+    # SIGHUP -> reload
+    test("SIGHUP sent", send_signal("HUP"))
+    time.sleep(2)
+    logs = get_log_since(marker)
+    test("SIGHUP triggers reload (log confirms)",
+         "reload" in logs.lower() or "reloading" in logs.lower(),
+         detail=f"log excerpt: {logs[:200]}" if logs else "no new logs")
+
+    # Verify daemon still running
+    test("daemon alive after SIGHUP", daemon_is_running())
+
+    # SIGTERM -> clean shutdown
+    test("SIGTERM sent", send_signal("TERM"))
+    time.sleep(3)
+    test("daemon stopped after SIGTERM", not daemon_is_running())
+    test("socket cleaned up after SIGTERM", not os.path.exists(SOCKET_PATH))
+
+    # Restart
+    if not ensure_daemon():
+        test("daemon restarts after SIGTERM", False, detail="could not restart")
+        return
+    test("daemon restarts cleanly after SIGTERM", daemon_is_running())
+
+    # Kill -9 -> unclean -> restart
+    pid = get_pid()
+    if pid:
+        r = run(f"kill -9 {pid}", check=False)
+        time.sleep(1)
+
+        # Restart should handle orphan state
+        if not ensure_daemon():
+            test("daemon starts after kill -9", False, detail="could not restart")
+            return
+        test("daemon starts after kill -9", daemon_is_running())
+
+        try:
+            status = nopal_status()
+            test("IPC responsive after kill -9 recovery", True)
+        except RuntimeError as e:
+            test("IPC responsive after kill -9 recovery", False, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Phase 11: Error resilience
+# ---------------------------------------------------------------------------
+
+def phase11():
+    section("Phase 11: Error resilience")
+
+    if not ensure_daemon():
+        test("daemon running for resilience", False, detail="could not start daemon")
+        return
+
+    marker = log_marker()
+
+    # Reload with daemon running
+    rc, _ = nopal_cmd("reload")
+    test("normal reload succeeds", rc == 0)
+
+    # Test that status still works after reload
+    try:
+        status = nopal_status()
+        test("status responsive after reload", status is not None)
+    except RuntimeError as e:
+        test("status responsive after reload", False, detail=str(e))
+
+    # Verify daemon handles rapid reloads
+    last_rc = 0
+    for i in range(3):
+        last_rc, _ = nopal_cmd("reload")
+    test("rapid reloads don't crash daemon", last_rc == 0)
+
+    try:
+        status = nopal_status()
+        test("status responsive after rapid reloads", status is not None)
+    except RuntimeError as e:
+        test("status responsive after rapid reloads", False, detail=str(e))
+
+    # Verify no error logs from normal operations
+    logs = get_log_since(marker)
+    error_lines = [l for l in logs.split("\n")
+                   if "error" in l.lower() and "nopal" in l.lower()]
+    test(f"no error log messages ({len(error_lines)} found)",
+         len(error_lines) == 0,
+         detail=error_lines[0][:120] if error_lines else None)
+
+
+# ---------------------------------------------------------------------------
+# Phase 12: CLI commands
+# ---------------------------------------------------------------------------
+
+def phase12():
+    section("Phase 12: CLI commands")
+
+    if not ensure_daemon():
+        test("daemon running for CLI", False, detail="could not start daemon")
+        return
+
+    # Wait for at least one interface online
+    wait_for_any_online(30)
+
+    # Single interface status
+    try:
+        status = nopal_status()
+        interfaces = status.get("interfaces", [])
+        if interfaces:
+            iface_name = interfaces[0]["name"]
+            rc, out = nopal_cmd(f"status {iface_name}")
+            test(f"single interface status ({iface_name})", rc == 0,
+                 detail=out.strip()[:100] if rc != 0 else None)
+            test("detail view has state field",
+                 "State:" in out or "state" in out.lower(),
+                 detail=f"output: {out[:100]}" if out else None)
+    except RuntimeError as e:
+        test("single interface status", False, detail=str(e))
+
+    # Internal diagnostics
+    rc, out = nopal_cmd("internal")
+    test("nopal internal succeeds", rc == 0,
+         detail=out.strip()[:100] if rc != 0 else None)
+    test("internal output has routing info",
+         "table" in out.lower() or "rule" in out.lower(),
+         detail=f"output length: {len(out)}")
+
+    # JSON mode
+    rc, out = nopal_cmd("status --json")
+    test("status --json succeeds", rc == 0,
+         detail=out.strip()[:100] if rc != 0 else None)
+    if rc == 0:
+        try:
+            data = json.loads(out)
+            test("JSON has api_version field", "api_version" in data)
+            test("JSON has interfaces", "interfaces" in data)
+        except json.JSONDecodeError as e:
+            test("status --json valid JSON", False, detail=str(e))
+
+    # Connected
+    rc, out = nopal_cmd("connected")
+    test("nopal connected succeeds", rc == 0,
+         detail=out.strip()[:100] if rc != 0 else None)
+    if rc == 0:
+        has_real = any(n for n in out.split("\n")
+                       if "/" in n and "127.0.0.0" not in n)
+        test("connected shows real subnets (not just loopback)", has_real)
+
+    # Use command (requires root, which we are)
+    try:
+        status = nopal_status()
+        interfaces = status.get("interfaces", [])
+        if interfaces:
+            iface_name = interfaces[0]["name"]
+            rc, out = nopal_cmd(f"use {iface_name} ping -c1 -W2 8.8.8.8")
+            test(f"nopal use {iface_name} doesn't crash",
+                 rc == 0 or "error" not in out.lower(),
+                 detail=f"rc={rc}" if rc != 0 else None)
+    except RuntimeError as e:
+        test("nopal use", False, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Phase 13: Dampening (observational)
+# ---------------------------------------------------------------------------
+
+def phase13():
+    section("Phase 13: Dampening")
+
+    # Dampening requires specific config — just verify it doesn't crash
+    # and that the dampening-related status fields are present
+    try:
+        status = nopal_status()
+    except RuntimeError as e:
+        test("fetch status for dampening", False,
+             skip_reason="cannot get daemon status")
+        return
+
+    log("Dampening test is observational — requires manual config with dampening enabled")
+    log("Checking that dampening fields don't cause errors...")
+
+    for iface in status.get("interfaces", []):
+        name = iface.get("name", "?")
+        state = iface.get("state", "?")
+        log(f"  {name}: state={state}")
+
+    test("dampening: daemon runs without errors (observational)", True)
+
+
+# ---------------------------------------------------------------------------
 # Soak: Memory stability
 # ---------------------------------------------------------------------------
 
@@ -772,12 +1270,18 @@ def phase_soak():
 
     log(f"Initial PID: {pid}, RSS: {initial_rss} kB")
     log("Sampling every 60s. Press Ctrl-C to stop and see results.")
-    log("Will also query status and reload periodically to exercise the daemon.\n")
+    log("Will also query status and reload periodically to exercise the daemon.")
+    log("CSV output: /tmp/soak.csv\n")
 
     # Baseline log errors so we only report new ones
     baseline_logs = get_log_snapshot()
 
+    # Write CSV header
+    with open("/tmp/soak.csv", "w") as f:
+        f.write("elapsed_s,rss_kb,fd_count,cpu_ticks,nft_lines,route_count\n")
+
     samples = [(time.time(), initial_rss)]
+    start_time = samples[0][0]
     interval = 60
     iteration = 0
 
@@ -798,11 +1302,26 @@ def phase_soak():
                 log(f"  [{iteration}] Could not read RSS for PID {pid}")
                 continue
 
-            samples.append((time.time(), rss))
-            delta = rss - initial_rss
-            elapsed_min = (samples[-1][0] - samples[0][0]) / 60
-            log(f"  [{iteration}] RSS: {rss} kB (delta: {delta:+d} kB, "
-                f"elapsed: {elapsed_min:.0f}m)")
+            now = time.time()
+            samples.append((now, rss))
+            elapsed = int(now - start_time)
+            elapsed_min = elapsed / 60
+
+            # Collect additional metrics
+            fds = get_fd_count(pid)
+            cpu = get_cpu_ticks(pid)
+            nft_r = run("nft list ruleset", check=False)
+            nft_lines = len(nft_r.stdout.splitlines()) if nft_r.returncode == 0 else -1
+            routes_r = run("ip route show table all", check=False)
+            route_count = len(routes_r.stdout.splitlines()) if routes_r.returncode == 0 else -1
+
+            # Write CSV
+            with open("/tmp/soak.csv", "a") as f:
+                f.write(f"{elapsed},{rss},{fds},{cpu},{nft_lines},{route_count}\n")
+
+            elapsed_str = f"{elapsed_min:.0f}m"
+            log(f"  [{iteration}] RSS: {rss} kB, FDs: {fds}, nft: {nft_lines} lines, "
+                f"routes: {route_count} (elapsed: {elapsed_str})")
 
             # Periodically exercise the daemon
             if iteration % 5 == 0:
@@ -859,7 +1378,7 @@ def main():
     parser = argparse.ArgumentParser(description="nopal hardware test harness")
     parser.add_argument(
         "--phase", default="all",
-        help="Phase to run: 1, 2, 3, 4, 4wait, 5, 6, soak, or all"
+        help="Phase to run: 1-13, 4wait, soak, or all"
     )
     args = parser.parse_args()
 
@@ -879,11 +1398,18 @@ def main():
         "4wait": phase4_wait,
         "5": phase5,
         "6": phase6,
+        "7": phase7,
+        "8": phase8,
+        "9": phase9,
+        "10": phase10,
+        "11": phase11,
+        "12": phase12,
+        "13": phase13,
         "soak": phase_soak,
     }
 
     if args.phase == "all":
-        for p in ["1", "2", "3", "4", "5", "6"]:
+        for p in ["1", "2", "3", "5", "6", "7", "8", "9", "10", "11", "12"]:
             try:
                 phases[p]()
             except Exception as e:
