@@ -529,9 +529,26 @@ proc cliBypass(socketPath: string, args: seq[string]) =
     stderr.writeLine "usage: nopal bypass add|remove|list [network]"
     quit(1)
 
+# Module-level state for nopal use cleanup (needed for signal handler)
+var useCleanupCmd4 {.global.}: string
+var useCleanupCmd6 {.global.}: string
+
+proc useCleanupHandler() {.noconv.} =
+  if useCleanupCmd4.len > 0:
+    discard execCmd(useCleanupCmd4)
+  if useCleanupCmd6.len > 0:
+    discard execCmd(useCleanupCmd6)
+  quit(1)
+
 proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
   ## Run a command with traffic routed through a specific interface.
   ## Adds uidrange ip rules, runs the command, cleans up rules on exit.
+  ## Three layers of cleanup: normal exit, signal handler, delete-before-add on next run.
+
+  # Root check — ip rule manipulation requires CAP_NET_ADMIN
+  if getuid() != 0:
+    stderr.writeLine "error: 'nopal use' requires root (ip rule manipulation needs CAP_NET_ADMIN)"
+    quit(1)
 
   # Query daemon for interface table_id and device
   let req = IpcRequest(id: 1, rpcMethod: "interface.status",
@@ -551,6 +568,10 @@ proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
   let uidRange = fmt"{uid}-{uid}"
   let tableStr = $tableId
 
+  # Delete-before-add: clean up stale rules from a possible previous crash
+  discard execCmd(fmt"ip -4 rule del uidrange {uidRange} lookup {tableStr} prio 1 2>/dev/null")
+  discard execCmd(fmt"ip -6 rule del uidrange {uidRange} lookup {tableStr} prio 1 2>/dev/null")
+
   # Add IPv4 uidrange ip rule (required)
   var v4Added, v6Added = false
   let v4ret = execCmd(fmt"ip -4 rule add uidrange {uidRange} lookup {tableStr} prio 1")
@@ -562,6 +583,11 @@ proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
   # Try IPv6 rule (tolerate failure — IPv6 may be disabled)
   let v6ret = execCmd(fmt"ip -6 rule add uidrange {uidRange} lookup {tableStr} prio 1")
   v6Added = v6ret == 0
+
+  # Install signal handler for cleanup on SIGTERM/SIGINT
+  useCleanupCmd4 = fmt"ip -4 rule del uidrange {uidRange} lookup {tableStr} prio 1 2>/dev/null"
+  useCleanupCmd6 = fmt"ip -6 rule del uidrange {uidRange} lookup {tableStr} prio 1 2>/dev/null"
+  setControlCHook(useCleanupHandler)
 
   # Run user command with DEVICE and INTERFACE added to inherited env
   var exitCode = 1
@@ -577,9 +603,9 @@ proc cliUse(socketPath: string, iface: string, cmdArgs: seq[string]) =
 
   # Cleanup rules (always, even on error)
   if v4Added:
-    discard execCmd(fmt"ip -4 rule del uidrange {uidRange} lookup {tableStr} prio 1")
+    discard execCmd(fmt"ip -4 rule del uidrange {uidRange} lookup {tableStr} prio 1 2>/dev/null")
   if v6Added:
-    discard execCmd(fmt"ip -6 rule del uidrange {uidRange} lookup {tableStr} prio 1")
+    discard execCmd(fmt"ip -6 rule del uidrange {uidRange} lookup {tableStr} prio 1 2>/dev/null")
 
   quit(exitCode)
 
@@ -668,6 +694,11 @@ proc runCli(args: seq[string]) =
 
   while i < args.len:
     let a = args[i]
+    if positional.len > 0:
+      # Command already identified — all remaining args belong to it
+      positional.add a
+      inc i
+      continue
     case a
     of "-s", "--socket":
       inc i

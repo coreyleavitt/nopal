@@ -1283,7 +1283,7 @@ def phase14():
     ip_service = "http://api.ipify.org"
     for iface in online[:2]:  # test up to 2 WANs
         name = iface["name"]
-        rc, out = nopal_cmd(f"use {name} curl -4 --silent --max-time 10 {ip_service}")
+        rc, out = nopal_cmd(f"use {name} curl -4 -s --max-time 10 {ip_service}")
         if rc == 0 and out.strip():
             test(f"traffic routes through {name}", True)
             log(f"  {name} exit IP: {out.strip()}")
@@ -1297,7 +1297,7 @@ def phase14():
         ips = []
         for iface in online[:2]:
             name = iface["name"]
-            rc, out = nopal_cmd(f"use {name} curl -4 --silent --max-time 10 {ip_service}")
+            rc, out = nopal_cmd(f"use {name} curl -4 -s --max-time 10 {ip_service}")
             if rc == 0 and out.strip():
                 ips.append(out.strip())
         if len(ips) == 2:
