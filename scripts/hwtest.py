@@ -1015,8 +1015,9 @@ def phase9():
         return
 
     # Wait for interfaces to come online (which triggers hooks)
-    wait_for_any_online(30)
-    time.sleep(2)  # let hooks fire
+    # Hooks fire on state transitions — need to wait for probes to complete
+    wait_for_any_online(45)
+    time.sleep(5)  # let hooks fire and write to log
 
     # Check hook log
     if os.path.exists(hook_log):
