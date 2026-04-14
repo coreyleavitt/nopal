@@ -13,7 +13,7 @@ define Package/nopal
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Multi-WAN manager
-  DEPENDS:=+nftables
+  DEPENDS:=+nftables +ip-full +kmod-nft-ct +kmod-nft-fib +kmod-nft-numgen
 endef
 
 define Package/nopal/description

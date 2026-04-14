@@ -3,7 +3,7 @@
 
 Runs on the OpenWrt device itself. Exercises daemon lifecycle, health probes,
 failover, hot reload, policy routing, and memory stability.
-Uses `nopal status --json` for assertions.
+Uses `nopal -j status` for assertions.
 
 Usage:
     # Install python3 (uses tmpfs overlay, doesn't eat flash)
@@ -83,7 +83,7 @@ def run(cmd, check=True, capture=True, timeout=60):
 
 def nopal_status(iface=None):
     """Get daemon status as parsed JSON."""
-    cmd = ["nopal", "status", "--json"]
+    cmd = ["nopal", "-j", "status"]
     if iface:
         if not is_valid_iface_name(iface):
             raise RuntimeError(f"invalid interface name: {iface!r}")
@@ -92,7 +92,7 @@ def nopal_status(iface=None):
     try:
         return json.loads(r.stdout)
     except (json.JSONDecodeError, ValueError) as e:
-        raise RuntimeError(f"invalid JSON from 'nopal status --json': {e}\n{r.stdout[:200]}")
+        raise RuntimeError(f"invalid JSON from 'nopal -j status': {e}\n{r.stdout[:200]}")
 
 
 def get_pid():
@@ -1195,8 +1195,8 @@ def phase12():
          detail=f"output length: {len(out)}")
 
     # JSON mode
-    rc, out = nopal_cmd("status --json")
-    test("status --json succeeds", rc == 0,
+    rc, out = nopal_cmd("-j status")
+    test("nopal -j status succeeds", rc == 0,
          detail=out.strip()[:100] if rc != 0 else None)
     if rc == 0:
         try:
@@ -1204,7 +1204,7 @@ def phase12():
             test("JSON has api_version field", "api_version" in data)
             test("JSON has interfaces", "interfaces" in data)
         except json.JSONDecodeError as e:
-            test("status --json valid JSON", False, detail=str(e))
+            test("nopal -j status valid JSON", False, detail=str(e))
 
     # Connected
     rc, out = nopal_cmd("connected")
@@ -1425,7 +1425,7 @@ def phase17():
 
     def ipc_query(thread_id):
         try:
-            rc, out = nopal_cmd("status --json")
+            rc, out = nopal_cmd("-j status")
             if rc == 0:
                 data = json.loads(out)
                 results.append(thread_id)
