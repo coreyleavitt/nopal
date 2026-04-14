@@ -26,6 +26,8 @@ type
     ifindex*: uint32
     family*: uint8
     table*: uint32
+    gateway*: array[16, byte]  ## Raw gateway IP (4 bytes IPv4, 16 bytes IPv6)
+    hasGateway*: bool
 
   RouteMonitor* = object
     sock: NetlinkSocket
@@ -82,11 +84,13 @@ proc processEvents*(m: var RouteMonitor, changes: var seq[RouteChange]) =
       if family != AF_INET and family != AF_INET6:
         continue
 
-      # Scan attributes for table and OIF
+      # Scan attributes for table, OIF, and gateway
       let attrStart = msgStart + nlmsgAlign(sizeof(RtMsg))
       var routeTable = uint32(rtm.rtmTable)
       var oif: uint32 = 0
       var hasOif = false
+      var gw: array[16, byte]
+      var hasGw = false
 
       for (attrType, s) in nlAttrs(m.recvBuf[0 ..< msgEnd], attrStart):
         if attrType == RTA_TABLE.uint16:
@@ -94,6 +98,12 @@ proc processEvents*(m: var RouteMonitor, changes: var seq[RouteChange]) =
         elif attrType == RTA_OIF.uint16:
           oif = attrU32(m.recvBuf[0 ..< msgEnd], s)
           hasOif = true
+        elif attrType == RTA_GATEWAY.uint16:
+          let gwLen = if family == AF_INET: 4 else: 16
+          let buf = m.recvBuf[0 ..< msgEnd]
+          if s.a + gwLen <= buf.len:
+            copyMem(addr gw[0], unsafeAddr buf[s.a], gwLen)
+            hasGw = true
 
       # Only main table (254)
       if routeTable != RT_TABLE_MAIN_U32:
@@ -116,7 +126,8 @@ proc processEvents*(m: var RouteMonitor, changes: var seq[RouteChange]) =
           inc i
 
       changes.add(RouteChange(
-        kind: kind, ifindex: oif, family: family, table: routeTable))
+        kind: kind, ifindex: oif, family: family, table: routeTable,
+        gateway: gw, hasGateway: hasGw))
 
     of RTM_NEWADDR.uint16, RTM_DELADDR.uint16:
       # Parse address message

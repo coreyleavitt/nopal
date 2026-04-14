@@ -22,8 +22,6 @@ type
 
   Effect* = enum
     efRegenerateNftables
-    efAddRoutes
-    efRemoveRoutes
     efUpdateDns
     efRemoveDns
     efBroadcastEvent
@@ -115,11 +113,11 @@ func applyFailurePenalty*(snap: DampeningSnapshot): DampeningSnapshot {.raises: 
 # ---------------------------------------------------------------------------
 
 const
-  # Going online: add to routing
-  OnlineEffects = {efAddRoutes, efRegenerateNftables, efUpdateDns,
+  # Going online: join policy routing
+  OnlineEffects = {efRegenerateNftables, efUpdateDns,
                    efBroadcastEvent, efWriteStatus}
-  # Going offline: remove from routing
-  OfflineEffects = {efRemoveRoutes, efRegenerateNftables, efRemoveDns,
+  # Going offline: leave policy routing
+  OfflineEffects = {efRegenerateNftables, efRemoveDns,
                     efBroadcastEvent, efWriteStatus, efFlushConntrack}
   # No route changes (degraded ↔ online, probing → offline)
   StatusOnlyEffects = {efBroadcastEvent, efWriteStatus}
@@ -127,7 +125,7 @@ const
   LinkUpEffects = {efCancelProbeTimers, efResetProbeCounters,
                    efScheduleFirstProbe, efBroadcastEvent, efWriteStatus}
   # Link down: go offline, cancel probes
-  LinkDownEffects = {efRemoveRoutes, efRegenerateNftables, efRemoveDns,
+  LinkDownEffects = {efRegenerateNftables, efRemoveDns,
                      efCancelProbeTimers, efFlushConntrack,
                      efBroadcastEvent, efWriteStatus}
 
@@ -370,7 +368,6 @@ when isMainModule:
       check d.transitioned
       check d.newState == isOnline
       check d.newSuccessCount == 3
-      check efAddRoutes in d.effects
       check efRegenerateNftables in d.effects
       check efUpdateDns in d.effects
       check efBroadcastEvent in d.effects
@@ -381,14 +378,13 @@ when isMainModule:
       let d = decide(snap, probeOk(qualityOk = false))
       check d.transitioned
       check d.newState == isDegraded
-      check efAddRoutes in d.effects
+      check efRegenerateNftables in d.effects
 
     test "degraded recovers to online on good quality":
       let snap = makeSnap(isDegraded, successes = 5)
       let d = decide(snap, probeOk())
       check d.transitioned
       check d.newState == isOnline
-      check efAddRoutes notin d.effects  # routes already present
       check efBroadcastEvent in d.effects
 
     test "degraded stays degraded on bad quality":
@@ -401,8 +397,6 @@ when isMainModule:
       let d = decide(snap, probeOk(qualityOk = false))
       check d.transitioned
       check d.newState == isDegraded
-      check efAddRoutes notin d.effects
-      check efRemoveRoutes notin d.effects
 
     test "online stays online on good quality":
       let snap = makeSnap(isOnline, successes = 10)
@@ -431,7 +425,6 @@ when isMainModule:
       check d.transitioned
       check d.newState == isOffline
       check d.newFailCount == 5
-      check efRemoveRoutes in d.effects
       check efFlushConntrack in d.effects
 
     test "degraded stays degraded before down_count":
@@ -485,7 +478,6 @@ when isMainModule:
       check d.newState == isOffline
       check d.newSuccessCount == 0
       check d.newFailCount == 0
-      check efRemoveRoutes in d.effects
       check efCancelProbeTimers in d.effects
       check efFlushConntrack in d.effects
 
@@ -588,15 +580,20 @@ when isMainModule:
           let d = decide(snap, probeOk())
           check d.newSuccessCount >= succ
 
-    test "addRoutes always paired with regenerateNftables":
+    test "policy-affecting transitions always regenerate nftables":
+      ## Transitions that change policy membership (joining or leaving the
+      ## set of active interfaces) must regenerate nftables. Probing is not
+      ## a policy state, so Init/Offline→Probing doesn't need nftables.
       for state in [isInit, isProbing, isOnline, isDegraded, isOffline]:
         for event in [probeOk(), probeFail(), linkUp(), linkDown()]:
           let snap = makeSnap(state)
           let d = decide(snap, event)
           if d.transitioned:
-            if efAddRoutes in d.effects:
-              check efRegenerateNftables in d.effects
-            if efRemoveRoutes in d.effects:
+            let joining = d.newState in {isOnline, isDegraded} and
+                          state notin {isOnline, isDegraded}
+            let leaving = d.newState in {isOffline, isProbing, isInit} and
+                          state in {isOnline, isDegraded}
+            if joining or leaving:
               check efRegenerateNftables in d.effects
 
     test "dampening suppressed never transitions to online":

@@ -407,6 +407,77 @@ proc getAddresses*(m: var RouteManager, ifindex: uint32,
   )
 
 # ---------------------------------------------------------------------------
+# getDefaultRoutes
+# ---------------------------------------------------------------------------
+
+type
+  DefaultRouteInfo* = object
+    ifindex*: uint32
+    family*: uint8
+    gateway*: array[16, byte]  ## Raw gateway IP (4 bytes for IPv4, 16 for IPv6)
+    metric*: uint32
+
+proc getDefaultRoutes*(m: var RouteManager): NlResult[seq[DefaultRouteInfo]] {.raises: [].} =
+  ## Dump default routes from the main table.
+  ## Returns gateway, OIF ifindex, family, and metric for each.
+  let rtm = RtMsg(
+    rtmFamily: 0,  # both families
+    rtmDstLen: 0, rtmSrcLen: 0, rtmTos: 0,
+    rtmTable: 0, rtmProtocol: 0, rtmScope: 0, rtmType: 0, rtmFlags: 0,
+  )
+  var payloadBuf: seq[byte]
+  writeStruct(payloadBuf, rtm)
+
+  m.foldDump(newSeq[DefaultRouteInfo](), RTM_GETROUTE.uint16, payloadBuf,
+    proc(acc: sink seq[DefaultRouteInfo], msg: DumpMsg): seq[DefaultRouteInfo] {.raises: [].} =
+      var res = acc
+      if msg.hdr.nlmsgType != RTM_NEWROUTE.uint16:
+        return res
+      if msg.payload.len < sizeof(RtMsg):
+        return res
+
+      let rtmMsg = readStruct[RtMsg](msg.payload, 0)
+
+      # Only default routes (dstLen=0), unicast, main table
+      if rtmMsg.rtmDstLen != 0 or rtmMsg.rtmType != RTN_UNICAST:
+        return res
+      let family = rtmMsg.rtmFamily
+      if family != AF_INET and family != AF_INET6:
+        return res
+
+      # Extract attributes
+      let attrStart = nlmsgAlign(sizeof(RtMsg))
+      var routeTable = uint32(rtmMsg.rtmTable)
+      var oif: uint32 = 0
+      var hasOif = false
+      var gw: array[16, byte]
+      var hasGw = false
+      var metric: uint32 = 0
+
+      for (attrType, s) in nlAttrs(msg.payload, attrStart):
+        if attrType == RTA_TABLE.uint16:
+          routeTable = attrU32(msg.payload, s)
+        elif attrType == RTA_OIF.uint16:
+          oif = attrU32(msg.payload, s)
+          hasOif = true
+        elif attrType == RTA_GATEWAY.uint16:
+          let gwLen = if family == AF_INET: 4 else: 16
+          if s.a + gwLen <= msg.payload.len:
+            copyMem(addr gw[0], unsafeAddr msg.payload[s.a], gwLen)
+            hasGw = true
+        elif attrType == RTA_PRIORITY.uint16:
+          metric = attrU32(msg.payload, s)
+
+      # Only main table, must have OIF and gateway
+      if routeTable != uint32(RT_TABLE_MAIN) or not hasOif or not hasGw:
+        return res
+
+      res.add(DefaultRouteInfo(
+        ifindex: oif, family: family, gateway: gw, metric: metric))
+      res
+  )
+
+# ---------------------------------------------------------------------------
 # getConnectedNetworks
 # ---------------------------------------------------------------------------
 

@@ -22,6 +22,7 @@ import ./health/arp
 import ./nftables/marks
 import ./nftables/chains
 import ./nftables/engine as nftEngine
+import ./linux_constants as lc
 import ./netlink/route
 import ./netlink/link
 import ./netlink/monitor
@@ -451,12 +452,15 @@ proc regenerateNftables(d: var Daemon) =
 # Route management
 # =========================================================================
 
-proc addRoutes(d: var Daemon, index: int) =
-  ## Add ip rules and copy default routes for an interface.
+proc installInfraRules(d: var Daemon, index: int) =
+  ## Install all ip rules for one interface: fwmark→table (policy routing)
+  ## and lc.PROBE_MARK→table (probe routing). Called once at init.
+  ## Rules are never removed during normal operation — dead rules are harmless
+  ## because nftables controls which marks are applied.
   if index < 0 or index >= MaxInterfaces: return
   let ti = int(d.trackerIndex[index])
   if ti < 0:
-    error fmt"addRoutes: no tracker for index {index}"
+    error fmt"installInfraRules: no tracker for index {index}"
     return
   let t = d.trackers[ti]
 
@@ -466,52 +470,91 @@ proc addRoutes(d: var Daemon, index: int) =
   const AF_INET = uint8(2)
   const AF_INET6 = uint8(10)
 
+  # Policy routing rules (fwmark→table, priority 100+)
   if family == afIpv4 or family == afBoth:
     let r = d.routeManager.addRule(t.mark, d.config.globals.markMask,
                                    t.tableId, 100 + index.uint32, AF_INET)
     if not r.ok:
-      warn fmt"failed to add IPv4 ip rule for {t.name}: {r.error}"
+      warn fmt"failed to add IPv4 fwmark rule for {t.name}: {r.error}"
 
   if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
     let r = d.routeManager.addRule(t.mark, d.config.globals.markMask,
                                    t.tableId, 100 + index.uint32, AF_INET6)
     if not r.ok:
-      warn fmt"failed to add IPv6 ip rule for {t.name}: {r.error}"
+      warn fmt"failed to add IPv6 fwmark rule for {t.name}: {r.error}"
 
-  info fmt"added routes for {t.name} (mark=0x{t.mark.toHex(4)}, table={t.tableId})"
-
-proc removeRoutes(d: var Daemon, index: int) =
-  ## Delete ip rules and flush routing table for an interface.
-  if index < 0 or index >= MaxInterfaces: return
-  let ti = int(d.trackerIndex[index])
-  if ti < 0:
-    error fmt"removeRoutes: no tracker for index {index}"
-    return
-  let t = d.trackers[ti]
-
-  let cfg = d.configForIndex(index)
-  let family = if cfg.isSome: cfg.get.family else: afIpv4
-
-  const AF_INET = uint8(2)
-  const AF_INET6 = uint8(10)
-
+  # Probe routing rules (lc.PROBE_MARK→table, priority 50+)
+  # SO_BINDTODEVICE + ip rule fallthrough ensures each probe finds its own table.
   if family == afIpv4 or family == afBoth:
-    let r = d.routeManager.delRule(t.mark, d.config.globals.markMask,
-                                   t.tableId, 100 + index.uint32, AF_INET)
+    let r = d.routeManager.addRule(lc.PROBE_MARK, 0xFFFFFFFF'u32,
+                                   t.tableId, 50 + index.uint32, AF_INET)
     if not r.ok:
-      warn fmt"failed to delete IPv4 ip rule for {t.name}: {r.error}"
+      warn fmt"failed to add IPv4 probe rule for {t.name}: {r.error}"
 
   if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
-    let r = d.routeManager.delRule(t.mark, d.config.globals.markMask,
-                                   t.tableId, 100 + index.uint32, AF_INET6)
+    let r = d.routeManager.addRule(lc.PROBE_MARK, 0xFFFFFFFF'u32,
+                                   t.tableId, 50 + index.uint32, AF_INET6)
     if not r.ok:
-      warn fmt"failed to delete IPv6 ip rule for {t.name}: {r.error}"
+      warn fmt"failed to add IPv6 probe rule for {t.name}: {r.error}"
 
-  let r = d.routeManager.flushTableBoth(t.tableId)
+  debug fmt"installed ip rules for {t.name} (mark=0x{t.mark.toHex(4)}, table={t.tableId})"
+
+proc installInterfaceRoute(d: var Daemon, trackerIdx: int,
+                           gateway: openArray[byte], family: uint8) =
+  ## Install a default route in the per-interface routing table.
+  ## Called when a gateway becomes known (init dump or route monitor event).
+  let t = d.trackers[trackerIdx]
+  let r = d.routeManager.addRoute(t.tableId, gateway, t.ifindex, 0, family)
   if not r.ok:
-    warn fmt"failed to flush table {t.tableId} for {t.name}: {r.error}"
+    let familyStr = if family == uint8(2): "IPv4" else: "IPv6"
+    warn fmt"failed to add {familyStr} default route for {t.name}: {r.error}"
+  else:
+    let familyStr = if family == uint8(2): "IPv4" else: "IPv6"
+    info fmt"installed {familyStr} default route for {t.name} (table={t.tableId})"
 
-  info fmt"removed routes for {t.name}"
+proc removeInterfaceRoute(d: var Daemon, trackerIdx: int, family: uint8) =
+  ## Remove a default route from the per-interface routing table.
+  ## Called when a gateway disappears (route monitor event).
+  let t = d.trackers[trackerIdx]
+  let r = d.routeManager.delRoute(t.tableId, family)
+  if not r.ok:
+    let familyStr = if family == uint8(2): "IPv4" else: "IPv6"
+    debug fmt"failed to remove {familyStr} default route for {t.name}: {r.error}"
+
+proc cleanupInfraRoutes(d: var Daemon, index: int) =
+  ## Remove all ip rules and flush routing table for an interface.
+  ## Called on shutdown and hot-reload interface removal.
+  if index < 0 or index >= MaxInterfaces: return
+  let ti = int(d.trackerIndex[index])
+  if ti < 0: return
+  let t = d.trackers[ti]
+
+  let cfg = d.configForIndex(index)
+  let family = if cfg.isSome: cfg.get.family else: afIpv4
+
+  const AF_INET = uint8(2)
+  const AF_INET6 = uint8(10)
+
+  # Remove fwmark rules
+  if family == afIpv4 or family == afBoth:
+    discard d.routeManager.delRule(t.mark, d.config.globals.markMask,
+                                   t.tableId, 100 + index.uint32, AF_INET)
+
+  if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
+    discard d.routeManager.delRule(t.mark, d.config.globals.markMask,
+                                   t.tableId, 100 + index.uint32, AF_INET6)
+
+  # Remove probe routing rules
+  if family == afIpv4 or family == afBoth:
+    discard d.routeManager.delRule(lc.PROBE_MARK, 0xFFFFFFFF'u32,
+                                   t.tableId, 50 + index.uint32, AF_INET)
+
+  if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
+    discard d.routeManager.delRule(lc.PROBE_MARK, 0xFFFFFFFF'u32,
+                                   t.tableId, 50 + index.uint32, AF_INET6)
+
+  # Flush routing table
+  discard d.routeManager.flushTableBoth(t.tableId)
 
 # =========================================================================
 # DNS management
@@ -617,10 +660,6 @@ proc executeEffects(d: var Daemon, trackerIdx: int, decision: StateDecision,
     case effect
     of efRegenerateNftables:
       d.nftablesDirty = true
-    of efAddRoutes:
-      d.addRoutes(index)
-    of efRemoveRoutes:
-      d.removeRoutes(index)
     of efUpdateDns:
       d.updateDns(index)
     of efRemoveDns:
@@ -784,6 +823,7 @@ proc handleLinkEvents(d: var Daemon) =
 
 proc handleRouteEvents(d: var Daemon) =
   ## Process route and address change events from netlink monitor.
+  ## Default route changes update per-interface routing tables reactively.
   d.routeChangeBuf.setLen(0)
   d.routeMonitor.processEvents(d.routeChangeBuf)
 
@@ -791,18 +831,33 @@ proc handleRouteEvents(d: var Daemon) =
 
   for change in d.routeChangeBuf:
     case change.kind
-    of rckRouteAdd, rckRouteDel:
-      # Find tracker whose ifindex matches
-      var found = false
-      for t in d.trackers:
-        if t.ifindex != 0 and t.ifindex == change.ifindex:
-          if t.state == isOnline or t.state == isDegraded:
-            debug fmt"{t.name}: route change detected (family={change.family})"
-            d.connectedNetworksDirty = true
-          found = true
+    of rckRouteAdd:
+      # Find tracker whose ifindex matches and install per-interface route
+      for ti in 0 ..< d.trackers.len:
+        if d.trackers[ti].ifindex != 0 and d.trackers[ti].ifindex == change.ifindex:
+          if change.hasGateway:
+            if change.family == uint8(2):  # AF_INET
+              d.trackers[ti].gateway4[0 ..< 4] = change.gateway[0 ..< 4]
+              d.trackers[ti].hasGateway4 = true
+            else:
+              d.trackers[ti].gateway6 = change.gateway
+              d.trackers[ti].hasGateway6 = true
+            let gwLen = if change.family == uint8(2): 4 else: 16
+            d.installInterfaceRoute(ti, change.gateway[0 ..< gwLen], change.family)
+          d.connectedNetworksDirty = true
+          break
+    of rckRouteDel:
+      # Find tracker whose ifindex matches and remove per-interface route
+      for ti in 0 ..< d.trackers.len:
+        if d.trackers[ti].ifindex != 0 and d.trackers[ti].ifindex == change.ifindex:
+          if change.family == uint8(2):  # AF_INET
+            d.trackers[ti].hasGateway4 = false
+          else:
+            d.trackers[ti].hasGateway6 = false
+          d.removeInterfaceRoute(ti, change.family)
+          d.connectedNetworksDirty = true
           break
     of rckAddrAdd, rckAddrDel:
-      # Address changes may require source rule updates
       d.connectedNetworksDirty = true
 
 proc handleProbeTimer(d: var Daemon, index: int) =
@@ -935,10 +990,36 @@ proc initializeInterfaces(d: var Daemon) =
 
     d.setupProbeForInterface(d.trackers[ti], c)
 
+  # Install ip rules for ALL interfaces (infrastructure — never removed)
+  for ti in 0 ..< d.trackers.len:
+    d.installInfraRules(d.trackers[ti].index)
+
+  # Query ubus for interface gateways and install per-interface table routes.
+  # netifd only installs the winning default route in the kernel, so we can't
+  # rely on netlink route dumps to find gateways for non-primary interfaces.
+  var ifaceNames: seq[string]
+  for t in d.trackers: ifaceNames.add(t.name)
+  let gateways = getInterfaceGateways(ifaceNames)
+  for gw in gateways:
+    for ti in 0 ..< d.trackers.len:
+      if d.trackers[ti].name == gw.name:
+        if gw.gateway4.len > 0:
+          var gwBytes: array[16, byte]
+          if parseIpToBytes(gw.gateway4, gwBytes):
+            d.trackers[ti].gateway4[0 ..< 4] = gwBytes[0 ..< 4]
+            d.trackers[ti].hasGateway4 = true
+            d.installInterfaceRoute(ti, gwBytes[0 ..< 4], uint8(2))
+        if gw.gateway6.len > 0:
+          var gwBytes: array[16, byte]
+          if parseIpToBytes(gw.gateway6, gwBytes):
+            d.trackers[ti].gateway6 = gwBytes
+            d.trackers[ti].hasGateway6 = true
+            d.installInterfaceRoute(ti, gwBytes, uint8(10))
+        break
+
   d.registerProbeSockets()
 
   for index in onlineIndices:
-    d.addRoutes(index)
     d.updateDns(index)
 
   d.regenerateNftables()
@@ -1118,10 +1199,34 @@ proc reloadReinitSubsystems(ctx: ReloadContext, d: var Daemon) =
 
   d.registerProbeSockets()
 
-  # Restore routes and DNS for active interfaces
+  # Install infrastructure ip rules for all interfaces
+  for ti in 0 ..< d.trackers.len:
+    d.installInfraRules(d.trackers[ti].index)
+
+  # Query ubus for interface gateways and install per-interface table routes
+  var ifaceNames: seq[string]
+  for t in d.trackers: ifaceNames.add(t.name)
+  let gateways = getInterfaceGateways(ifaceNames)
+  for gw in gateways:
+    for ti in 0 ..< d.trackers.len:
+      if d.trackers[ti].name == gw.name:
+        if gw.gateway4.len > 0:
+          var gwBytes: array[16, byte]
+          if parseIpToBytes(gw.gateway4, gwBytes):
+            d.trackers[ti].gateway4[0 ..< 4] = gwBytes[0 ..< 4]
+            d.trackers[ti].hasGateway4 = true
+            d.installInterfaceRoute(ti, gwBytes[0 ..< 4], uint8(2))
+        if gw.gateway6.len > 0:
+          var gwBytes: array[16, byte]
+          if parseIpToBytes(gw.gateway6, gwBytes):
+            d.trackers[ti].gateway6 = gwBytes
+            d.trackers[ti].hasGateway6 = true
+            d.installInterfaceRoute(ti, gwBytes, uint8(10))
+        break
+
+  # Restore DNS for active interfaces
   for t in d.trackers:
     if t.state == isOnline or t.state == isDegraded:
-      d.addRoutes(t.index)
       d.updateDns(t.index)
 
   d.regenerateNftables()
@@ -1136,10 +1241,9 @@ proc handleReload(d: var Daemon) =
 
   if reloadFastPath(ctx, d): return
 
-  # Remove routes for active interfaces (needs var Daemon)
+  # Clean up infrastructure routes for all interfaces
   for t in d.trackers:
-    if t.state == isOnline or t.state == isDegraded:
-      d.removeRoutes(t.index)
+    d.cleanupInfraRoutes(t.index)
 
   reloadTeardown(ctx, d.probeEngine, d.selector, d.dnsManager,
                  d.trackers, d.timers)
@@ -1159,10 +1263,9 @@ proc performRollback(d: var Daemon) =
   # Cancel the confirmation timer
   d.timers.cancelByIndex(0, {tkReloadConfirm})
 
-  # Teardown current state
+  # Clean up infrastructure routes for all interfaces
   for t in d.trackers:
-    if t.state == isOnline or t.state == isDegraded:
-      d.removeRoutes(t.index)
+    d.cleanupInfraRoutes(t.index)
 
   var ctx = ReloadContext(newConfig: saved.oldConfig)
   reloadTeardown(ctx, d.probeEngine, d.selector, d.dnsManager,
@@ -1344,29 +1447,8 @@ proc shutdown(d: var Daemon) =
   d.dnsManager.apply()
 
   # 6. Remove routes/rules (uses routeManager — must be before routeManager.close)
-  const AF_INET = uint8(2)
-  const AF_INET6 = uint8(10)
-
   for t in d.trackers:
-    let cfg = d.configForIndex(t.index)
-    let family = if cfg.isSome: cfg.get.family else: afIpv4
-    let priority = 100 + t.index.uint32
-
-    if family == afIpv4 or family == afBoth:
-      let r = d.routeManager.delRule(t.mark, d.config.globals.markMask,
-                                     t.tableId, priority, AF_INET)
-      if not r.ok and r.error.osError != int32(ENOENT) and r.error.osError != int32(ESRCH):
-        warn fmt"shutdown: failed to delete IPv4 ip rule for {t.name}: {r.error}"
-
-    if d.config.globals.ipv6Enabled and (family == afIpv6 or family == afBoth):
-      let r = d.routeManager.delRule(t.mark, d.config.globals.markMask,
-                                     t.tableId, priority, AF_INET6)
-      if not r.ok and r.error.osError != int32(ENOENT) and r.error.osError != int32(ESRCH):
-        warn fmt"shutdown: failed to delete IPv6 ip rule for {t.name}: {r.error}"
-
-    let r = d.routeManager.flushTableBoth(t.tableId)
-    if not r.ok and r.error.osError != int32(ENOENT) and r.error.osError != int32(ESRCH):
-      warn fmt"shutdown: failed to flush table {t.tableId} for {t.name}: {r.error}"
+    d.cleanupInfraRoutes(t.index)
 
   # 6. Close route manager netlink socket
   d.routeManager.close()

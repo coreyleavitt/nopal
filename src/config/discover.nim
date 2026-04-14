@@ -4,7 +4,7 @@
 ## then reads /etc/config/network to resolve device names for each
 ## interface in those zones. Skips DHCPv6 interfaces.
 
-import std/[strformat, logging, os]
+import std/[strformat, logging, os, osproc, json]
 import ./parser
 import ./schema
 
@@ -71,6 +71,40 @@ proc discoverWanInterfaces*(
 
   if result.len > 0:
     info fmt"WAN discovery: found {result.len} interface(s): {result}"
+
+type
+  InterfaceGateway* = object
+    name*: string
+    gateway4*: string  ## IPv4 gateway (e.g., "192.168.100.1") or ""
+    gateway6*: string  ## IPv6 gateway or ""
+
+proc getInterfaceGateways*(interfaceNames: openArray[string]): seq[InterfaceGateway] =
+  ## Query ubus for the default gateway of each named interface.
+  ## Returns gateway info for interfaces that have routes.
+  ## This is a one-time init call, not a hot-path operation.
+  for name in interfaceNames:
+    var gw = InterfaceGateway(name: name)
+    try:
+      let (output, exitCode) = execCmdEx("ubus call network.interface." & name & " status")
+      if exitCode != 0:
+        result.add(gw)
+        continue
+      let j = parseJson(output)
+      # IPv4 routes
+      for route in j.getOrDefault("route").getElems():
+        if route.getOrDefault("target").getStr() == "0.0.0.0" and
+           route.getOrDefault("mask").getInt() == 0:
+          gw.gateway4 = route.getOrDefault("nexthop").getStr()
+          break
+      # IPv6 routes
+      for route in j.getOrDefault("route6").getElems():
+        if route.getOrDefault("target").getStr() == "::" and
+           route.getOrDefault("mask").getInt() == 0:
+          gw.gateway6 = route.getOrDefault("nexthop").getStr()
+          break
+    except CatchableError:
+      discard
+    result.add(gw)
 
 proc applyGlobalsDefaults*(iface: var InterfaceConfig, globals: GlobalsConfig) =
   ## Fill unset interface fields from globals defaults.

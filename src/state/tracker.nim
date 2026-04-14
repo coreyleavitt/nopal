@@ -31,6 +31,10 @@ type
     lossPercent*: uint32
     onlineSince*: Option[MonoTime]
     offlineSince*: Option[MonoTime]
+    gateway4*: array[4, byte]
+    gateway6*: array[16, byte]
+    hasGateway4*: bool
+    hasGateway6*: bool
 
 proc newTracker*(name: string, index: int, mark: uint32, tableId: uint32,
                  device: string, upCount, downCount: uint32): InterfaceTracker =
@@ -165,7 +169,7 @@ when isMainModule:
         newDampening: none[DampeningSnapshot](),
         transitioned: true,
         newState: isOnline,
-        effects: {efAddRoutes, efRegenerateNftables},
+        effects: {efRegenerateNftables, efUpdateDns, efBroadcastEvent, efWriteStatus},
       )
       let now = getMonoTime()
       t.apply(d, now)
@@ -181,7 +185,7 @@ when isMainModule:
         newDampening: none[DampeningSnapshot](),
         transitioned: true,
         newState: isOffline,
-        effects: {efRemoveRoutes},
+        effects: {efRegenerateNftables, efRemoveDns, efBroadcastEvent, efWriteStatus, efFlushConntrack},
       )
       let now = getMonoTime()
       t.apply(d, now)
