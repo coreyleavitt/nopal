@@ -1,5 +1,5 @@
 # Package
-version       = "0.1.0-alpha.7"
+version       = "0.1.0-rc.1"
 author        = "Corey Leavitt"
 description   = "Multi-WAN policy routing manager for OpenWrt"
 license       = "Apache-2.0"
