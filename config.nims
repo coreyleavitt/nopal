@@ -28,10 +28,12 @@ when defined(release):
 
 const crossCFlags = "-Oz -fno-unwind-tables -fno-asynchronous-unwind-tables -fmerge-all-constants -fvisibility=hidden"
 
-proc setupCross(target, sysroot, cpuFlags: string) =
+proc setupCross(target, defaultSysroot, cpuFlags: string) =
+  let sysroot = getEnv("NOPAL_SYSROOT", defaultSysroot)
+  let cc = getEnv("NOPAL_CC", "clang")
   switch("cc", "clang")
-  switch("clang.exe", "clang")
-  switch("clang.linkerexe", "clang")
+  switch("clang.exe", cc)
+  switch("clang.linkerexe", cc)
   switch("clang.options.linker", "")
   switch("passC", "--target=" & target & " --sysroot=" & sysroot & " " & cpuFlags & " " & crossCFlags)
   switch("passL", "--target=" & target & " --sysroot=" & sysroot &
