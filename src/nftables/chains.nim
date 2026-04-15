@@ -350,17 +350,22 @@ proc buildPrerouting(rs: var Ruleset, interfaces: openArray[InterfaceInfo],
   rs.addRule("prerouting", @[matchNfprotoIpv6(), matchProtocol("icmpv6"),
     matchIcmpv6TypeRange(133, 137), nftAccept()])
 
-  # 3. Restore conntrack mark → packet mark for existing connections.
-  #    If ct mark has WAN bits set, this packet belongs to an established
-  #    connection already assigned to a WAN — restore and accept.
+  # 3. Connected/local network bypass: MUST come before ct mark restore.
+  #    Return traffic (internet → LAN client) has a ct mark from the
+  #    outbound connection. If we restore that mark first, the packet gets
+  #    routed through the per-interface table (which only has a default route)
+  #    and goes back out the WAN instead of to the LAN client. Bypassing
+  #    local destinations first ensures they route via the main table's
+  #    connected routes.
+  addConnectedBypass(rs, "prerouting", connected)
+
+  # 4. Restore conntrack mark → packet mark for existing connections.
+  #    At this point we know the destination is NOT local, so restoring
+  #    the WAN mark is safe — the packet should go out the assigned WAN.
   rs.addRule("prerouting", @[matchCtMarkMaskedNeq(markMask, 0), setMarkFromCt(markMask)])
   rs.addRule("prerouting", @[matchMetaMarkMaskedNeq(markMask, 0), nftAccept()])
 
-  # 4. Connected/local network bypass: traffic to locally-routable
-  #    destinations should not be policy-routed (uses main table)
-  addConnectedBypass(rs, "prerouting", connected)
-
-  # 5. Policy dispatch: new connections get a WAN assignment
+  # 5. Policy dispatch: new connections to non-local destinations
   rs.addRule("prerouting", @[jump("policy_rules")])
 
   # 6. Mark inbound new connections per interface (for return-path routing)
