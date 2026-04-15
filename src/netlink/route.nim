@@ -573,6 +573,121 @@ proc getConnectedNetworks*(m: var RouteManager): NlResult[seq[string]] {.raises:
 
   nlOk(networks)
 
+proc getLocalRoutesFamily(m: var RouteManager, family: uint8,
+                          wanIfindexes: openArray[uint32]): NlResult[seq[string]] {.raises: [].} =
+  ## Dump non-default unicast routes in the main table whose OIF is NOT
+  ## a managed WAN interface. These are locally-routable destinations
+  ## (VPN tunnels, static routes to local infrastructure) that should
+  ## bypass policy routing.
+  let rtm = RtMsg(
+    rtmFamily: family,
+    rtmDstLen: 0, rtmSrcLen: 0, rtmTos: 0,
+    rtmTable: 0, rtmProtocol: 0, rtmScope: 0, rtmType: 0, rtmFlags: 0,
+  )
+  var payloadBuf: seq[byte]
+  writeStruct(payloadBuf, rtm)
+
+  # Capture wanIfindexes in a seq for the closure
+  var wanSet: seq[uint32]
+  for idx in wanIfindexes: wanSet.add(idx)
+
+  m.foldDump(newSeq[string](), RTM_GETROUTE.uint16, payloadBuf,
+    proc(acc: sink seq[string], msg: DumpMsg): seq[string] {.raises: [].} =
+      var res = acc
+      if msg.hdr.nlmsgType != RTM_NEWROUTE.uint16:
+        return res
+      if msg.payload.len < sizeof(RtMsg):
+        return res
+
+      let rtmMsg = readStruct[RtMsg](msg.payload, 0)
+
+      # Only unicast, non-default, main table
+      if rtmMsg.rtmType != RTN_UNICAST or rtmMsg.rtmDstLen == 0:
+        return res
+      # Skip scope-link (already handled by getConnectedNetworks)
+      if rtmMsg.rtmScope == RT_SCOPE_LINK:
+        return res
+
+      # Extract table and OIF
+      let attrStart = nlmsgAlign(sizeof(RtMsg))
+      var routeTable = uint32(rtmMsg.rtmTable)
+      var oif: uint32 = 0
+      var hasOif = false
+      var dst: array[16, byte]
+      var hasDst = false
+
+      for (attrType, s) in nlAttrs(msg.payload, attrStart):
+        if attrType == RTA_TABLE.uint16:
+          routeTable = attrU32(msg.payload, s)
+        elif attrType == RTA_OIF.uint16:
+          oif = attrU32(msg.payload, s)
+          hasOif = true
+        elif attrType == RTA_DST.uint16:
+          let addrLen = if family == AF_INET: 4 else: 16
+          if s.a + addrLen <= msg.payload.len:
+            copyMem(addr dst[0], unsafeAddr msg.payload[s.a], addrLen)
+            hasDst = true
+
+      # Must be main table, have OIF and destination
+      if routeTable != uint32(RT_TABLE_MAIN) or not hasOif or not hasDst:
+        return res
+
+      # Skip routes through managed WAN interfaces
+      for wanIdx in wanSet:
+        if oif == wanIdx:
+          return res
+
+      # Format as CIDR
+      let cidr = if family == AF_INET:
+        formatIpv4Cidr(dst[0 ..< 4], rtmMsg.rtmDstLen)
+      else:
+        formatIpv6Cidr(dst, rtmMsg.rtmDstLen)
+      if cidr.len > 0:
+        res.add(cidr)
+
+      res
+  )
+
+proc getBypassNetworks*(m: var RouteManager,
+                        wanIfindexes: openArray[uint32]): NlResult[seq[string]] {.raises: [].} =
+  ## Dump all networks that should bypass policy routing:
+  ## 1. Connected subnets (scope-link routes) — directly attached networks
+  ## 2. Routes through non-WAN interfaces (VPN tunnels, local infrastructure)
+  ## Always includes loopback fallbacks.
+  var networks: seq[string] = @["127.0.0.0/8"]
+
+  # Connected subnets (scope-link)
+  let r4 = m.getConnectedNetworksFamily(AF_INET)
+  if r4.ok:
+    for cidr in r4.value:
+      if cidr notin networks:
+        networks.add(cidr)
+
+  let r6 = m.getConnectedNetworksFamily(AF_INET6)
+  if r6.ok:
+    for cidr in r6.value:
+      if cidr notin networks:
+        networks.add(cidr)
+
+  # Locally-routable destinations (non-WAN OIF)
+  let lr4 = m.getLocalRoutesFamily(AF_INET, wanIfindexes)
+  if lr4.ok:
+    for cidr in lr4.value:
+      if cidr notin networks:
+        networks.add(cidr)
+
+  let lr6 = m.getLocalRoutesFamily(AF_INET6, wanIfindexes)
+  if lr6.ok:
+    for cidr in lr6.value:
+      if cidr notin networks:
+        networks.add(cidr)
+
+  # Ensure IPv6 loopback is present
+  if "::1/128" notin networks:
+    networks.add("::1/128")
+
+  nlOk(networks)
+
 when isMainModule:
   import std/unittest
 

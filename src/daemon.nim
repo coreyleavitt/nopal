@@ -431,11 +431,16 @@ proc regenerateNftables(d: var Daemon) =
 
   if d.connectedNetworksDirty:
     d.connectedNetworksDirty = false
-    let r = d.routeManager.getConnectedNetworks()
+    # Collect WAN ifindexes for bypass filtering
+    var wanIfindexes: seq[uint32]
+    for t in d.trackers:
+      if t.ifindex != 0:
+        wanIfindexes.add(t.ifindex)
+    let r = d.routeManager.getBypassNetworks(wanIfindexes)
     if r.ok:
       d.connectedNetworks = r.value
     else:
-      warn "failed to dump connected networks: " & $r.error
+      warn "failed to dump bypass networks: " & $r.error
       d.connectedNetworks = @["127.0.0.0/8", "::1/128"]
 
   let rs = buildRuleset(
@@ -450,6 +455,16 @@ proc regenerateNftables(d: var Daemon) =
 
 # =========================================================================
 # Route management
+#
+# Design: per-interface routing tables contain ONLY the default route.
+# Non-default routes (VPN, static, connected subnets) are handled by
+# ip rule fallthrough to the main table (priority 32766). This is
+# functionally equivalent to mwan3rtmon's full-mirror approach for all
+# standard multi-WAN scenarios, with less kernel memory and no sync bugs.
+#
+# To prevent unnecessary nftables marking for locally-routable traffic
+# (which would pollute conntrack marks), the bypass network list includes
+# both connected subnets and routes through non-WAN interfaces.
 # =========================================================================
 
 proc installInfraRules(d: var Daemon, index: int) =
@@ -831,34 +846,39 @@ proc handleRouteEvents(d: var Daemon) =
 
   for change in d.routeChangeBuf:
     case change.kind
-    of rckRouteAdd:
-      # Find tracker whose ifindex matches and install per-interface route
-      for ti in 0 ..< d.trackers.len:
-        if d.trackers[ti].ifindex != 0 and d.trackers[ti].ifindex == change.ifindex:
-          if change.hasGateway:
-            if change.family == uint8(2):  # AF_INET
-              d.trackers[ti].gateway4[0 ..< 4] = change.gateway[0 ..< 4]
-              d.trackers[ti].hasGateway4 = true
-            else:
-              d.trackers[ti].gateway6 = change.gateway
-              d.trackers[ti].hasGateway6 = true
-            let gwLen = if change.family == uint8(2): 4 else: 16
-            d.installInterfaceRoute(ti, change.gateway[0 ..< gwLen], change.family)
-          d.connectedNetworksDirty = true
-          break
-    of rckRouteDel:
-      # Find tracker whose ifindex matches and remove per-interface route
-      for ti in 0 ..< d.trackers.len:
-        if d.trackers[ti].ifindex != 0 and d.trackers[ti].ifindex == change.ifindex:
-          if change.family == uint8(2):  # AF_INET
-            d.trackers[ti].hasGateway4 = false
-          else:
-            d.trackers[ti].hasGateway6 = false
-          d.removeInterfaceRoute(ti, change.family)
-          d.connectedNetworksDirty = true
-          break
+    of rckRouteAdd, rckRouteDel:
+      if change.dstLen == 0:
+        # Default route change — update per-interface routing table
+        if change.kind == rckRouteAdd:
+          for ti in 0 ..< d.trackers.len:
+            if d.trackers[ti].ifindex != 0 and d.trackers[ti].ifindex == change.ifindex:
+              if change.hasGateway:
+                if change.family == uint8(2):  # AF_INET
+                  d.trackers[ti].gateway4[0 ..< 4] = change.gateway[0 ..< 4]
+                  d.trackers[ti].hasGateway4 = true
+                else:
+                  d.trackers[ti].gateway6 = change.gateway
+                  d.trackers[ti].hasGateway6 = true
+                let gwLen = if change.family == uint8(2): 4 else: 16
+                d.installInterfaceRoute(ti, change.gateway[0 ..< gwLen], change.family)
+              break
+        else:  # rckRouteDel
+          for ti in 0 ..< d.trackers.len:
+            if d.trackers[ti].ifindex != 0 and d.trackers[ti].ifindex == change.ifindex:
+              if change.family == uint8(2):
+                d.trackers[ti].hasGateway4 = false
+              else:
+                d.trackers[ti].hasGateway6 = false
+              d.removeInterfaceRoute(ti, change.family)
+              break
+      # All route changes (default and non-default) may affect bypass networks.
+      # Set both dirty flags: connectedNetworksDirty triggers a fresh dump,
+      # nftablesDirty ensures the bypass rules are regenerated.
+      d.connectedNetworksDirty = true
+      d.nftablesDirty = true
     of rckAddrAdd, rckAddrDel:
       d.connectedNetworksDirty = true
+      d.nftablesDirty = true
 
 proc handleProbeTimer(d: var Daemon, index: int) =
   ## Send a probe for the given interface, schedule timeout.
