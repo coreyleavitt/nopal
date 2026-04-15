@@ -175,8 +175,15 @@ proc matchMetaMarkMaskedEq(mask, value: uint32): JsonNode =
 proc matchMetaMarkMaskedNeq(mask, value: uint32): JsonNode =
   %*{"match": {"op": "!=", "left": {"&": [{"meta": {"key": "mark"}}, mask]}, "right": value}}
 
+proc matchCtMarkMaskedEq(mask, value: uint32): JsonNode =
+  %*{"match": {"op": "==", "left": {"&": [{"ct": {"key": "mark"}}, mask]}, "right": value}}
+
 proc matchCtMarkMaskedNeq(mask, value: uint32): JsonNode =
   %*{"match": {"op": "!=", "left": {"&": [{"ct": {"key": "mark"}}, mask]}, "right": value}}
+
+proc matchCtStatusDnat(): JsonNode =
+  ## Match packets belonging to a DNAT'd connection (ct status & dnat != 0).
+  %*{"match": {"op": "!=", "left": {"&": [{"ct": {"key": "status"}}, "dnat"]}, "right": 0}}
 
 proc matchCtStateNew(): JsonNode =
   %*{"match": {"op": "==", "left": {"ct": {"key": "state"}}, "right": "new"}}
@@ -350,27 +357,34 @@ proc buildPrerouting(rs: var Ruleset, interfaces: openArray[InterfaceInfo],
   rs.addRule("prerouting", @[matchNfprotoIpv6(), matchProtocol("icmpv6"),
     matchIcmpv6TypeRange(133, 137), nftAccept()])
 
-  # 3. Connected/local network bypass: MUST come before ct mark restore.
+  # 3. DNAT return-path: tag inbound DNAT connections by arrival interface.
+  #    Port-forwarded traffic arrives with dest = router's WAN IP (accepted
+  #    by connected bypass at step 4). Without this, the ct mark stays 0
+  #    and the LAN server's response gets random WAN assignment at step 6.
+  #    ct status dnat precisely identifies DNAT'd packets.
+  for iface in interfaces:
+    rs.addRule("prerouting", @[
+      matchIifname(iface.device),
+      matchCtStatusDnat(),
+      matchCtMarkMaskedEq(markMask, 0),
+      setCtMark(iface.mark),
+    ])
+
+  # 4. Connected/local network bypass: MUST come before ct mark restore.
   #    Return traffic (internet → LAN client) has a ct mark from the
   #    outbound connection. If we restore that mark first, the packet gets
   #    routed through the per-interface table (which only has a default route)
-  #    and goes back out the WAN instead of to the LAN client. Bypassing
-  #    local destinations first ensures they route via the main table's
-  #    connected routes.
+  #    and goes back out the WAN instead of to the LAN client.
   addConnectedBypass(rs, "prerouting", connected)
 
-  # 4. Restore conntrack mark → packet mark for existing connections.
+  # 5. Restore conntrack mark → packet mark for existing connections.
   #    At this point we know the destination is NOT local, so restoring
   #    the WAN mark is safe — the packet should go out the assigned WAN.
   rs.addRule("prerouting", @[matchCtMarkMaskedNeq(markMask, 0), setMarkFromCt(markMask)])
   rs.addRule("prerouting", @[matchMetaMarkMaskedNeq(markMask, 0), nftAccept()])
 
-  # 5. Policy dispatch: new connections to non-local destinations
+  # 6. Policy dispatch: new connections to non-local destinations
   rs.addRule("prerouting", @[jump("policy_rules")])
-
-  # 6. Mark inbound new connections per interface (for return-path routing)
-  for iface in interfaces:
-    rs.addRule("prerouting", @[matchIifname(iface.device), matchCtStateNew(), setCtMark(iface.mark)])
 
 proc buildOutput(rs: var Ruleset, connected: openArray[string], markMask: uint32) =
   ## Output chain handles locally-generated traffic (DNS, NTP, SSH, etc.).
@@ -1052,6 +1066,31 @@ when isMainModule:
       let policyRules = getRulesForChain(parsed, "policy_rules")
       let ruleStr = $policyRules[0]["expr"]
       check "policy_balanced" in ruleStr
+
+    test "dnat_return_path_marks_by_interface":
+      let (interfaces, policies, rules) = twoInterfaceSetup()
+      let rs = buildRuleset(interfaces, policies, rules, @["192.168.1.0/24"], 0xFF00'u32, true, false)
+      let parsed = parseJson($rs.toJson())
+      let preroutingRules = getRulesForChain(parsed, "prerouting")
+
+      # DNAT rules should exist per interface, before connected bypass
+      var foundDnatWan = false
+      var foundDnatWanb = false
+      var foundBypass = false
+      for rule in preroutingRules:
+        let s = $rule["expr"]
+        if "192.168.1.0" in s and "accept" in s:
+          # Bypass must come AFTER DNAT rules
+          check foundDnatWan
+          check foundDnatWanb
+          foundBypass = true
+        if "iifname" in s and "dnat" in s and "eth0" in s:
+          foundDnatWan = true
+        if "iifname" in s and "dnat" in s and "eth1" in s:
+          foundDnatWanb = true
+      check foundDnatWan
+      check foundDnatWanb
+      check foundBypass
 
     test "connected networks bypass in prerouting":
       let (interfaces, policies, rules) = twoInterfaceSetup()
