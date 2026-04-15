@@ -335,27 +335,42 @@ proc addConnectedBypass(rs: var Ruleset, chain: string, connected: openArray[str
   rs.addRule(chain, @[matchDaddrNamedSet("bypass_v4", rfIpv4), nftAccept()])
   rs.addRule(chain, @[matchDaddrNamedSet("bypass_v6", rfIpv6), nftAccept()])
 
-proc buildPrerouting(rs: var Ruleset, interfaces: openArray[InterfaceInfo], markMask: uint32) =
-  # Exception: skip probe packets
+proc buildPrerouting(rs: var Ruleset, interfaces: openArray[InterfaceInfo],
+                     connected: openArray[string], markMask: uint32) =
+  ## Prerouting is where ALL policy decisions happen for forwarded traffic.
+  ## Marks must be set BEFORE the routing decision — the kernel reads the
+  ## packet mark to select the routing table via fwmark ip rules. If marks
+  ## are set after routing (e.g., in the forward chain), the first packet
+  ## of every connection uses the main table regardless of policy.
+
+  # 1. Probe bypass: nopal's own health probes must not be policy-routed
   rs.addRule("prerouting", @[matchMetaMarkEq(ProbeMark), nftAccept()])
 
-  # Exception: accept IPv6 NDP/RA (ICMPv6 types 133-137)
+  # 2. ICMPv6 NDP/RA bypass (types 133-137): essential for IPv6 operation
   rs.addRule("prerouting", @[matchNfprotoIpv6(), matchProtocol("icmpv6"),
     matchIcmpv6TypeRange(133, 137), nftAccept()])
 
-  # Restore conntrack mark -> packet mark when ct mark has WAN bits set
+  # 3. Restore conntrack mark → packet mark for existing connections.
+  #    If ct mark has WAN bits set, this packet belongs to an established
+  #    connection already assigned to a WAN — restore and accept.
   rs.addRule("prerouting", @[matchCtMarkMaskedNeq(markMask, 0), setMarkFromCt(markMask)])
+  rs.addRule("prerouting", @[matchMetaMarkMaskedNeq(markMask, 0), nftAccept()])
 
-  # Mark inbound new connections per interface
+  # 4. Connected/local network bypass: traffic to locally-routable
+  #    destinations should not be policy-routed (uses main table)
+  addConnectedBypass(rs, "prerouting", connected)
+
+  # 5. Policy dispatch: new connections get a WAN assignment
+  rs.addRule("prerouting", @[jump("policy_rules")])
+
+  # 6. Mark inbound new connections per interface (for return-path routing)
   for iface in interfaces:
     rs.addRule("prerouting", @[matchIifname(iface.device), matchCtStateNew(), setCtMark(iface.mark)])
 
-proc buildForward(rs: var Ruleset, connected: openArray[string], markMask: uint32) =
-  addConnectedBypass(rs, "forward", connected)
-  rs.addRule("forward", @[matchCtMarkMaskedNeq(markMask, 0), setMarkFromCt(markMask)])
-  rs.addRule("forward", @[matchMetaMarkMaskedEq(markMask, 0), jump("policy_rules")])
-
 proc buildOutput(rs: var Ruleset, connected: openArray[string], markMask: uint32) =
+  ## Output chain handles locally-generated traffic (DNS, NTP, SSH, etc.).
+  ## Unlike forwarded traffic, the output hook triggers re-routing when
+  ## the packet mark changes, so setting marks here works correctly.
   addConnectedBypass(rs, "output", connected)
   rs.addRule("output", @[matchCtMarkMaskedNeq(markMask, 0), setMarkFromCt(markMask)])
   rs.addRule("output", @[matchMetaMarkMaskedNeq(markMask, 0), nftAccept()])
@@ -590,9 +605,8 @@ proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[Pol
   if dynamicBypassV6.len > 0:
     rs.addSetElements("bypass_v6", dynamicBypassV6)
 
-  # Base chains
+  # Base chains (no forward — policy decisions are in prerouting)
   rs.addBaseChain("prerouting", "filter", "prerouting", -150, "accept")
-  rs.addBaseChain("forward", "filter", "forward", -150, "accept")
   rs.addBaseChain("output", "filter", "output", -150, "accept")
   rs.addBaseChain("postrouting", "filter", "postrouting", 150, "accept")
 
@@ -603,13 +617,10 @@ proc buildRuleset*(interfaces: openArray[InterfaceInfo], policies: openArray[Pol
   for policy in policies:
     rs.addRegularChain(fmt"policy_{policy.name}")
 
-  # Prerouting rules
-  buildPrerouting(rs, interfaces, markMask)
+  # Prerouting rules (all policy decisions for forwarded traffic)
+  buildPrerouting(rs, interfaces, connected, markMask)
 
-  # Forward rules
-  buildForward(rs, connected, markMask)
-
-  # Output rules
+  # Output rules (locally-generated traffic)
   buildOutput(rs, connected, markMask)
 
   # Postrouting rules
@@ -823,7 +834,7 @@ when isMainModule:
 
       let chainNames = getChainNames(parsed)
       check "prerouting" in chainNames
-      check "forward" in chainNames
+      check "forward" notin chainNames  # no forward chain — policy in prerouting
       check "output" in chainNames
       check "postrouting" in chainNames
       check "policy_rules" in chainNames
@@ -1037,21 +1048,28 @@ when isMainModule:
       let ruleStr = $policyRules[0]["expr"]
       check "policy_balanced" in ruleStr
 
-    test "connected networks bypass policy routing":
+    test "connected networks bypass in prerouting":
       let (interfaces, policies, rules) = twoInterfaceSetup()
       let connected = @["192.168.1.0/24", "10.0.0.0/8", "fd00::/64"]
       let rs = buildRuleset(interfaces, policies, rules, connected, 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
-      let forwardRules = getRulesForChain(parsed, "forward")
 
-      check forwardRules.len >= 4
-      let firstStr = $forwardRules[0]["expr"]
-      check "192.168.1.0" in firstStr
-      check "10.0.0.0" in firstStr
-      check "accept" in firstStr
+      # Bypass rules are in prerouting (before routing decision), not forward
+      let preroutingRules = getRulesForChain(parsed, "prerouting")
+      var foundV4Bypass = false
+      var foundV6Bypass = false
+      for rule in preroutingRules:
+        let s = $rule["expr"]
+        if "192.168.1.0" in s and "accept" in s:
+          foundV4Bypass = true
+        if "fd00::" in s and "accept" in s:
+          foundV6Bypass = true
+      check foundV4Bypass
+      check foundV6Bypass
 
-      let secondStr = $forwardRules[1]["expr"]
-      check "fd00::" in secondStr
+      # No forward chain exists
+      let chainNames = getChainNames(parsed)
+      check "forward" notin chainNames
 
     # ------------------------------------------------------------------
     # HIGH priority tests
@@ -1153,15 +1171,22 @@ when isMainModule:
       check "sticky_r0_v4" in mapNames
       check "sticky_r0_v6" in mapNames
 
-    test "no_connected_networks_means_no_bypass_rules":
+    test "no_connected_networks_still_has_bypass_sets_in_prerouting":
       let (interfaces, policies, rules) = twoInterfaceSetup()
       let rs = buildRuleset(interfaces, policies, rules, @[], 0xFF00'u32, true, false)
       let parsed = parseJson($rs.toJson())
-      let forwardRules = getRulesForChain(parsed, "forward")
 
-      # Without connected networks, forward chain should have 4 rules:
-      # bypass_v4 set + bypass_v6 set + ct restore + jump policy_rules
-      check forwardRules.len == 4
+      # No forward chain exists (policy decisions in prerouting)
+      let chainNames2 = getChainNames(parsed)
+      check "forward" notin chainNames2
+
+      # Prerouting should still have dynamic bypass set rules
+      let preroutingRules = getRulesForChain(parsed, "prerouting")
+      var foundBypassV4 = false
+      for rule in preroutingRules:
+        let s = $rule["expr"]
+        if "bypass_v4" in s: foundBypassV4 = true
+      check foundBypassV4
 
     # ------------------------------------------------------------------
     # MEDIUM priority tests

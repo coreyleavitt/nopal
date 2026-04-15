@@ -1710,7 +1710,6 @@ def phase21():
 
     # Check for expected chains
     test("has prerouting chain", "prerouting" in ruleset)
-    test("has forward chain", "forward" in ruleset)
     test("has output chain", "output" in ruleset)
     test("has postrouting chain", "postrouting" in ruleset)
     test("has policy_rules chain", "policy_rules" in ruleset)

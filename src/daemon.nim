@@ -988,6 +988,13 @@ proc deregisterProbeSockets(probeEngine: var ProbeEngine, selector: var Selector
 proc initializeInterfaces(d: var Daemon) =
   ## Set up initial interface states, probes, routes, and nftables.
 
+  # Delete stale nftables table FIRST — before any ip rules are installed.
+  # On daemon restart, the old nftables table may still be marking forwarded
+  # traffic for previously-online interfaces. If ip rules are installed before
+  # this table is replaced, marked packets hit empty routing tables (no default
+  # route yet) and get dropped, black-holing all WAN traffic.
+  discard nftEngine.cleanup()
+
   # Clean up stale ip rules/routes from a previous run (e.g., after SIGKILL).
   # Delete-before-add prevents EEXIST warnings on rule installation.
   for ti in 0 ..< d.trackers.len:
