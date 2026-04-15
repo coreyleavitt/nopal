@@ -987,6 +987,12 @@ proc deregisterProbeSockets(probeEngine: var ProbeEngine, selector: var Selector
 
 proc initializeInterfaces(d: var Daemon) =
   ## Set up initial interface states, probes, routes, and nftables.
+
+  # Clean up stale ip rules/routes from a previous run (e.g., after SIGKILL).
+  # Delete-before-add prevents EEXIST warnings on rule installation.
+  for ti in 0 ..< d.trackers.len:
+    d.cleanupInfraRoutes(d.trackers[ti].index)
+
   var onlineIndices: seq[int]
 
   for ti in 0 ..< d.trackers.len:
