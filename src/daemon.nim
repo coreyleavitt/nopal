@@ -1043,6 +1043,18 @@ proc initializeInterfaces(d: var Daemon) =
             d.installInterfaceRoute(ti, gwBytes, uint8(10))
         break
 
+  # Warn if multiple WANs share the same route metric.
+  # Without distinct metrics, the kernel keeps only one default route in the
+  # main table. nopal handles routing via per-interface tables, but the router's
+  # own traffic during early boot or daemon downtime uses the main table.
+  if d.trackers.len >= 2:
+    let routeResult = d.routeManager.getDefaultRoutes()
+    if routeResult.ok and routeResult.value.len < d.trackers.len:
+      warn "only " & $routeResult.value.len & " of " & $d.trackers.len &
+           " WAN interfaces have a default route in the main table — " &
+           "set different metrics in /etc/config/network for " &
+           "resilient failover when nopal is not running"
+
   d.registerProbeSockets()
 
   for index in onlineIndices:
