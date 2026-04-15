@@ -326,13 +326,19 @@ proc flushTableFamily(m: var RouteManager, table: uint32,
       operation: "flushTable",
       detail: "dump failed for table " & $table))
 
-  let deleteMsgs = collectResult.value
+  var deleteMsgs = collectResult.value
 
-  # Send all delete messages, accumulating failures
+  # Send all delete messages, accumulating failures.
+  # Stamp each with a unique sequence number for ACK matching.
   var failCount = 0
   let total = deleteMsgs.len
-  for delBuf in deleteMsgs:
-    let ack = m.sock.sendAndAck(delBuf, m.recvBuf)
+  for i in 0 ..< deleteMsgs.len:
+    let seq = m.nextSeq()
+    if deleteMsgs[i].len >= sizeof(NlMsgHdr):
+      var hdr = readStruct[NlMsgHdr](deleteMsgs[i], 0)
+      hdr.nlmsgSeq = seq
+      copyMem(addr deleteMsgs[i][0], unsafeAddr hdr, sizeof(NlMsgHdr))
+    let ack = m.sock.sendAndAck(deleteMsgs[i], m.recvBuf)
     if not ack.ok:
       inc failCount
 

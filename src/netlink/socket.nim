@@ -215,7 +215,14 @@ proc recvMsg*(s: NetlinkSocket, buf: var seq[byte]): int =
 
 proc sendAndAck*(s: NetlinkSocket, data: openArray[byte],
                  buf: var seq[byte], timeoutMs: int = 5000): NlAckResult =
-  ## Send message and wait for ACK. Returns NlAckResult with error details.
+  ## Send message and wait for matching ACK. Skips stale responses by
+  ## checking the sequence number in the ACK against the sent message.
+  if data.len < sizeof(NlMsgHdr):
+    return nlAckErr(nakSendFailed, 0)
+
+  let sentHdr = readStruct[NlMsgHdr](data, 0)
+  let expectedSeq = sentHdr.nlmsgSeq
+
   let sendResult = s.sendMsg(data)
   if not sendResult.ok:
     return sendResult
@@ -234,6 +241,9 @@ proc sendAndAck*(s: NetlinkSocket, data: openArray[byte],
 
     let hdr = readStruct[NlMsgHdr](buf, 0)
     if hdr.nlmsgType == NLMSG_ERROR:
+      # Skip stale ACKs from previous operations
+      if hdr.nlmsgSeq != expectedSeq:
+        continue
       if n >= sizeof(NlMsgHdr) + sizeof(int32):
         let errCode = readStruct[int32](buf, sizeof(NlMsgHdr))
         if errCode == 0:
