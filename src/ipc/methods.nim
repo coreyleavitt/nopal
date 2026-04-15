@@ -89,7 +89,7 @@ when isMainModule:
                     reloadPending: Option[ReloadPendingInfo] = none[ReloadPendingInfo]()): DaemonSnapshot =
     DaemonSnapshot(
       apiVersion: 1,
-      version: "0.1.1",
+      version: "0.1.2",
       uptimeSecs: 100,
       interfaces: ifaces,
       policies: policies,
