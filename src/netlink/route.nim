@@ -17,9 +17,15 @@ const
 
 type
   RouteManager* = object
-    sock: NetlinkSocket
-    nlSeq: uint32
-    recvBuf: seq[byte]
+    ## Separate sockets for command (sendAndAck) and dump (foldDump) operations.
+    ## Prevents stale ACKs from commands interfering with dump streams and
+    ## vice versa — isolation by construction via separate kernel queues.
+    cmdSock: NetlinkSocket
+    cmdSeq: uint32
+    cmdBuf: seq[byte]
+    dumpSock: NetlinkSocket
+    dumpSeq: uint32
+    dumpBuf: seq[byte]
 
   DumpMsg* = object
     ## Self-contained dump message. Owns its payload bytes (copied from recvBuf)
@@ -28,21 +34,28 @@ type
     payload*: seq[byte]
 
 proc newRouteManager*(): RouteManager =
-  ## Create a RouteManager with a NETLINK_ROUTE socket.
+  ## Create a RouteManager with separate command and dump sockets.
   result = RouteManager(
-    sock: openNetlink(NETLINK_ROUTE, 0),
-    nlSeq: 0,
-    recvBuf: newSeq[byte](RecvBufSize),
+    cmdSock: openNetlink(NETLINK_ROUTE, 0),
+    cmdSeq: 0,
+    cmdBuf: newSeq[byte](RecvBufSize),
+    dumpSock: openNetlink(NETLINK_ROUTE, 0),
+    dumpSeq: 0,
+    dumpBuf: newSeq[byte](RecvBufSize),
   )
 
 proc close*(m: var RouteManager) {.raises: [].} =
-  ## Close the netlink socket.
-  m.sock.close()
+  ## Close both netlink sockets.
+  m.cmdSock.close()
+  m.dumpSock.close()
 
-proc nextSeq(m: var RouteManager): uint32 =
-  ## Return the next sequence number, wrapping on overflow.
-  m.nlSeq = m.nlSeq + 1
-  m.nlSeq
+proc nextCmdSeq(m: var RouteManager): uint32 =
+  m.cmdSeq = m.cmdSeq + 1
+  m.cmdSeq
+
+proc nextDumpSeq(m: var RouteManager): uint32 =
+  m.dumpSeq = m.dumpSeq + 1
+  m.dumpSeq
 
 # ---------------------------------------------------------------------------
 # NlAckResult → NlResult mapping
@@ -72,10 +85,10 @@ proc foldDump*[A](m: var RouteManager, init: sink A,
                   msgType: uint16, payload: openArray[byte],
                   f: proc(acc: sink A, msg: DumpMsg): A {.raises: [].}
                  ): NlResult[A] {.raises: [].} =
-  ## Send a dump request and fold over response messages.
+  ## Send a dump request on the dump socket and fold over response messages.
   ## Returns NlResult[A] with the accumulated value or an error.
   ## The fold function f receives self-contained DumpMsg values.
-  let seq = m.nextSeq()
+  let seq = m.nextDumpSeq()
 
   var b = initBuilder(
     msgType,
@@ -87,7 +100,7 @@ proc foldDump*[A](m: var RouteManager, init: sink A,
     b.buf.add(payload[i])
   let msg = b.finish()
 
-  let sendResult = m.sock.sendMsg(msg)
+  let sendResult = m.dumpSock.sendMsg(msg)
   if not sendResult.ok:
     return nlErr[A](NlError(
       kind: nekSendFailed, osError: sendResult.osError,
@@ -98,7 +111,7 @@ proc foldDump*[A](m: var RouteManager, init: sink A,
   var done = false
 
   while not done:
-    let n = m.sock.recvMsg(m.recvBuf)
+    let n = m.dumpSock.recvMsg(m.dumpBuf)
     if n < 0:
       return nlErr[A](NlError(
         kind: nekRecvFailed, osError: errno.int32,
@@ -111,13 +124,13 @@ proc foldDump*[A](m: var RouteManager, init: sink A,
       discard posix.poll(nil, 0, 1)  # 1ms sleep
       continue
 
-    for (hdr, payloadSlice) in nlMsgs(m.recvBuf, n):
+    for (hdr, payloadSlice) in nlMsgs(m.dumpBuf, n):
       if hdr.nlmsgType == NLMSG_DONE:
         done = true
         break
       if hdr.nlmsgType == NLMSG_ERROR:
         if payloadSlice.b - payloadSlice.a + 1 >= sizeof(int32):
-          let errCode = readStruct[int32](m.recvBuf, payloadSlice.a)
+          let errCode = readStruct[int32](m.dumpBuf, payloadSlice.a)
           if errCode != 0:
             return nlErr[A](NlError(
               kind: nekKernelError, osError: -errCode,
@@ -130,7 +143,7 @@ proc foldDump*[A](m: var RouteManager, init: sink A,
       let pEnd = payloadSlice.b + 1
       var ownedPayload = newSeq[byte](pEnd - pStart)
       if ownedPayload.len > 0:
-        copyMem(addr ownedPayload[0], unsafeAddr m.recvBuf[pStart], ownedPayload.len)
+        copyMem(addr ownedPayload[0], unsafeAddr m.dumpBuf[pStart], ownedPayload.len)
       acc = f(acc, DumpMsg(hdr: hdr, payload: ownedPayload))
 
   NlResult[A](ok: true, value: acc)
@@ -145,7 +158,7 @@ proc addRoute*(m: var RouteManager, table: uint32, gateway: openArray[byte],
   ## gateway: raw IP bytes (4 for IPv4, 16 for IPv6).
   ## oif: output interface index.
   ## metric: route priority for tier-based selection.
-  let seq = m.nextSeq()
+  let seq = m.nextCmdSeq()
 
   let rtm = RtMsg(
     rtmFamily: family,
@@ -173,7 +186,7 @@ proc addRoute*(m: var RouteManager, table: uint32, gateway: openArray[byte],
 
   let msg = b.finish()
   let familyStr = if family == AF_INET: "IPv4" else: "IPv6"
-  m.sock.sendAndAck(msg, m.recvBuf).toNlResult(
+  m.cmdSock.sendAndAck(msg, m.cmdBuf).toNlResult(
     "addRoute", "table " & $table & ", family " & familyStr)
 
 # ---------------------------------------------------------------------------
@@ -183,7 +196,7 @@ proc addRoute*(m: var RouteManager, table: uint32, gateway: openArray[byte],
 proc delRoute*(m: var RouteManager, table: uint32,
                family: uint8): NlResult[void] {.raises: [].} =
   ## Delete the default route from a routing table.
-  let seq = m.nextSeq()
+  let seq = m.nextCmdSeq()
 
   let rtm = RtMsg(
     rtmFamily: family,
@@ -207,7 +220,7 @@ proc delRoute*(m: var RouteManager, table: uint32,
 
   let msg = b.finish()
   let familyStr = if family == AF_INET: "IPv4" else: "IPv6"
-  m.sock.sendAndAck(msg, m.recvBuf).toNlResult(
+  m.cmdSock.sendAndAck(msg, m.cmdBuf).toNlResult(
     "delRoute", "table " & $table & ", family " & familyStr)
 
 # ---------------------------------------------------------------------------
@@ -217,7 +230,7 @@ proc delRoute*(m: var RouteManager, table: uint32,
 proc modifyRule(m: var RouteManager, msgType: uint16, mark, mask, table,
                 priority: uint32, family: uint8): NlResult[void] {.raises: [].} =
   ## Internal helper to add or delete an ip rule (fwmark/mask -> table).
-  let seq = m.nextSeq()
+  let seq = m.nextCmdSeq()
 
   let flags = if msgType == RTM_NEWRULE.uint16:
     NLM_F_REQUEST.uint16 or NLM_F_ACK.uint16 or
@@ -249,7 +262,7 @@ proc modifyRule(m: var RouteManager, msgType: uint16, mark, mask, table,
   let msg = b.finish()
   let op = if msgType == RTM_NEWRULE.uint16: "addRule" else: "delRule"
   let familyStr = if family == AF_INET: "IPv4" else: "IPv6"
-  m.sock.sendAndAck(msg, m.recvBuf).toNlResult(
+  m.cmdSock.sendAndAck(msg, m.cmdBuf).toNlResult(
     op, "mark " & $mark & ", table " & $table & ", family " & familyStr)
 
 proc addRule*(m: var RouteManager, mark, mask, table, priority: uint32,
@@ -333,12 +346,12 @@ proc flushTableFamily(m: var RouteManager, table: uint32,
   var failCount = 0
   let total = deleteMsgs.len
   for i in 0 ..< deleteMsgs.len:
-    let seq = m.nextSeq()
+    let seq = m.nextCmdSeq()
     if deleteMsgs[i].len >= sizeof(NlMsgHdr):
       var hdr = readStruct[NlMsgHdr](deleteMsgs[i], 0)
       hdr.nlmsgSeq = seq
       copyMem(addr deleteMsgs[i][0], unsafeAddr hdr, sizeof(NlMsgHdr))
-    let ack = m.sock.sendAndAck(deleteMsgs[i], m.recvBuf)
+    let ack = m.cmdSock.sendAndAck(deleteMsgs[i], m.cmdBuf)
     if not ack.ok:
       inc failCount
 
