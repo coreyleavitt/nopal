@@ -1,46 +1,13 @@
-## Syslog logger for nopal daemon.
+## Logging setup for nopal daemon.
 ##
-## Writes log messages to syslog via /dev/log Unix datagram socket,
-## matching OpenWrt's logd expectations.
+## Uses Nim's std/logging with stderr output. On OpenWrt, procd captures
+## stdout/stderr and routes to syslog via logd — no direct /dev/log
+## socket needed.
 
-import std/[logging, posix, strutils]
-
-const
-  LOG_DAEMON = 3 shl 3  # facility
-  LOG_ERR = 3
-  LOG_WARNING = 4
-  LOG_NOTICE = 5
-  LOG_INFO = 6
-  LOG_DEBUG = 7
-
-type
-  SyslogHandler* = ref object of Logger
-    ident: string
-    fd: cint
-
-proc close*(h: SyslogHandler) =
-  ## Close the syslog socket. Called explicitly on shutdown.
-  if h != nil and h.fd >= 0:
-    discard posix.close(h.fd)
-    h.fd = -1
-
-func levelToSyslog(level: Level): cint {.raises: [].} =
-  case level
-  of lvlAll, lvlDebug: LOG_DEBUG
-  of lvlInfo: LOG_INFO
-  of lvlNotice: LOG_NOTICE
-  of lvlWarn: LOG_WARNING
-  of lvlError, lvlFatal: LOG_ERR
-  of lvlNone: LOG_INFO
-
-proc newSyslogHandler*(ident: string = "nopal", level: Level = lvlInfo): SyslogHandler =
-  new(result)
-  result.levelThreshold = level
-  result.ident = ident
-  result.fd = -1
+import std/[logging, strutils]
 
 proc initStderrFallback*(level: Level = lvlInfo) =
-  ## Set up stderr logging (for development / non-OpenWrt environments).
+  ## Set up stderr logging. On OpenWrt, procd routes this to syslog.
   addHandler(newConsoleLogger(level, "[$levelname] "))
 
 func parseLogLevel*(s: string): Level {.raises: [].} =
