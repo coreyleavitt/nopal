@@ -3,8 +3,7 @@
 ## Writes log messages to syslog via /dev/log Unix datagram socket,
 ## matching OpenWrt's logd expectations.
 
-import std/logging
-import std/posix
+import std/[logging, posix, strutils]
 
 const
   LOG_DAEMON = 3 shl 3  # facility
@@ -43,3 +42,20 @@ proc newSyslogHandler*(ident: string = "nopal", level: Level = lvlInfo): SyslogH
 proc initStderrFallback*(level: Level = lvlInfo) =
   ## Set up stderr logging (for development / non-OpenWrt environments).
   addHandler(newConsoleLogger(level, "[$levelname] "))
+
+func parseLogLevel*(s: string): Level {.raises: [].} =
+  ## Parse a log level string from config. Returns lvlInfo on unrecognized input.
+  case s.toLowerAscii()
+  of "debug": lvlDebug
+  of "info": lvlInfo
+  of "notice": lvlNotice
+  of "warn", "warning": lvlWarn
+  of "error", "err": lvlError
+  of "fatal": lvlFatal
+  of "none": lvlNone
+  else: lvlInfo
+
+proc setLogLevel*(level: Level) =
+  ## Update the threshold on all registered handlers.
+  for handler in logging.getHandlers():
+    handler.levelThreshold = level

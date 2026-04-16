@@ -30,6 +30,7 @@ import ./netlink/conntrack
 import ./dnsmanager
 import ./timer
 import ./hooks
+import ./logging as nopalLog
 import ./statusfiles
 import ./snapshot
 import ./version
@@ -203,6 +204,9 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
   ## register fds with selector, assign marks, build trackers.
   var config = loadConfig(configPath)
   enrichConfigWithDiscovery(config)
+
+  # Apply configured log level
+  nopalLog.setLogLevel(nopalLog.parseLogLevel(config.globals.logLevel))
 
   info fmt"loaded config: {config.interfaces.len} interfaces, {config.policies.len} policies, {config.rules.len} rules"
 
@@ -1229,6 +1233,7 @@ proc reloadReinitSubsystems(ctx: ReloadContext, d: var Daemon) =
   d.config = ctx.newConfig
   d.cachedRules = buildRulesFromConfig(d.config)
   d.hookRunner.updateScript(d.config.globals.hookScript)
+  nopalLog.setLogLevel(nopalLog.parseLogLevel(d.config.globals.logLevel))
   d.trackers = ctx.newTrackers
   d.trackerIndex = buildTrackerIndex(d.trackers)
 
