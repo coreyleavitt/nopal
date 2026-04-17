@@ -31,6 +31,7 @@ import ./dnsmanager
 import ./timer
 import ./hooks
 import ./logging as nopalLog
+import ./preflight
 import ./statusfiles
 import ./snapshot
 import ./version
@@ -207,6 +208,15 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
 
   # Apply configured log level
   nopalLog.setLogLevel(nopalLog.parseLogLevel(config.globals.logLevel))
+
+  # Validate runtime environment before creating any state
+  for r in runPreflight(config.globals.markMask):
+    case r.severity
+    of pfPass: debug fmt"preflight: {r.name}: ok"
+    of pfWarn: warn fmt"preflight: {r.name}: {r.message}"
+    of pfFail:
+      error fmt"preflight: {r.name}: {r.message}"
+      quit(1)
 
   info fmt"loaded config: {config.interfaces.len} interfaces, {config.policies.len} policies, {config.rules.len} rules"
 
