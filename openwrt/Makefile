@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=nopal
-PKG_VERSION:=0.1.3-alpha.4
+PKG_VERSION:=0.1.4-alpha.1
 PKG_RELEASE:=1
 
 PKG_LICENSE:=Apache-2.0
