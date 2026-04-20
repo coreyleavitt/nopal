@@ -13,7 +13,6 @@ import ../linux_constants
 const
   ARPHRD_ETHER = 1'u16
   ARP_PKT_LEN = 28
-  IFNAMSIZ = 16
 
 type
   ArpProbeState* = object
@@ -29,13 +28,6 @@ type
     sll_pkttype: uint8
     sll_halen: uint8
     sll_addr: array[8, byte]
-
-  Ifreq {.importc: "struct ifreq", header: "<net/if.h>".} = object
-    ifr_name: array[IFNAMSIZ, char]
-    ifr_data: array[24, byte]  # union of various fields
-
-proc ioctl(fd: cint, request: culong, arg: pointer): cint
-  {.importc, header: "<sys/ioctl.h>".}
 
 proc createArpSocket*(device: string): tuple[fd: cint, state: ArpProbeState] =
   ## Create an AF_PACKET ARP socket bound to `device`.

@@ -1,6 +1,8 @@
 ## Linux-specific constants not available in Nim's posix module.
 ## All values are for Linux; this module should not be imported on other OSes.
 
+import std/posix
+
 # Netlink families
 const AF_NETLINK* = cint(16)
 const AF_PACKET* = cint(17)
@@ -233,3 +235,34 @@ const POLLHUP* = cshort(0x10)
 
 # Probe identification mark
 const PROBE_MARK* = uint32(0xDEAD)
+
+# Interface name max length
+const IFNAMSIZ* = 16
+
+# ifreq struct for ioctl
+type
+  Ifreq* {.importc: "struct ifreq", header: "<net/if.h>".} = object
+    ifr_name*: array[IFNAMSIZ, char]
+    ifr_data*: array[24, byte]  # union of various fields
+
+proc ioctl*(fd: cint, request: culong, arg: pointer): cint
+  {.importc, header: "<sys/ioctl.h>".}
+
+proc resolveIfindex*(device: string): uint32 =
+  ## Resolve a network device name to its kernel ifindex via SIOCGIFINDEX.
+  ## Returns 0 if the device doesn't exist or the ioctl fails.
+  let fd = cint(posix.socket(posix.AF_INET, posix.SOCK_DGRAM, 0))
+  if fd < 0: return 0
+  defer: discard posix.close(fd)
+
+  var ifr: Ifreq
+  let nameLen = min(device.len, IFNAMSIZ - 1)
+  for i in 0 ..< nameLen:
+    ifr.ifr_name[i] = device[i]
+
+  if ioctl(fd, SIOCGIFINDEX, addr ifr) < 0:
+    return 0
+
+  var idx: cint
+  copyMem(addr idx, addr ifr.ifr_data[0], sizeof(cint))
+  uint32(idx)

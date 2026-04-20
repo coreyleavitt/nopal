@@ -272,6 +272,7 @@ proc initDaemon*(configPath: string, signalFd: cint): Daemon =
       iface.name, i, mark, tableId, iface.device,
       iface.upCount, iface.downCount,
     )
+    t.ifindex = lc.resolveIfindex(iface.device)
 
     if iface.dampening:
       t.setDampening(
@@ -1197,6 +1198,7 @@ proc reloadBuildTrackers(ctx: var ReloadContext, config: NopalConfig) =
       iface.name, i, mark, tableId, iface.device,
       iface.upCount, iface.downCount,
     )
+    t.ifindex = lc.resolveIfindex(iface.device)
 
     if iface.dampening:
       t.setDampening(
