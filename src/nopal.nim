@@ -17,6 +17,30 @@ const
   DefaultConfig = "/etc/config/nopal"
   DefaultSocket = "/var/run/nopal.sock"
 
+  # ANSI color codes for TTY output
+  ColorGreen = "\x1b[32m"
+  ColorRed = "\x1b[31m"
+  ColorYellow = "\x1b[33m"
+  ColorBlue = "\x1b[34m"
+  ColorDim = "\x1b[2m"
+  ColorReset = "\x1b[0m"
+
+proc colorState(state: string, useColor: bool): string =
+  if not useColor: return state
+  case state
+  of "online": ColorGreen & state & ColorReset
+  of "offline": ColorRed & state & ColorReset
+  of "degraded": ColorYellow & state & ColorReset
+  of "probing": ColorBlue & state & ColorReset
+  of "init": ColorDim & state & ColorReset
+  else: state
+
+proc colorUpDown(up: bool, useColor: bool): string =
+  if up:
+    if useColor: ColorGreen & "up" & ColorReset else: "up"
+  else:
+    if useColor: ColorRed & "down" & ColorReset else: "down"
+
 # ---------------------------------------------------------------------------
 # Signal state -- module-level globals for async-signal-safe self-pipe trick
 # ---------------------------------------------------------------------------
@@ -202,14 +226,14 @@ proc formatInterfaceUptime(iface: JsonNode): string =
   let h = uptimeSecs div 3600
   let m = (uptimeSecs mod 3600) div 60
   let s = uptimeSecs mod 60
-  if h > 0: fmt"{h}h{m}m"
-  elif m > 0: fmt"{m}m{s}s"
-  else: fmt"{s}s"
+  if h > 0: result = fmt"{h}h{m}m"
+  elif m > 0: result = fmt"{m}m{s}s"
+  else: result = fmt"{s}s"
 
-proc printInterfaceTable(interfaces: JsonNode) =
+proc printInterfaceTable(interfaces: JsonNode, useColor: bool) =
   echo "  " & alignLeft("INTERFACE", 12) & " " &
        alignLeft("DEVICE", 10) & " " &
-       alignLeft("STATE", 10) & " " &
+       alignLeft("STATE", 15) & " " &
        align("RTT", 8) & " " &
        align("LOSS", 6) & " " &
        align("OK", 6) & " " &
@@ -220,6 +244,9 @@ proc printInterfaceTable(interfaces: JsonNode) =
     let name = iface{"name"}.getStr("-")
     let device = iface{"device"}.getStr("-")
     let state = iface{"state"}.getStr("-")
+    # Pad state BEFORE adding color codes (ANSI codes are invisible bytes)
+    let statePadded = alignLeft(state, 15)
+    let stateColored = colorState(statePadded, useColor)
     let rttVal = iface{"avg_rtt_ms"}
     let rtt = if rttVal != nil and rttVal.kind != JNull: fmt"{rttVal.getFloat():.1f}ms" else: "-"
     let lossVal = iface{"loss_percent"}.getInt(0)
@@ -230,24 +257,25 @@ proc printInterfaceTable(interfaces: JsonNode) =
 
     echo "  " & alignLeft(name, 12) & " " &
          alignLeft(device, 10) & " " &
-         alignLeft(state, 10) & " " &
+         stateColored & " " &
          align(rtt, 8) & " " &
          align(loss, 6) & " " &
          align(ok, 6) & " " &
          align(fail, 6) & " " &
          align(uptime, 8)
 
-proc printInterfaceDetail(iface: JsonNode) =
+proc printInterfaceDetail(iface: JsonNode, useColor: bool) =
   let name = iface{"name"}.getStr("-")
   let device = iface{"device"}.getStr("-")
   let state = iface{"state"}.getStr("-")
+  let stateColored = colorState(state, useColor)
   let enabled = if iface{"enabled"}.getBool(false): "yes" else: "no"
   let mark = iface{"mark"}.getInt(0).toHex(4).toLowerAscii()
   let tableId = iface{"table_id"}.getInt(0)
   let uptime = formatInterfaceUptime(iface)
   echo fmt"Interface: {name}"
   echo fmt"  Device:    {device}"
-  echo fmt"  State:     {state}"
+  echo "  State:     " & stateColored
   echo fmt"  Enabled:   {enabled}"
   echo fmt"  Mark:      0x{mark}"
   echo fmt"  Table:     {tableId}"
@@ -266,10 +294,11 @@ proc printInterfaceDetail(iface: JsonNode) =
     echo "  Targets:"
     for t in targets:
       let ip = t{"ip"}.getStr("?")
-      let up = if t{"up"}.getBool(false): "up" else: "down"
+      let isUp = t{"up"}.getBool(false)
+      let upStr = colorUpDown(isUp, useColor)
       let rttMs = t{"rtt_ms"}
       let rttStr = if rttMs != nil and rttMs.kind != JNull: fmt"{rttMs.getFloat():.1f}ms" else: "-"
-      echo fmt"    {ip}: {up} ({rttStr})"
+      echo "    " & ip & ": " & upStr & " (" & rttStr & ")"
 
 proc printPolicyTable(policies: JsonNode) =
   echo "  " & alignLeft("POLICY", 16) & " " &
@@ -300,6 +329,8 @@ proc printPolicyTable(policies: JsonNode) =
 # ---------------------------------------------------------------------------
 
 proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
+  let useColor = not jsonMode and posix.isatty(1) != 0
+
   if iface.len > 0:
     # Single interface detail
     let req = IpcRequest(id: 1, rpcMethod: "interface.status",
@@ -311,7 +342,7 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
     if jsonMode:
       echo resp.data.pretty()
     else:
-      printInterfaceDetail(resp.data)
+      printInterfaceDetail(resp.data, useColor)
     return
 
   let req = IpcRequest(id: 1, rpcMethod: "status")
@@ -344,7 +375,7 @@ proc cliStatus(socketPath: string, iface: string, jsonMode: bool) =
     echo "No interfaces configured."
   else:
     echo "Interfaces:"
-    printInterfaceTable(interfaces)
+    printInterfaceTable(interfaces, useColor)
 
   echo ""
 
@@ -367,10 +398,11 @@ proc cliInterfaces(socketPath: string, jsonMode: bool) =
     if interfaces != nil: echo interfaces.pretty()
     return
 
+  let useColor = not jsonMode and posix.isatty(1) != 0
   if interfaces == nil or interfaces.kind != JArray or interfaces.len == 0:
     echo "No interfaces configured."
   else:
-    printInterfaceTable(interfaces)
+    printInterfaceTable(interfaces, useColor)
 
 proc cliPolicies(socketPath: string, jsonMode: bool) =
   let req = IpcRequest(id: 1, rpcMethod: "status")
