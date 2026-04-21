@@ -6,6 +6,7 @@
 
 import std/[posix, os, strutils, strformat, json, endians, net, nativesockets]
 import daemon
+import config/parser
 import ipc/protocol
 import logging
 import std/logging as stdlog
@@ -686,6 +687,22 @@ proc cliRules() =
   if exitCode != 0:
     echo "no nopal nftables rules found — rules are removed when the daemon stops"
 
+proc cliCheck(configPath: string, jsonMode: bool) =
+  ## Parse and validate config without starting the daemon.
+  try:
+    discard loadConfig(configPath)
+  except CatchableError as e:
+    if jsonMode:
+      echo $(%*{"valid": false, "error": e.msg})
+    else:
+      stderr.writeLine "error: " & e.msg
+    quit(1)
+
+  if jsonMode:
+    echo $(%*{"valid": true})
+  else:
+    echo "configuration valid"
+
 proc printUsage() =
   echo fmt"nopal {Version} -- Multi-WAN manager for OpenWrt"
   echo ""
@@ -703,6 +720,7 @@ proc printUsage() =
   echo "  nopal bypass add <cidr>      Add network to policy routing bypass"
   echo "  nopal bypass remove <cidr>   Remove network from bypass"
   echo "  nopal bypass list            Show dynamic bypass networks"
+  echo "  nopal check                  Validate config without starting daemon"
   echo "  nopal version                Show version"
   echo "  nopal help                   Show this help"
   echo ""
@@ -720,6 +738,7 @@ proc printUsage() =
 
 proc runCli(args: seq[string]) =
   var socketPath = DefaultSocket
+  var configPath = DefaultConfig
   var jsonMode = false
   var positional: seq[string] = @[]
   var i = 1
@@ -732,6 +751,13 @@ proc runCli(args: seq[string]) =
       inc i
       continue
     case a
+    of "-c", "--config":
+      inc i
+      if i < args.len:
+        configPath = args[i]
+      else:
+        stderr.writeLine "error: -c/--config requires an argument"
+        quit(1)
     of "-s", "--socket":
       inc i
       if i < args.len:
@@ -777,6 +803,8 @@ proc runCli(args: seq[string]) =
       cliReload(socketPath, positional[1..^1])
     of "bypass":
       cliBypass(socketPath, positional[1..^1])
+    of "check":
+      cliCheck(configPath, jsonMode)
     of "help":
       printUsage()
     of "version":
