@@ -197,7 +197,7 @@ proc defaultGlobals*(): GlobalsConfig =
     probeInterval: 5,
     probeTimeout: 2,
     upCount: 3,
-    downCount: 3,
+    downCount: 5,
   )
 
 proc defaultInterface*(): InterfaceConfig =
